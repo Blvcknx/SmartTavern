@@ -9,7 +9,7 @@ No server plugin, no build step — install via the default extension installer.
 
 ---
 
-## Installation
+## Installation and quickstart
 
 **Via the extension installer (recommended):**
 `Extensions → Manage extensions → Install extension`, then paste the git repository URL.
@@ -23,6 +23,8 @@ SillyTavern/public/scripts/extensions/third-party/SmartTavern/
 and restart / reload SillyTavern.
 
 Recommended companion: the built-in **Connection Manager** extension (enabled by default in recent ST builds). It stores the saved connection profiles that SmartTavern uses for per-step and per-updater routing. Without it, SmartTavern still works — every internal call simply uses the currently active connection (one warning is shown).
+
+Right-click on the character avatar (long press on mobiles) will open the context window for you to configure.
 
 ## How it works
 
