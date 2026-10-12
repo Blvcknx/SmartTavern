@@ -8,6 +8,10 @@ A single, self-contained SillyTavern UI extension that replicates SkyrimNet-styl
 No server plugin, no build step — install via the default extension installer.
 
 ---
+## Screenshot
+
+<img width="1114" height="855" alt="image" src="https://github.com/user-attachments/assets/6abdc9dd-fe12-4f13-8b29-555bf72fad37" /> <img width="1130" height="645" alt="image" src="https://github.com/user-attachments/assets/358e0a3c-e7ec-4be1-a719-4375d3cddcc7" />
+
 
 ## Installation and quickstart
 
