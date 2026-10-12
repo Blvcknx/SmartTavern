@@ -75,8 +75,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
     ].join('\n'),
     injectionFooter: '[End of SmartTavern state block]',
     profileUpdateProfileId: '',
-    updaterMaxTokens: 1024,
-    stepMaxTokens: 512,
+    updaterMaxTokens: 5000,
+    stepMaxTokens: 5000,
     // Floating UI: the summoned panel, the avatar context menu and the wand-menu button.
     // `ui` stores the last open tab and the panel position (null = default, left-center).
     disableFloatingUI: false,
