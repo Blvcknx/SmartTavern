@@ -1,0 +1,15 @@
+{
+    "display_name": "SmartTavern",
+    "loading_order": 15,
+    "requires": [],
+    "optional": [
+        "connection-manager"
+    ],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "blvcknx",
+    "version": "1.0.0",
+    "homePage": "",
+    "generate_interceptor": "smarttavernInterceptor",
+    "minimum_client_version": "1.12.6"
+}

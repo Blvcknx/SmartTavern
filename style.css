@@ -1,0 +1,335 @@
+/* SmartTavern extension styles */
+
+#smarttavern_settings .smarttavern_hint {
+    opacity: 0.75;
+    font-size: 0.9em;
+    margin: 4px 0 8px 0;
+}
+
+#smarttavern_settings label {
+    display: block;
+    margin-bottom: 6px;
+}
+
+#smarttavern_settings .smarttavern_grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 4px 12px;
+    margin-bottom: 6px;
+}
+
+#smarttavern_settings .smarttavern_textarea {
+    width: 100%;
+    resize: vertical;
+}
+
+#smarttavern_settings hr {
+    margin: 10px 0;
+    opacity: 0.5;
+}
+
+.smarttavern_field_row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+
+.smarttavern_field_row .smarttavern_field_name {
+    flex: 0 0 150px;
+    min-width: 0;
+}
+
+.smarttavern_field_row .smarttavern_field_desc {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.smarttavern_step_card {
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.35));
+    border-radius: 10px;
+    padding: 8px;
+    margin-bottom: 8px;
+}
+
+.smarttavern_step_header {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+
+.smarttavern_step_header .smarttavern_step_name {
+    flex: 1 1 120px;
+    min-width: 100px;
+}
+
+.smarttavern_step_header .smarttavern_step_profile {
+    flex: 1 1 160px;
+    min-width: 120px;
+}
+
+.smarttavern_step_prompt {
+    width: 100%;
+    min-height: 110px;
+    resize: vertical;
+}
+
+.smarttavern_row_actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin: 4px 0;
+}
+
+.smarttavern_popup_section_title {
+    font-weight: bold;
+    margin: 10px 0 2px 0;
+}
+
+.smarttavern_popup_pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+    border-radius: 8px;
+    padding: 8px;
+    max-height: 240px;
+    overflow-y: auto;
+}
+
+/* ------------------------------------------------------------------
+   Floating panel (summoned over the chat) + avatar context menu.
+   Theme safety: ST CSS variables only — no hardcoded colors.
+   ------------------------------------------------------------------ */
+
+#smarttavern_panel {
+    position: fixed;
+    display: flex;
+    flex-direction: column;
+    width: min(420px, calc(100vw - 16px));
+    max-height: min(85vh, 760px);
+    z-index: 3010;
+    background: var(--SmartThemeBlurTintColor);
+    color: var(--SmartThemeBodyColor);
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 10px;
+    box-shadow: 0 6px 32px var(--black70a);
+    backdrop-filter: blur(var(--SmartThemeBlurStrength));
+    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength));
+    font-size: calc(var(--mainFontSize) - 0.1rem);
+}
+
+#smarttavern_panel .smarttavern_panel_header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+    cursor: move;
+    user-select: none;
+    /* Column flex base: when the body overflows the panel's max-height, the shrink must
+       land on the body alone — never on the chrome rows. */
+    flex-shrink: 0;
+}
+
+#smarttavern_panel .smarttavern_panel_icon {
+    opacity: 0.8;
+}
+
+#smarttavern_panel .smarttavern_panel_title {
+    font-weight: 600;
+    flex: 1 1 auto;
+}
+
+#smarttavern_panel .smarttavern_panel_close {
+    cursor: pointer;
+}
+
+#smarttavern_panel.dragging {
+    opacity: 0.92;
+}
+
+/* The tab strip must keep its full height at all times and the tabs must never be hidden
+   under a scrollbar: the strip is a flex row that wraps (instead of scrolling) and its own
+   scrollbar is suppressed (ST themes style scrollbars as thick always-visible bars).
+   flex-shrink: 0 is essential — overflow-x: auto makes the strip's automatic minimum size
+   zero, so the panel's flex shrink would otherwise squash this row and clip the tabs
+   (its share of the overflow deficit grows/shrinks with each tab's content height). */
+#smarttavern_panel .smarttavern_panel_tabs {
+    display: flex;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+    gap: 2px;
+    padding: 6px 8px 0;
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+    overflow-x: auto;
+    scrollbar-width: none;
+}
+
+#smarttavern_panel .smarttavern_panel_tabs::-webkit-scrollbar {
+    display: none;
+}
+
+#smarttavern_panel .smarttavern_tab_button {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 6px;
+    opacity: 0.7;
+    border-bottom: 2px solid transparent;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+#smarttavern_panel .smarttavern_tab_button.active {
+    opacity: 1;
+    border-bottom-color: var(--SmartThemeQuoteColor);
+    color: var(--SmartThemeQuoteColor);
+}
+
+#smarttavern_panel .smarttavern_panel_body {
+    padding: 8px 10px;
+    overflow-y: auto;
+    min-height: 120px;
+}
+
+#smarttavern_panel .smarttavern_tab_panel {
+    display: none;
+}
+
+#smarttavern_panel .smarttavern_tab_panel.active {
+    display: block;
+}
+
+/* The editors moved from the drawer into the panel — mirror the drawer rules. */
+#smarttavern_panel .smarttavern_hint {
+    opacity: 0.75;
+    font-size: 0.9em;
+    margin: 4px 0 8px 0;
+}
+
+#smarttavern_panel label {
+    display: block;
+    margin-bottom: 6px;
+}
+
+#smarttavern_panel .smarttavern_grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 4px 12px;
+    margin-bottom: 6px;
+}
+
+#smarttavern_panel .smarttavern_textarea {
+    width: 100%;
+    resize: vertical;
+}
+
+#smarttavern_panel hr {
+    margin: 10px 0;
+    opacity: 0.5;
+}
+
+#smarttavern_panel .smarttavern_meta {
+    opacity: 0.7;
+    font-size: 0.85em;
+    margin: 6px 0;
+}
+
+#smarttavern_panel .smarttavern_bio_field > label {
+    display: block;
+    font-weight: 600;
+    font-size: 0.9em;
+    margin: 8px 0 2px;
+}
+
+.smarttavern_bio_value {
+    width: 100%;
+    resize: vertical;
+    min-height: 54px;
+    max-height: 40vh;
+}
+
+#smarttavern_panel .menu_button.disabled {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+/* Collapsible step cards */
+.smarttavern_step_chevron {
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 0 2px;
+    transition: transform 0.15s ease;
+}
+
+.smarttavern_step_card.collapsed .smarttavern_step_chevron {
+    transform: rotate(-90deg);
+}
+
+.smarttavern_step_card.collapsed .smarttavern_step_prompt,
+.smarttavern_step_card.collapsed .smarttavern_step_profile {
+    display: none;
+}
+
+/* Avatar context menu (RMB / long-press) */
+#smarttavern_ctx_menu {
+    position: fixed;
+    display: none;
+    flex-direction: column;
+    min-width: 190px;
+    padding: 4px;
+    z-index: 30110;
+    background: var(--SmartThemeBlurTintColor);
+    color: var(--SmartThemeBodyColor);
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 10px;
+    box-shadow: 0 6px 32px var(--black70a);
+    backdrop-filter: blur(var(--SmartThemeBlurStrength));
+    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength));
+    font-size: calc(var(--mainFontSize) - 0.1rem);
+}
+
+#smarttavern_ctx_menu.show {
+    display: flex;
+}
+
+#smarttavern_ctx_menu .smarttavern_ctx_title {
+    font-weight: 600;
+    opacity: 0.7;
+    padding: 5px 8px 6px;
+    margin-bottom: 3px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#smarttavern_ctx_menu .smarttavern_ctx_item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 8px;
+    border-radius: 8px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+#smarttavern_ctx_menu .smarttavern_ctx_item:hover {
+    background: var(--black30a);
+}
+
+/* Mobile: fixed near-fullscreen sheet, no dragging. */
+@media (max-width: 900px) {
+    #smarttavern_panel {
+        left: 2vw !important;
+        top: 5vh !important;
+        width: 96vw;
+        max-height: 90vh;
+    }
+
+    #smarttavern_panel .smarttavern_panel_header {
+        cursor: default;
+    }
+}
