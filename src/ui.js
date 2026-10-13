@@ -6,17 +6,25 @@ import {
     initPanel, openPanel, togglePanel, refreshStatus, refreshProfileSelects,
     showProfilePopup, showRunResults, runUpdateCommand, runRebuildCommand, runResetCommand,
 } from './panel.js';
+import { initProgress } from './progress.js';
 
 export function initUI() {
     $('#extensions_settings2').append(buildDrawerHtml());
     wireDrawer();
     initPanel();
+    initProgress();
     registerSlashCommands();
     registerDebugDump();
     refreshStatus();
     applyDrawerFloatingVisibility();
 
     $(document).on('smarttavern:floating-changed', applyDrawerFloatingVisibility);
+
+    // Mirror the live generation status into the drawer (works even with floating UI off).
+    $(document).on('smarttavern:progress', (event) => {
+        const detail = event.originalEvent?.detail ?? {};
+        $('#smarttavern_live_status').text(detail.status ?? '').toggle(Boolean(detail.status));
+    });
 
     // Pick up newly created connection profiles without re-rendering everything.
     $(document).on('mousedown focus', '.smarttavern_profile_select', () => refreshProfileSelects());
@@ -55,6 +63,8 @@ function buildDrawerHtml() {
                 </a>
 
                 <div class="smarttavern_hint" id="smarttavern_status"></div>
+
+                <div class="smarttavern_hint" id="smarttavern_live_status"></div>
             </div>
         </div>
     </div>`;

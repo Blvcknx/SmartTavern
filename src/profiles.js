@@ -7,6 +7,7 @@ import {
     getStoredProfile, getMainCharacter, resolveMemberByMessageName, substituteParamsSafe,
 } from './state.js';
 import { generateVia, withInternalGeneration } from './gen.js';
+import { activityStart, activityEntry, activityFail, activityEnd } from './progress.js';
 
 const busyKeys = new Set();
 
@@ -169,6 +170,7 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
     if (busyKeys.has(key)) return null;
     busyKeys.add(key);
     try {
+        activityStart({ status: `${source === 'rebuild' ? 'Rebuilding' : 'Compiling'} profile · ${char.name}` });
         const context = getContext();
         const fields = Array.isArray(settings.fields) ? settings.fields : [];
         const schema = buildJsonSchema(fields);
@@ -180,14 +182,21 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
             maxTokens: settings.updaterMaxTokens,
             jsonSchema: schema,
         }));
-        const parsed = normalizeProfileJson(extractJson(result?.content), fields, null);
+        const rawContent = String(result?.content ?? '');
+        activityEntry({ title: `Profile payload · ${rawContent.length} chars`, tone: 'info', text: rawContent });
+        const parsed = normalizeProfileJson(extractJson(rawContent), fields, null);
         if (!parsed) throw new Error('The model did not return a usable profile object');
         const now = (context.chat ?? []).length;
         const record = { fields: parsed.fields, createdAt: now, updatedAt: now, source };
         setStoredProfile(key, record);
         log(`profile ${source} written for "${key}"`);
         if (notify) toastr.success(`Profile for ${char.name} ${source === 'rebuild' ? 'rebuilt' : 'created'}.`, 'SmartTavern');
+        activityEnd({ ok: true, summary: `${source === 'rebuild' ? 'Profile rebuilt' : 'Profile created'} · ${char.name}` });
         return record;
+    } catch (error) {
+        activityFail(`Profile ${source} failed — ${error?.message ?? error}`);
+        activityEnd({ ok: false, summary: 'Profile update failed' });
+        throw error;
     } finally {
         busyKeys.delete(key);
     }
@@ -210,6 +219,7 @@ export async function updateProfile(char, { notify = true } = {}) {
     if (busyKeys.has(key)) return null;
     busyKeys.add(key);
     try {
+        activityStart({ status: `Updating profile · ${char.name}` });
         const context = getContext();
         const fields = Array.isArray(settings.fields) ? settings.fields : [];
         const schema = buildJsonSchema(fields);
@@ -221,7 +231,9 @@ export async function updateProfile(char, { notify = true } = {}) {
             maxTokens: settings.updaterMaxTokens,
             jsonSchema: schema,
         }));
-        const parsed = normalizeProfileJson(extractJson(result?.content), fields, existing);
+        const rawContent = String(result?.content ?? '');
+        activityEntry({ title: `Profile payload · ${rawContent.length} chars`, tone: 'info', text: rawContent });
+        const parsed = normalizeProfileJson(extractJson(rawContent), fields, existing);
         if (!parsed) throw new Error('The model did not return a usable profile object');
         const record = {
             ...existing,
@@ -232,7 +244,12 @@ export async function updateProfile(char, { notify = true } = {}) {
         setStoredProfile(key, record);
         log(`profile updated for "${key}"`);
         if (notify) toastr.success(`Profile for ${char.name} updated.`, 'SmartTavern');
+        activityEnd({ ok: true, summary: `Profile updated · ${char.name}` });
         return record;
+    } catch (error) {
+        activityFail(`Profile update failed — ${error?.message ?? error}`);
+        activityEnd({ ok: false, summary: 'Profile update failed' });
+        throw error;
     } finally {
         busyKeys.delete(key);
     }

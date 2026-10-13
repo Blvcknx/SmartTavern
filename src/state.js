@@ -24,6 +24,7 @@ export const DEFAULT_STEPS = Object.freeze([
     {
         name: 'Physical Condition',
         enabled: true,
+        role: 'user',
         profileId: '',
         prompt: [
             'You are narrating the body of {{char}}.',
@@ -40,6 +41,7 @@ export const DEFAULT_STEPS = Object.freeze([
     {
         name: 'Mental Condition',
         enabled: true,
+        role: 'user',
         profileId: '',
         prompt: [
             'You are narrating the mind of {{char}}.',
@@ -58,6 +60,10 @@ export const DEFAULT_STEPS = Object.freeze([
     },
 ]);
 
+// Valid values for per-step/final-pass `role` and the injection anchor.
+export const STEP_ROLES = Object.freeze(['user', 'system', 'assistant']);
+export const INJECT_ANCHORS = Object.freeze(['before-last-user', 'after-last-user', 'top-of-history', 'depth']);
+
 export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     autoUpdate: true,
@@ -66,6 +72,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
     chatLookback: 24,
     profileUpdateLookback: 24,
     injectDepth: 1,
+    // Anchor for the ephemeral block: where it sits relative to the user's latest message.
+    // 'depth' keeps the legacy injectDepth-from-the-end behavior.
+    injectAnchor: 'before-last-user',
     injectName: 'SmartTavern',
     injectionHeader: [
         '[Living profile of {{char}} — dynamically maintained; treat as authoritative over the static character card when they conflict]',
@@ -74,6 +83,31 @@ export const DEFAULT_SETTINGS = Object.freeze({
         '[Current state assessment — freshly computed; highly relevant to {{char}}\'s next reply:]',
     ].join('\n'),
     injectionFooter: '[End of SmartTavern state block]',
+    // Final pass: optional synthesis call after all steps. 'replace' mode injects its output
+    // as the whole state block; 'append' keeps the step blocks and adds an extra "[name]"
+    // block with the final output. maxTokens 0 = fall back to stepMaxTokens.
+    finalStep: {
+        enabled: false,
+        name: 'Final',
+        profileId: '',
+        role: 'user',
+        maxTokens: 0,
+        mode: 'replace',
+        prompt: [
+            'You are assembling the final state brief of {{char}} for an ongoing interactive fiction session.',
+            '',
+            'Character profile:',
+            '{{definitions}}',
+            '',
+            'Assessments from the reasoning pipeline:',
+            '{{steps}}',
+            '',
+            'Recent conversation:',
+            '{{chat}}',
+            '',
+            'Task: Merge the assessments above into one coherent, non-redundant state brief of {{char}}\'s current body and mind for the next reply. Resolve contradictions in favor of the most recent assessment. Keep every concrete detail that matters for the next reply. Write in second person ("you"). No headings, no preamble, no out-of-character commentary.',
+        ].join('\n'),
+    },
     profileUpdateProfileId: '',
     updaterMaxTokens: 5000,
     stepMaxTokens: 5000,
@@ -116,11 +150,48 @@ export function deepMerge(target, source) {
     return target;
 }
 
+/**
+ * Repairs legacy/invalid settings after the merge: unknown step roles, an unknown injection
+ * anchor and an invalid final-pass config are reset to defaults. Arrays are never replaced
+ * wholesale — existing steps keep their content.
+ */
+function normalizeSettings(settings) {
+    let changed = false;
+    for (const step of (Array.isArray(settings.steps) ? settings.steps : [])) {
+        if (!isPlainObject(step)) continue;
+        if (!STEP_ROLES.includes(step.role)) {
+            step.role = 'user';
+            changed = true;
+        }
+    }
+    if (!INJECT_ANCHORS.includes(settings.injectAnchor)) {
+        settings.injectAnchor = 'before-last-user';
+        changed = true;
+    }
+    const finalStep = settings.finalStep;
+    if (isPlainObject(finalStep)) {
+        if (!STEP_ROLES.includes(finalStep.role)) {
+            finalStep.role = 'user';
+            changed = true;
+        }
+        if (finalStep.mode !== 'replace' && finalStep.mode !== 'append') {
+            finalStep.mode = 'replace';
+            changed = true;
+        }
+        if (!String(finalStep.name ?? '').trim()) {
+            finalStep.name = 'Final';
+            changed = true;
+        }
+    }
+    if (changed) saveSettings();
+}
+
 export function loadSettings() {
     const context = getContext();
     const settings = isPlainObject(context.extensionSettings[SETTINGS_KEY]) ? context.extensionSettings[SETTINGS_KEY] : {};
     context.extensionSettings[SETTINGS_KEY] = settings;
     deepMerge(settings, DEFAULT_SETTINGS);
+    normalizeSettings(settings);
     return settings;
 }
 
