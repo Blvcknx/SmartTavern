@@ -47,7 +47,7 @@ function buildDrawerHtml() {
             </div>
             <div class="inline-drawer-content">
                 <div class="smarttavern_hint">
-                    Living per-chat character profiles plus a chained multi-pass reasoning pipeline.
+                    Living per-chat character profiles plus generated reasoning blocks for the next reply.
                     Right-click a character's avatar in chat (long-press on touch devices), use the
                     wand menu, or press the button below to summon the floating panel.
                 </div>

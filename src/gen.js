@@ -21,6 +21,9 @@ export async function withInternalGeneration(fn) {
 
 let sharedServicePromise = null;
 let missingServiceWarningShown = false;
+// generateRaw temporarily changes shared token-budget state in ST. Profiled
+// requests can overlap, but active-connection calls (including fallbacks) cannot.
+let activeQueue = Promise.resolve();
 
 function getServiceFromContext() {
     return getContext().ConnectionManagerRequestService ?? null;
@@ -85,7 +88,9 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         }
     }
 
-    return generateViaActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, profileId });
+    const request = activeQueue.then(() => generateViaActive(context, { systemPrompt, prompt, maxTokens, jsonSchema }));
+    activeQueue = request.catch(() => {});
+    return request;
 }
 
 async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema }) {
@@ -138,17 +143,15 @@ function flattenMessages(prompt) {
     return String(prompt ?? '');
 }
 
-async function generateViaActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, profileId }) {
+async function generateViaActive(context, { systemPrompt, prompt, maxTokens, jsonSchema }) {
     if (typeof context.generateRaw !== 'function') {
         throw new Error('SillyTavern context does not expose generateRaw()');
     }
     const text = await context.generateRaw({
         systemPrompt,
-        prompt: typeof prompt === 'string' ? prompt : flattenMessages(prompt),
+        prompt,
         responseLength: maxTokens > 0 ? maxTokens : null,
         jsonSchema: jsonSchema ? { ...jsonSchema, returnInvalid: true } : null,
-        // Forward-compat: per-call connection profile override (ST proposal). Ignored if unsupported.
-        connectionProfile: profileId || undefined,
     });
     // With a schema, generateRaw returns an extracted JSON string; without, the cleaned message.
     return { content: String(text ?? ''), reasoning: '' };

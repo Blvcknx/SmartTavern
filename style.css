@@ -484,3 +484,27 @@
     font-family: var(--monoFontFamily, monospace);
     font-size: 0.9em;
 }
+
+/* Keep both the folded chip and its wider log centered on narrow screens. */
+@media (max-width: 900px) {
+    #smarttavern_activity {
+        left: 50%;
+        right: auto;
+        transform: translateX(-50%);
+        bottom: max(12px, env(safe-area-inset-bottom));
+        max-width: calc(100vw - 24px);
+    }
+
+    #smarttavern_activity_chip {
+        box-sizing: border-box;
+        max-width: calc(100vw - 24px);
+    }
+
+    #smarttavern_activity_body {
+        left: 50%;
+        right: auto;
+        transform: translateX(-50%);
+        box-sizing: border-box;
+        width: min(460px, calc(100vw - 24px));
+    }
+}

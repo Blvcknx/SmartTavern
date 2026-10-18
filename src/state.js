@@ -24,7 +24,7 @@ export const DEFAULT_STEPS = Object.freeze([
     {
         name: 'Physical Condition',
         enabled: true,
-        role: 'user',
+        role: 'assistant',
         profileId: '',
         prompt: [
             'You are narrating the body of {{char}}.',
@@ -41,7 +41,7 @@ export const DEFAULT_STEPS = Object.freeze([
     {
         name: 'Mental Condition',
         enabled: true,
-        role: 'user',
+        role: 'assistant',
         profileId: '',
         prompt: [
             'You are narrating the mind of {{char}}.',
@@ -60,9 +60,9 @@ export const DEFAULT_STEPS = Object.freeze([
     },
 ]);
 
-// Valid values for per-step/final-pass `role` and the injection anchor.
+// Valid values for per-step and tail `role` and the injection anchor.
 export const STEP_ROLES = Object.freeze(['user', 'system', 'assistant']);
-export const INJECT_ANCHORS = Object.freeze(['before-last-user', 'after-last-user', 'top-of-history', 'depth']);
+export const INJECT_ANCHORS = Object.freeze(['prompt-end', 'before-last-user', 'after-last-user', 'top-of-history', 'depth']);
 
 export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
@@ -72,9 +72,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
     chatLookback: 24,
     profileUpdateLookback: 24,
     injectDepth: 1,
-    // Anchor for the ephemeral block: where it sits relative to the user's latest message.
-    // 'depth' keeps the legacy injectDepth-from-the-end behavior.
-    injectAnchor: 'before-last-user',
+    // 'prompt-end' relocates the budgeted reservation after assembly. Other
+    // anchors retain history placement for comparisons.
+    injectAnchor: 'prompt-end',
     injectName: 'SmartTavern',
     injectionHeader: [
         '[Living profile of {{char}} — dynamically maintained; treat as authoritative over the static character card when they conflict]',
@@ -83,34 +83,21 @@ export const DEFAULT_SETTINGS = Object.freeze({
         '[Current state assessment — freshly computed; highly relevant to {{char}}\'s next reply:]',
     ].join('\n'),
     injectionFooter: '[End of SmartTavern state block]',
-    // Final pass: optional synthesis call after all steps. 'replace' mode injects its output
-    // as the whole state block; 'append' keeps the step blocks and adds an extra "[name]"
-    // block with the final output. maxTokens 0 = fall back to stepMaxTokens.
-    finalStep: {
-        enabled: false,
-        name: 'Final',
-        profileId: '',
-        role: 'user',
-        maxTokens: 0,
-        mode: 'replace',
-        prompt: [
-            'You are assembling the final state brief of {{char}} for an ongoing interactive fiction session.',
-            '',
-            'Character profile:',
-            '{{definitions}}',
-            '',
-            'Assessments from the reasoning pipeline:',
-            '{{steps}}',
-            '',
-            'Recent conversation:',
-            '{{chat}}',
-            '',
-            'Task: Merge the assessments above into one coherent, non-redundant state brief of {{char}}\'s current body and mind for the next reply. Resolve contradictions in favor of the most recent assessment. Keep every concrete detail that matters for the next reply. Write in second person ("you"). No headings, no preamble, no out-of-character commentary.',
-        ].join('\n'),
-    },
+    tailRole: 'assistant',
+    tailPrompt: [
+        '[Working assessments for {{char}}\'s upcoming reply]',
+        '',
+        'Living profile:',
+        '{{definitions}}',
+        '',
+        '{{steps}}',
+        '',
+        'Use these assessments to guide the upcoming reply: account for the current physical state, motivations, and relevant constraints. Treat assessments as working interpretations; the latest explicit conversation evidence takes precedence. Continue the scene as {{char}} in response to {{user}}. Keep these notes out of the visible reply; do not summarize or repeat them.',
+    ].join('\n'),
     profileUpdateProfileId: '',
     updaterMaxTokens: 5000,
     stepMaxTokens: 5000,
+    stepExecution: 'dependencies',
     // Floating UI: the summoned panel, the avatar context menu and the wand-menu button.
     // `ui` stores the last open tab and the panel position (null = default, left-center).
     disableFloatingUI: false,
@@ -151,37 +138,43 @@ export function deepMerge(target, source) {
 }
 
 /**
- * Repairs legacy/invalid settings after the merge: unknown step roles, an unknown injection
- * anchor and an invalid final-pass config are reset to defaults. Arrays are never replaced
- * wholesale — existing steps keep their content.
+ * Repairs invalid roles/anchors and migrates the removed consolidation pass to
+ * local prompt-tail assembly. Existing steps keep their content.
  */
 function normalizeSettings(settings) {
     let changed = false;
+    // Roles formerly selected the role of the generation instructions. They now
+    // describe generated output in the reply prompt. Start existing configs as assistant.
+    if (settings.outputRolesVersion !== 1) {
+        for (const step of (Array.isArray(settings.steps) ? settings.steps : [])) {
+            if (isPlainObject(step)) step.role = 'assistant';
+        }
+        settings.outputRolesVersion = 1;
+        changed = true;
+    }
     for (const step of (Array.isArray(settings.steps) ? settings.steps : [])) {
         if (!isPlainObject(step)) continue;
         if (!STEP_ROLES.includes(step.role)) {
-            step.role = 'user';
+            step.role = 'assistant';
             changed = true;
         }
     }
     if (!INJECT_ANCHORS.includes(settings.injectAnchor)) {
-        settings.injectAnchor = 'before-last-user';
+        settings.injectAnchor = 'prompt-end';
         changed = true;
     }
-    const finalStep = settings.finalStep;
-    if (isPlainObject(finalStep)) {
-        if (!STEP_ROLES.includes(finalStep.role)) {
-            finalStep.role = 'user';
-            changed = true;
-        }
-        if (finalStep.mode !== 'replace' && finalStep.mode !== 'append') {
-            finalStep.mode = 'replace';
-            changed = true;
-        }
-        if (!String(finalStep.name ?? '').trim()) {
-            finalStep.name = 'Final';
-            changed = true;
-        }
+    if (Object.hasOwn(settings, 'finalStep')) {
+        delete settings.finalStep;
+        changed = true;
+    }
+    if (settings.promptTailVersion !== 1) {
+        settings.injectAnchor = 'prompt-end';
+        settings.promptTailVersion = 1;
+        changed = true;
+    }
+    if (!STEP_ROLES.includes(settings.tailRole)) {
+        settings.tailRole = 'assistant';
+        changed = true;
     }
     if (changed) saveSettings();
 }

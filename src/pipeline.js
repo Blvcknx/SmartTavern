@@ -1,4 +1,4 @@
-// SmartTavern — macro expansion, the chained multi-pass pipeline, ephemeral prompt
+// SmartTavern — macro expansion, dependency-aware block generation, ephemeral prompt
 // injection and the manifest-registered generation interceptor.
 //
 // The interceptor receives the post-processing "core chat" array that SillyTavern builds
@@ -11,17 +11,17 @@ import {
     cardText, chatExcerpt, charKey, getChatStore, getStoredProfile,
     resolveTargetChar, clampInt, substituteParamsSafe, STEP_ROLES,
 } from './state.js';
+import { system_message_types } from '../../../../system-messages.js';
 import { generateVia, withInternalGeneration, isInternalGeneration } from './gen.js';
 import { bootstrapProfile, serializeProfile } from './profiles.js';
 import { activityStart, activityStatus, activityEntry, activityFail, activityEnd } from './progress.js';
+import { stagePromptTail, clearPromptTail } from './tail.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
 
 const MACRO_RE = /\{\{\s*([^{}]+?)\s*\}\}/g;
 
 const STEP_SYSTEM = 'You are a state-assessment engine for an interactive fiction platform. Follow the task instructions precisely and output only the requested prose with no preamble, headings or meta commentary.';
-
-const FINAL_SYSTEM = 'You are a state-synthesis engine for an interactive fiction platform. Follow the task instructions precisely and output only the requested prose with no preamble, headings or meta commentary.';
 
 // Characters whose bootstrap already failed this session — no retry spam per generation.
 const failedBootstraps = new Set();
@@ -38,7 +38,7 @@ function recordLastRun(result, source) {
         char: result.char,
         profile: result.profile,
         stepOutputs: result.stepOutputs,
-        finalOutput: result.finalOutput ?? '',
+        injectionText: result.injectionText ?? '',
         source,
         at: Date.now(),
     };
@@ -126,25 +126,28 @@ function stepBlocks(settings, stepOutputs) {
     return parts;
 }
 
-export function assembleInjection({ settings, char, profile, chat, stepOutputs, finalOutput = '' }) {
+export function assembleInjection({ settings, char, profile, chat, stepOutputs }) {
+    return assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs })
+        .map(block => block.text).join('\n\n');
+}
+
+export function assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs }) {
     const resolve = makeMacroResolver({ char, profile, chat, stepOutputs, settings });
     const parts = [];
+    const roleFor = step => STEP_ROLES.includes(step?.role) ? step.role : 'assistant';
+    const add = (text, role) => { if (text) parts.push({ text, role }); };
     const header = expandMacros(settings.injectionHeader ?? '', resolve).trim();
-    if (header) parts.push(header);
-    // 'replace' mode: the final pass output becomes the whole injected block. When the final
-    // pass is off, failed, or in 'append' mode, the raw step blocks are injected instead
-    // (append adds the final output as one extra block).
-    const finalCfg = settings.finalStep;
-    const finalText = finalCfg && finalCfg.enabled !== false ? String(finalOutput ?? '').trim() : '';
-    if (finalText && (finalCfg.mode ?? 'replace') === 'replace') {
-        parts.push(finalText);
-    } else {
-        parts.push(...stepBlocks(settings, stepOutputs));
-        if (finalText) parts.push(`[${finalCfg.name || 'Final'}]\n${finalText}`);
+    for (const step of settings.steps ?? []) {
+        if (!step || step.enabled === false) continue;
+        const output = String(stepOutputs?.[step.name] ?? '').trim();
+        if (output) add(`[${step.name}]\n${output}`, roleFor(step));
     }
     const footer = expandMacros(settings.injectionFooter ?? '', resolve).trim();
-    if (footer) parts.push(footer);
-    return parts.join('\n\n').trim();
+    // No prompt/header-only injection when every assessment failed.
+    if (!parts.length) return parts;
+    if (header) parts[0].text = `${header}\n\n${parts[0].text}`;
+    if (footer) parts[parts.length - 1].text += `\n\n${footer}`;
+    return parts;
 }
 
 function findLastUserIndex(chatArr) {
@@ -176,16 +179,16 @@ function resolveInjectIndex(chatArr, settings) {
     }
 }
 
-export function injectEphemeral(chatArr, text, settings) {
+export function injectEphemeral(chatArr, text, settings, role = 'assistant', index = resolveInjectIndex(chatArr, settings)) {
     const context = getContext();
-    const index = resolveInjectIndex(chatArr, settings);
     const message = {
-        name: settings.injectName || 'SmartTavern',
-        is_user: false,
-        is_system: true,
+        name: role === 'user' ? context.name1 : (context.name2 || settings.injectName || 'SmartTavern'),
+        is_user: role === 'user',
+        is_system: role === 'system',
         mes: text,
         send_date: typeof context.humanizedDateTime === 'function' ? context.humanizedDateTime() : new Date().toISOString(),
-        extra: { isSmartTavern: true },
+        // ST maps narrator messages to the system role; is_system alone does not.
+        extra: { isSmartTavern: true, ...(role === 'system' ? { type: system_message_types.NARRATOR } : {}) },
         [EPHEMERAL_FLAG]: true,
     };
     chatArr.splice(index, 0, message);
@@ -197,26 +200,24 @@ export function injectEphemeral(chatArr, text, settings) {
 // --------------------------------------------------------------------------------------------
 
 async function runSteps({ char, profile, chat, settings }) {
-    const stepOutputs = {};
+    const stepOutputs = Object.create(null);
     const steps = (Array.isArray(settings.steps) ? settings.steps : [])
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
-    const resolve = makeMacroResolver({ char, profile, chat, stepOutputs, settings });
-    let index = 0;
-    for (const step of steps) {
-        index++;
+    const runStep = async (step, index) => {
         const label = step.name || 'Unnamed step';
-        activityStatus(`Step ${index}/${steps.length} · ${label}`);
+        activityStatus(`Step ${index + 1}/${steps.length} · ${label}`);
         const startedAt = Date.now();
         try {
+            const earlierOutputs = Object.fromEntries(steps.slice(0, index)
+                .filter(previous => Object.hasOwn(stepOutputs, previous.name))
+                .map(previous => [previous.name, stepOutputs[previous.name]]));
+            const resolve = makeMacroResolver({ char, profile, chat, stepOutputs: earlierOutputs, settings });
             const expanded = expandMacros(step.prompt, resolve);
             const text = substituteParamsSafe(expanded);
-            const role = STEP_ROLES.includes(step.role) ? step.role : 'user';
-            // 'system' merges the body into the system message (single system turn, empty prompt);
-            // 'assistant' sends it as an assistant message (prefill-style); 'user' is the default.
             const result = await withInternalGeneration(() => generateVia({
                 profileId: step.profileId || '',
-                systemPrompt: role === 'system' ? `${STEP_SYSTEM}\n\n${text}` : STEP_SYSTEM,
-                prompt: role === 'assistant' ? [{ role: 'assistant', content: text }] : (role === 'system' ? '' : text),
+                systemPrompt: STEP_SYSTEM,
+                prompt: text,
                 maxTokens: settings.stepMaxTokens,
             }));
             const output = String(result?.content ?? '').trim();
@@ -231,50 +232,32 @@ async function runSteps({ char, profile, chat, settings }) {
             stepOutputs[step.name] = '';
             activityFail(`Step "${label}" failed — ${error?.message ?? error}`);
         }
+    };
+    // Only explicit macro dependencies impose ordering. {{steps}} needs all earlier
+    // outputs. Forward references stay empty, matching sequential execution.
+    const pending = new Set(steps.map((_, index) => index));
+    while (pending.size) {
+        const ready = [...pending].filter(index => {
+            if (settings.stepExecution === 'sequential') return index === Math.min(...pending);
+            const macros = [...String(steps[index].prompt).matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)]
+                .map(match => match[1].trim().toLowerCase());
+            return ![...pending].some(previous => previous < index && (
+                macros.includes('steps') ||
+                String(steps[previous].name ?? '').trim().toLowerCase() === String(steps[index].name ?? '').trim().toLowerCase() ||
+                macros.some(macro => macro.startsWith('step:') && macro.slice(5).trim() === String(steps[previous].name ?? '').trim().toLowerCase())
+            ));
+        });
+        await Promise.all(ready.map(index => runStep(steps[index], index)));
+        ready.forEach(index => pending.delete(index));
     }
     return stepOutputs;
 }
 
 /**
- * Optional last pass: a single synthesis call over all step outputs. Returns '' when
- * disabled or failed — the injection then falls back to the raw step blocks.
- */
-async function runFinalStep({ char, profile, chat, stepOutputs, settings }) {
-    const finalCfg = settings.finalStep;
-    if (!finalCfg || finalCfg.enabled === false) return '';
-    const template = String(finalCfg.prompt ?? '').trim();
-    if (!template) return '';
-    const resolve = makeMacroResolver({ char, profile, chat, stepOutputs, settings });
-    const text = substituteParamsSafe(expandMacros(template, resolve));
-    try {
-        const role = STEP_ROLES.includes(finalCfg.role) ? finalCfg.role : 'user';
-        activityStatus(`Final pass · ${finalCfg.name || 'Final'}`);
-        const startedAt = Date.now();
-        const result = await withInternalGeneration(() => generateVia({
-            profileId: finalCfg.profileId || '',
-            systemPrompt: role === 'system' ? `${FINAL_SYSTEM}\n\n${text}` : FINAL_SYSTEM,
-            prompt: role === 'assistant' ? [{ role: 'assistant', content: text }] : (role === 'system' ? '' : text),
-            maxTokens: Number(finalCfg.maxTokens) > 0 ? Number(finalCfg.maxTokens) : settings.stepMaxTokens,
-        }));
-        const output = String(result?.content ?? '').trim();
-        activityEntry({
-            title: `${finalCfg.name || 'Final'} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s · ${output.length} chars`,
-            text: output,
-        });
-        return output;
-    } catch (error) {
-        warn('final pass failed; falling back to the raw step blocks', error);
-        activityFail(`Final pass failed — ${error?.message ?? error}`);
-        return '';
-    }
-}
-
-/**
- * Runs the full SmartTavern flow: optional inline bootstrap, all enabled steps sequentially,
- * the optional final synthesis pass, then (unless `inject: false`) the ephemeral state-block
- * injection.
+ * Runs the full SmartTavern flow: optional inline bootstrap, enabled steps in dependency order,
+ * then (unless `inject: false`) ephemeral history injection or prompt-tail staging.
  *
- * @returns {Promise<{char, profile, stepOutputs, finalOutput}|null>} null when nothing ran
+ * @returns {Promise<{char, profile, stepOutputs, injectionText}|null>} null when nothing ran
  */
 export async function runPipeline({ chat = null, inject = true, bootstrap = true, type = 'normal' } = {}) {
     const context = getContext();
@@ -286,7 +269,10 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
     const arr = Array.isArray(chat) ? chat : (context.chat ?? []);
     if (!arr.length) return null;
 
-    if (inject) sweepEphemeral(arr);
+    if (inject) {
+        clearPromptTail();
+        sweepEphemeral(arr);
+    }
 
     const char = resolveTargetChar(arr);
     if (!char) return null;
@@ -318,20 +304,38 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         });
 
         const stepOutputs = await runSteps({ char, profile, chat: arr, settings });
-        const finalOutput = await runFinalStep({ char, profile, chat: arr, stepOutputs, settings });
+        const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings });
+        const injectionText = stepBlocks(settings, stepOutputs).length
+            ? (settings.injectAnchor === 'prompt-end'
+                ? substituteParamsSafe(expandMacros(settings.tailPrompt ?? '', resolve)).trim()
+                : assembleInjection({ settings, char, profile, chat: arr, stepOutputs }))
+            : '';
+        if (!inject) return recordLastRun({ char, profile, stepOutputs, injectionText }, 'dry run');
 
-        if (!inject) return recordLastRun({ char, profile, stepOutputs, finalOutput }, 'dry run');
-
-        const text = assembleInjection({ settings, char, profile, chat: arr, stepOutputs, finalOutput });
-        if (!text) {
+        if (settings.injectAnchor === 'prompt-end') {
+            if (injectionText) {
+                const role = STEP_ROLES.includes(settings.tailRole) ? settings.tailRole : 'assistant';
+                const reservation = stagePromptTail(injectionText, role);
+                // Preserve the actual final history message: continue-generation
+                // processing must not mistake our reservation for its target.
+                injectEphemeral(arr, reservation, settings, role, Math.max(0, arr.length - 1));
+                summary = 'Reply prompt tail prepared';
+                activityEntry({ title: `Prompt tail prepared · ${role} · ${injectionText.length} chars`, tone: 'info', text: injectionText });
+            } else summary = 'Nothing to inject';
+            return recordLastRun({ char, profile, stepOutputs, injectionText }, 'generation');
+        }
+        const blocks = assembleInjectionBlocks({ settings, char, profile, chat: arr, stepOutputs });
+        if (!blocks.length) {
             summary = 'Nothing to inject';
-            return recordLastRun({ char, profile, stepOutputs, finalOutput }, 'generation');
+            return recordLastRun({ char, profile, stepOutputs, injectionText }, 'generation');
         }
 
-        const index = injectEphemeral(arr, text, settings);
-        log(`injected state block at core chat index ${index}`);
-        activityEntry({ title: `Injecting ${text.length} chars at core chat index ${index}`, tone: 'info', text });
-        return recordLastRun({ char, profile, stepOutputs, finalOutput }, 'generation');
+        let index = resolveInjectIndex(arr, settings);
+        for (const block of blocks) {
+            injectEphemeral(arr, block.text, settings, block.role, index++);
+            activityEntry({ title: `Injecting ${block.text.length} chars as ${block.role}`, tone: 'info', text: block.text });
+        }
+        return recordLastRun({ char, profile, stepOutputs, injectionText }, 'generation');
     } catch (error) {
         failed = true;
         summary = 'Pipeline failed — see console for details';

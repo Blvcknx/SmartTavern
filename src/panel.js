@@ -287,10 +287,12 @@ function buildPanelHtml() {
 
             <div class="smarttavern_tab_panel" data-tab="steps">
                 <div class="smarttavern_hint">
-                    Each enabled step is an isolated LLM call, executed strictly in order. Steps can
+                    Each enabled step is an isolated LLM call. Steps can
                     read earlier outputs via {{step:Step Name}} and the profile via {{definitions}}
-                    or {{field:Name}}. Each step may pin its own Connection Manager profile and send
-                    its prompt as user, system or assistant text.
+                    or {{field:Name}}. Independent steps can run together; references to earlier
+                    outputs preserve their order. Each step may pin its own Connection Manager profile.
+                    Per-block roles apply to history positions. Prompt-end mode uses the tail role in Settings.
+                    Assistant is recommended for assessments. Generation instructions are sent as user requests.
                     Click a card header to collapse it.
                 </div>
                 <div id="smarttavern_steps"></div>
@@ -298,14 +300,6 @@ function buildPanelHtml() {
                     <a id="smarttavern_add_step" class="menu_button"><i class="fa-solid fa-plus"></i><span>Add step</span></a>
                     <a id="smarttavern_restore_steps" class="menu_button"><i class="fa-solid fa-rotate-left"></i><span>Restore defaults</span></a>
                 </div>
-                <div class="smarttavern_hint">
-                    The optional final pass runs once after the last step. Macros: {{steps}} (all
-                    step blocks), {{step:Name}}, {{definitions}}, {{chat}}, {{char}}, {{user}},
-                    {{field:Name}}. Injection mode “Final output only” replaces the raw step blocks
-                    with the final output; “Step blocks + [final]” keeps the step blocks and adds
-                    the final output as an extra block.
-                </div>
-                <div id="smarttavern_final_editor"></div>
             </div>
 
             <div class="smarttavern_tab_panel" data-tab="schema">
@@ -350,6 +344,12 @@ function buildPanelHtml() {
                 </label>
 
                 <div class="smarttavern_grid">
+                    <label>Step execution
+                        <select id="smarttavern_stepExecution">
+                            <option value="dependencies"${settings.stepExecution !== 'sequential' ? ' selected' : ''}>Parallel where independent</option>
+                            <option value="sequential"${settings.stepExecution === 'sequential' ? ' selected' : ''}>Sequential</option>
+                        </select>
+                    </label>
                     <label>Update every N messages
                         <input id="smarttavern_updateInterval" class="text_margin_input" type="number" min="1" max="200" step="1" value="${settings.updateInterval}">
                     </label>
@@ -371,7 +371,8 @@ function buildPanelHtml() {
                 </div>
 
                 <label>Injection position
-                    <select id="smarttavern_injectAnchor" title="Where the state block sits relative to the user's latest message">
+                    <select id="smarttavern_injectAnchor" title="Where generated assessments enter the reply prompt">
+                        <option value="prompt-end"${settings.injectAnchor === 'prompt-end' ? ' selected' : ''}>End of assembled reply prompt</option>
                         <option value="before-last-user"${settings.injectAnchor === 'before-last-user' ? ' selected' : ''}>Before the user's latest message</option>
                         <option value="after-last-user"${settings.injectAnchor === 'after-last-user' ? ' selected' : ''}>After the user's latest message</option>
                         <option value="top-of-history"${settings.injectAnchor === 'top-of-history' ? ' selected' : ''}>Top of chat history</option>
@@ -379,13 +380,24 @@ function buildPanelHtml() {
                     </select>
                 </label>
 
-                <label>Injection name (message author used in prompts)
+                <label>Prompt-tail role
+                    <select id="smarttavern_tailRole" title="Role of the complete assembled tail; use this to compare model behavior">
+                        <option value="assistant"${settings.tailRole === 'assistant' ? ' selected' : ''}>Assistant</option>
+                        <option value="user"${settings.tailRole === 'user' ? ' selected' : ''}>User</option>
+                        <option value="system"${settings.tailRole === 'system' ? ' selected' : ''}>System</option>
+                    </select>
+                </label>
+                <label>Reply prompt-tail template
+                    <textarea id="smarttavern_tailPrompt" class="smarttavern_textarea" rows="8">${escapeHtml(settings.tailPrompt)}</textarea>
+                </label>
+                <div class="smarttavern_hint">Prompt-end mode assembles this template locally after block generation. Include {{steps}} for all generated assessments, or {{step:Name}} for individual blocks. No extra LLM call. The tail is context for the upcoming reply. Header/footer and per-block roles below apply only to history positions.</div>
+                <label>History injection name (fallback author)
                     <input id="smarttavern_injectName" class="text_margin_input" type="text" value="${escapeHtml(settings.injectName)}">
                 </label>
-                <label>Injection header (macros: {{char}}, {{user}}, {{definitions}}, {{chat}})
+                <label>History header (macros: {{char}}, {{user}}, {{definitions}}, {{chat}})
                     <textarea id="smarttavern_injectionHeader" class="smarttavern_textarea" rows="4">${escapeHtml(settings.injectionHeader)}</textarea>
                 </label>
-                <label>Injection footer
+                <label>History footer
                     <textarea id="smarttavern_injectionFooter" class="smarttavern_textarea" rows="2">${escapeHtml(settings.injectionFooter)}</textarea>
                 </label>
 
@@ -443,6 +455,8 @@ const PANEL_CONTROLS = [
     ['smarttavern_injectName', 'injectName', 'text'],
     ['smarttavern_injectionHeader', 'injectionHeader', 'text'],
     ['smarttavern_injectionFooter', 'injectionFooter', 'text'],
+    ['smarttavern_tailPrompt', 'tailPrompt', 'text'],
+    ['smarttavern_tailRole', 'tailRole', 'text'],
 ];
 
 function wireGeneralControls() {
@@ -477,7 +491,11 @@ function wireGeneralControls() {
 
     const anchorEl = $panel().find('#smarttavern_injectAnchor').get(0);
     anchorEl?.addEventListener('change', () => {
-        getSettings().injectAnchor = String(anchorEl.value ?? 'before-last-user');
+        getSettings().injectAnchor = String(anchorEl.value ?? 'prompt-end');
+        saveSettings();
+    });
+    $panel().find('#smarttavern_stepExecution').on('change', function () {
+        getSettings().stepExecution = this.value;
         saveSettings();
     });
 }
@@ -681,7 +699,7 @@ function renderStepEditor() {
     const settings = getSettings();
     const $container = $panel().find('#smarttavern_steps').empty();
     settings.steps.forEach((step, index) => {
-        const role = STEP_ROLES.includes(step.role) ? step.role : 'user';
+        const role = STEP_ROLES.includes(step.role) ? step.role : 'assistant';
         const card = $(`
             <div class="smarttavern_step_card">
                 <div class="smarttavern_step_header">
@@ -692,7 +710,7 @@ function renderStepEditor() {
                         <span>Enabled</span>
                     </label>
                     <input class="text_margin_input smarttavern_step_name" type="text" value="${escapeHtml(step.name)}" title="Step name (target of {{step:Name}})">
-                    <select class="smarttavern_step_role" title="Send this step's prompt as: user = task request, system = standing instruction, assistant = continuation/prefill">
+                    <select class="smarttavern_step_role" title="Role for history injection; prompt-end mode uses the tail role from Settings">
                         <option value="user"${role === 'user' ? ' selected' : ''}>User</option>
                         <option value="system"${role === 'system' ? ' selected' : ''}>System</option>
                         <option value="assistant"${role === 'assistant' ? ' selected' : ''}>Assistant</option>
@@ -747,84 +765,7 @@ function renderStepEditor() {
         });
         $container.append(card);
     });
-    renderFinalEditor();
     refreshProfileSelects();
-}
-
-/** Steps-tab card for the optional final pass: one synthesis call after the last step. */
-function renderFinalEditor() {
-    const settings = getSettings();
-    settings.finalStep ??= { enabled: false, name: 'Final', profileId: '', role: 'user', maxTokens: 0, mode: 'replace', prompt: '' };
-    const final = settings.finalStep;
-    const role = STEP_ROLES.includes(final.role) ? final.role : 'user';
-    const mode = final.mode === 'append' ? 'append' : 'replace';
-    const $container = $panel().find('#smarttavern_final_editor').empty();
-    const card = $(`
-        <div class="smarttavern_step_card">
-            <div class="smarttavern_step_header">
-                <div class="smarttavern_step_chevron fa-solid fa-chevron-down" title="Collapse / expand"></div>
-                <label class="checkbox" title="Run a final synthesis pass after the last step">
-                    <input class="smarttavern_final_enabled" type="checkbox" ${final.enabled ? 'checked' : ''}>
-                    <i class="fa-solid fa-check"></i>
-                    <span>Final pass</span>
-                </label>
-                <input class="text_margin_input smarttavern_final_name" type="text" value="${escapeHtml(final.name || 'Final')}" title="Block name used in append mode">
-                <select class="smarttavern_final_profile smarttavern_profile_select" title="Connection profile for the final pass"></select>
-            </div>
-            <textarea class="smarttavern_step_prompt smarttavern_final_prompt" rows="6" placeholder="Final prompt. Macros: {{steps}}, {{step:Name}}, {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{field:Name}}">${escapeHtml(final.prompt)}</textarea>
-            <div class="smarttavern_grid">
-                <label>Sent as
-                    <select class="smarttavern_final_role" title="Send the final prompt as user, system or assistant text">
-                        <option value="user"${role === 'user' ? ' selected' : ''}>User</option>
-                        <option value="system"${role === 'system' ? ' selected' : ''}>System</option>
-                        <option value="assistant"${role === 'assistant' ? ' selected' : ''}>Assistant</option>
-                    </select>
-                </label>
-                <label>Max tokens (0 = step max)
-                    <input class="text_margin_input smarttavern_final_tokens" type="number" min="0" max="8192" step="16" value="${Number(final.maxTokens ?? 0)}">
-                </label>
-                <label>Injected block
-                    <select class="smarttavern_final_mode" title="What replaces the state block in the prompt">
-                        <option value="replace"${mode === 'replace' ? ' selected' : ''}>Final output only</option>
-                        <option value="append"${mode === 'append' ? ' selected' : ''}>Step blocks + [final]</option>
-                    </select>
-                </label>
-            </div>
-        </div>`);
-    // Same collapse behavior as the step cards.
-    card.find('.smarttavern_step_header').on('click', (event) => {
-        if ($(event.target).closest('input, select, label, a, .menu_button').length) return;
-        card.toggleClass('collapsed');
-    });
-    card.find('.smarttavern_final_enabled').on('change', function () {
-        final.enabled = /** @type {HTMLInputElement} */ (this).checked;
-        saveSettings();
-    });
-    card.find('.smarttavern_final_name').on('input', function () {
-        final.name = String(/** @type {HTMLInputElement} */ (this).value);
-        saveSettings();
-    });
-    card.find('.smarttavern_final_prompt').on('input', function () {
-        final.prompt = String(/** @type {HTMLTextAreaElement} */ (this).value);
-        saveSettings();
-    });
-    card.find('.smarttavern_final_profile').on('change', function () {
-        final.profileId = String(/** @type {HTMLSelectElement} */ (this).value ?? '');
-        saveSettings();
-    });
-    card.find('.smarttavern_final_role').on('change', function () {
-        final.role = String(/** @type {HTMLSelectElement} */ (this).value);
-        saveSettings();
-    });
-    card.find('.smarttavern_final_tokens').on('input', function () {
-        final.maxTokens = coerceNumber(this, Number(final.maxTokens ?? 0));
-        saveSettings();
-    });
-    card.find('.smarttavern_final_mode').on('change', function () {
-        final.mode = String(/** @type {HTMLSelectElement} */ (this).value) === 'append' ? 'append' : 'replace';
-        saveSettings();
-    });
-    $container.append(card);
 }
 
 function profileOptionsHtml(selectedId = '') {
@@ -847,9 +788,7 @@ export function refreshProfileSelects() {
         const step = settings.steps?.[index];
         $(this).html(profileOptionsHtml(step?.profileId ?? ''));
     });
-    $panel().find('.smarttavern_final_profile').each(function () {
-        $(this).html(profileOptionsHtml(settings.finalStep?.profileId ?? ''));
-    });
+
 }
 
 // --------------------------------------------------------------------------------------------
@@ -876,7 +815,7 @@ async function restoreDefaultFields() {
 
 function addStep() {
     const settings = getSettings();
-    settings.steps.push({ name: `Step ${settings.steps.length + 1}`, enabled: true, role: 'user', profileId: '', prompt: '' });
+    settings.steps.push({ name: `Step ${settings.steps.length + 1}`, enabled: true, role: 'assistant', profileId: '', prompt: '' });
     saveSettings();
     renderStepEditor();
 }
@@ -982,9 +921,7 @@ function renderResultsTab() {
         const output = result.stepOutputs?.[step.name] ?? '';
         appendSection(body, step.name || 'Step', output || '(no output — failed or empty, see browser console)');
     }
-    if (getSettings().finalStep?.enabled) {
-        appendSection(body, 'Final pass', String(result.finalOutput ?? '').trim() || '(no output — failed or empty, see browser console)');
-    }
+    if (result.injectionText) appendSection(body, 'Assembled reply context', result.injectionText);
 }
 
 /** Dry-runs the pipeline and surfaces the outputs (Results tab, or a popup if the floating UI is off). */
@@ -1000,9 +937,7 @@ export async function showRunResults() {
         for (const step of (getSettings().steps ?? []).filter(s => s?.enabled !== false)) {
             appendSection(container, step.name || 'Step', result.stepOutputs?.[step.name] || '(no output — failed or empty, see browser console)');
         }
-        if (getSettings().finalStep?.enabled) {
-            appendSection(container, 'Final pass', String(result.finalOutput ?? '').trim() || '(no output — failed or empty, see browser console)');
-        }
+        if (result.injectionText) appendSection(container, 'Assembled reply context', result.injectionText);
         await showContentPopup('SmartTavern — pipeline dry run', container);
         return;
     }

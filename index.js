@@ -7,10 +7,14 @@ import { smarttavernInterceptor, sweepEphemeral, resetBootstrapFailures } from '
 import { maybeAutoUpdate } from './src/profiles.js';
 import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
+import { initPromptTail } from './src/tail.js';
 
 async function initSmartTavern() {
     const context = getContext();
     loadSettings();
+    // ST exposes eventTypes; older builds/extensions may use event_types.
+    const events = context.event_types ?? context.eventTypes;
+    initPromptTail();
 
     // manifest.json points at this global function name (generate_interceptor);
     // it must exist before the next generation starts.
@@ -18,15 +22,15 @@ async function initSmartTavern() {
 
     // Defensive sweeps — the pipeline injects into the per-generation core chat copy,
     // so the real chat history should never contain ephemeral messages.
-    context.eventSource.on(context.event_types.GENERATION_ENDED, () => sweepEphemeral());
-    context.eventSource.on(context.event_types.MESSAGE_DELETED, () => sweepEphemeral());
-    context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
+    context.eventSource.on(events.GENERATION_ENDED, () => sweepEphemeral());
+    context.eventSource.on(events.MESSAGE_DELETED, () => sweepEphemeral());
+    context.eventSource.on(events.CHAT_CHANGED, () => {
         sweepEphemeral();
         resetBootstrapFailures();
     });
 
     // Background profile maintenance after each character reply.
-    context.eventSource.on(context.event_types.MESSAGE_RECEIVED, onMessageReceived);
+    context.eventSource.on(events.MESSAGE_RECEIVED, onMessageReceived);
 
     try {
         initUI();
