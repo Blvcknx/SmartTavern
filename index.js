@@ -2,8 +2,8 @@
 // Loads settings, registers the manifest-referenced generation interceptor,
 // wires lifecycle events and builds the settings UI.
 import { getContext } from '../../../extensions.js';
-import { loadSettings, log, warn } from './src/state.js';
-import { smarttavernInterceptor, sweepEphemeral, resetBootstrapFailures } from './src/pipeline.js';
+import { loadSettings, getSettings, log, warn } from './src/state.js';
+import { smarttavernInterceptor, sweepEphemeral, resetBootstrapFailures, runRefinementPipeline } from './src/pipeline.js';
 import { maybeAutoUpdate } from './src/profiles.js';
 import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
@@ -32,6 +32,11 @@ async function initSmartTavern() {
     // Background profile maintenance after each character reply.
     context.eventSource.on(events.MESSAGE_RECEIVED, onMessageReceived);
 
+    // Refinement mode: refine the fresh reply once it is rendered, then run the
+    // profile auto-update so it reads the refined message (never in parallel).
+    const refineEvent = events.CHARACTER_MESSAGE_RENDERED ?? events.MESSAGE_RECEIVED;
+    context.eventSource.on(refineEvent, onCharacterMessageRendered);
+
     try {
         initUI();
     } catch (error) {
@@ -54,9 +59,26 @@ function onMessageReceived(messageId) {
         const message = Number.isInteger(messageId) ? arr[messageId] : arr[arr.length - 1];
         if (!message) return;
         if (message.is_user || message.is_system || message.smarttavern_ephemeral) return;
+        const settings = getSettings();
+        // In refinement mode the auto-update runs after refinement completes
+        // (see onCharacterMessageRendered) so it reads the refined reply.
+        if (settings.enabled && settings.pipelineMode === 'refinement') return;
         maybeAutoUpdate(message);
     } catch (error) {
         warn('MESSAGE_RECEIVED handler failed', error);
+    }
+}
+
+async function onCharacterMessageRendered(messageId) {
+    try {
+        const context = getContext();
+        const settings = getSettings();
+        if (!settings.enabled || settings.pipelineMode !== 'refinement') return;
+        await runRefinementPipeline(messageId);
+        // Auto-update only after refinement finishes, so the updater reads the refined reply.
+        maybeAutoUpdate(context.chat?.[messageId]);
+    } catch (error) {
+        warn('refinement hook failed', error);
     }
 }
 

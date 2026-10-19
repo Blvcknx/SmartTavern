@@ -26,6 +26,7 @@ export const DEFAULT_STEPS = Object.freeze([
         enabled: true,
         role: 'assistant',
         profileId: '',
+        lookback: null,
         prompt: [
             'You are narrating the body of {{char}}.',
             '',
@@ -43,6 +44,7 @@ export const DEFAULT_STEPS = Object.freeze([
         enabled: true,
         role: 'assistant',
         profileId: '',
+        lookback: null,
         prompt: [
             'You are narrating the mind of {{char}}.',
             '',
@@ -60,6 +62,73 @@ export const DEFAULT_STEPS = Object.freeze([
     },
 ]);
 
+// Valid pipeline modes: 'refinement' post-edits the freshly generated reply;
+// 'expansion' injects step outputs into the reply prompt before generation.
+export const PIPELINE_MODES = Object.freeze(['refinement', 'expansion']);
+
+// Preset for 'refinement' mode: each pass audits and surgically edits the fresh reply.
+// Per-step `lookback`: messages of chat history for {{chat}} in that step
+// (null = use the global `chatLookback`, 0 = no chat history).
+export const DEFAULT_REFINEMENT_STEPS = Object.freeze([
+    {
+        name: 'Body & Spatial Awareness',
+        enabled: true,
+        role: 'assistant',
+        profileId: '',
+        lookback: 3,
+        prompt: [
+            'You are auditing the latest reply of {{char}} (the DRAFT) for body and spatial continuity.',
+            '',
+            'Recent conversation (context):',
+            '{{chat}}',
+            '',
+            'DRAFT reply to refine:',
+            '{{draft}}',
+            '',
+            'Task: Check the draft against the recent conversation for physical posture and position, held or worn objects, injuries, pain, exhaustion, arousal, breathing, and the continuity of the surrounding space and anatomy. Fix ONLY physical and spatial inconsistencies with minimal, surgical edits so positions, objects and body states agree with the conversation. Preserve every event, action, line of dialogue (including its meaning), pacing, formatting and length.',
+            'First reason briefly inside <audit>...</audit>, then output the full corrected reply inside <revised_reply>...</revised_reply>. If nothing needs changing, output <audit>PASS</audit> and nothing else.',
+        ].join('\n'),
+    },
+    {
+        name: 'Character & Psychological Authenticity',
+        enabled: true,
+        role: 'assistant',
+        profileId: '',
+        lookback: 6,
+        prompt: [
+            'You are auditing the latest reply of {{char}} (the DRAFT) for character and psychological authenticity.',
+            '',
+            'Character definitions:',
+            '{{definitions}}',
+            '',
+            'Recent conversation (context):',
+            '{{chat}}',
+            '',
+            'DRAFT reply to refine:',
+            '{{draft}}',
+            '',
+            'Task: Check the draft against the character definitions and the recent conversation for voice and speech patterns, psychology, temperament, values, fears, aspirations, and motivations. Adjust ONLY passages that break character or motivation consistency — surgical adjustments, never full rewrites. Preserve every event, action, line of dialogue (including its meaning), pacing, formatting and length.',
+            'First reason briefly inside <audit>...</audit>, then output the full adjusted reply inside <revised_reply>...</revised_reply>. If nothing needs changing, output <audit>PASS</audit> and nothing else.',
+        ].join('\n'),
+    },
+    {
+        name: 'Prose & Wording Polish',
+        enabled: true,
+        role: 'assistant',
+        profileId: '',
+        lookback: 0,
+        prompt: [
+            'You are polishing the prose of the latest reply of {{char}} (the DRAFT).',
+            '',
+            'DRAFT reply to polish:',
+            '{{draft}}',
+            '',
+            'Task: Perform purely linguistic and prose enhancements — wording choice, sentence flow, repetition removal, grammar, punctuation and paragraphing. Do NOT alter events, actions, or the meaning of any dialogue, and do not add or remove information. Judge the text on its own; no chat history or character definitions are provided.',
+            'First reason briefly inside <audit>...</audit>, then output the full polished reply inside <revised_reply>...</revised_reply>. If the prose is already clean, output <audit>PASS</audit> and nothing else.',
+        ].join('\n'),
+    },
+]);
+
 // Valid values for per-step and tail `role` and the injection anchor.
 export const STEP_ROLES = Object.freeze(['user', 'system', 'assistant']);
 export const INJECT_ANCHORS = Object.freeze(['prompt-end', 'before-last-user', 'after-last-user', 'top-of-history', 'depth']);
@@ -68,6 +137,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     autoUpdate: true,
     bootstrapOnFirstMessage: true,
+    // Dual-mode pipeline: 'refinement' post-edits the freshly generated reply (default);
+    // 'expansion' injects step outputs before generation (classic behavior).
+    pipelineMode: 'refinement',
+    savePassesAsSwipes: true,
     updateInterval: 12,
     chatLookback: 24,
     profileUpdateLookback: 24,
@@ -138,11 +211,15 @@ export function deepMerge(target, source) {
 }
 
 /**
- * Repairs invalid roles/anchors and migrates the removed consolidation pass to
- * local prompt-tail assembly. Existing steps keep their content.
+ * Repairs invalid modes/roles/anchors/lookbacks and migrates the removed
+ * consolidation pass to local prompt-tail assembly. Existing steps keep their content.
  */
 function normalizeSettings(settings) {
     let changed = false;
+    if (!PIPELINE_MODES.includes(settings.pipelineMode)) {
+        settings.pipelineMode = 'refinement';
+        changed = true;
+    }
     // Roles formerly selected the role of the generation instructions. They now
     // describe generated output in the reply prompt. Start existing configs as assistant.
     if (settings.outputRolesVersion !== 1) {
@@ -156,6 +233,13 @@ function normalizeSettings(settings) {
         if (!isPlainObject(step)) continue;
         if (!STEP_ROLES.includes(step.role)) {
             step.role = 'assistant';
+            changed = true;
+        }
+        const lookback = typeof step.lookback === 'number' && Number.isFinite(step.lookback)
+            ? Math.max(0, Math.round(step.lookback))
+            : null;
+        if (step.lookback !== lookback) {
+            step.lookback = lookback;
             changed = true;
         }
     }

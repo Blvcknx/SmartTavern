@@ -70,6 +70,12 @@
     min-width: 120px;
 }
 
+/* Per-step chat lookback: compact number box with "Global" placeholder. */
+.smarttavern_step_header .smarttavern_step_lookback {
+    width: 72px;
+    flex: 0 0 auto;
+}
+
 .smarttavern_step_prompt {
     width: 100%;
     min-height: 110px;
