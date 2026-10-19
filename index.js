@@ -8,6 +8,7 @@ import { maybeAutoUpdate } from './src/profiles.js';
 import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
 import { initPromptTail } from './src/tail.js';
+import { dismissAllVeils } from './src/veil.js';
 
 async function initSmartTavern() {
     const context = getContext();
@@ -27,6 +28,9 @@ async function initSmartTavern() {
     context.eventSource.on(events.CHAT_CHANGED, () => {
         sweepEphemeral();
         resetBootstrapFailures();
+        // An in-flight refinement may still be veiling a message from the previous chat;
+        // its DOM is gone, so this only clears bookkeeping and any stray overlay.
+        dismissAllVeils();
     });
 
     // Background profile maintenance after each character reply.

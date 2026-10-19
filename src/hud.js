@@ -14,6 +14,7 @@ export function initHud() {
     bindAvatarContextMenu();
     bindLongPress();
     bindDismissal();
+    bindAvatarBadges();
     $(document).on('smarttavern:floating-changed', () => {
         applyFloatingMode();
     });
@@ -186,11 +187,7 @@ function handleMenuAction(action, char) {
         case 'update':
             updateProfile(char, { notify: true })
                 .then((result) => {
-                    if (!result) {
-                        toastr.info('Update already in progress for this character.', 'SmartTavern');
-                        return;
-                    }
-                    document.dispatchEvent(new CustomEvent('smarttavern:profile-updated', { detail: { key: charKey(char) } }));
+                    if (!result) toastr.info('Update already in progress for this character.', 'SmartTavern');
                 })
                 .catch((error) => {
                     console.error('[SmartTavern] quick profile update failed', error);
@@ -217,4 +214,44 @@ function bindDismissal() {
             hideMenu();
         }
     }, true);
+}
+
+// --------------------------------------------------------------------------------------------
+// Avatar change badges — silent background profile updates leave a dot on the character's
+// avatars in chat; clicking it opens the profile (and shows the field diff).
+// --------------------------------------------------------------------------------------------
+
+function bindAvatarBadges() {
+    $(document).on('smarttavern:profile-updated', (event) => {
+        const detail = event.originalEvent?.detail;
+        if (!detail?.silent || !Array.isArray(detail.changedFields) || !detail.changedFields.length) return;
+        badgeAvatars(String(detail.key ?? ''));
+    });
+
+    $(document).on('click', '.smarttavern_avatar_dot', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const key = String($(event.currentTarget).data('key') ?? '');
+        if (!key) return;
+        // Viewing the profile dismisses every dot of that character.
+        $('.smarttavern_avatar_dot').each(function () {
+            if (String($(this).data('key') ?? '') === key) $(this).remove();
+        });
+        openPanel('profile', { charKey: key });
+    });
+}
+
+function badgeAvatars(key) {
+    if (!key || floatingDisabled()) return;
+    // charKey is the avatar filename; chat avatars render via /thumbnail?...&file=<encoded>.
+    const needle = encodeURIComponent(key);
+    const attrKey = String(key).replace(/"/g, '&quot;');
+    $('#chat .mes .avatar img').each(function () {
+        const src = this.getAttribute('src') ?? '';
+        if (!src.includes(needle)) return;
+        const $avatar = $(this).closest('.avatar');
+        if ($avatar.find('.smarttavern_avatar_dot').length) return;
+        $avatar.css('position', 'relative');
+        $avatar.append(`<span class="smarttavern_avatar_dot" data-key="${attrKey}" title="Living profile changed in the background — click to view"><i class="fa-solid fa-arrows-rotate"></i></span>`);
+    });
 }

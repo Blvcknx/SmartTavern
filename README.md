@@ -83,6 +83,10 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Setting | Meaning |
 | --- | --- |
 | Enable SmartTavern | Master toggle for the pipeline injection |
+| Pipeline mode | Refinement (default): the reply is drafted first, then each enabled step refines it in order. Expansion: steps run before generation and inject context. |
+| Refinement display | **Veiled** (default): the fresh reply is blurred in chat until the final pass lands — pass progress shows as chips on the message and a hold-to-peek button can partially unblur it. **Off**: every pass lands visibly. |
+| Allow hold-to-peek | Shows the hold-to-peek button on the veil (on by default) |
+| Save refinement passes as swipes | Appends changed revisions to the message swipes. Veiled runs keep only draft + final so the swipes cannot spoil the result. |
 | Auto-update profiles | Background maintenance on `MESSAGE_RECEIVED` |
 | Bootstrap profile on first message | First generation for a character = complete rewrite of the card into the schema |
 | Update every N messages | Cadence per character (default 12) |
@@ -138,7 +142,7 @@ Use independent blocks for assessments that can use the same profile and convers
 ## Storage & privacy
 
 - Global config: `extensionSettings.smarttavern` (in `settings.json`).
-- Profiles: `chatMetadata.smarttavern = { version, profiles: { [avatar]: { fields, createdAt, updatedAt, source } } }` — saved with the chat, invisible to the character card.
+- Profiles: `chatMetadata.smarttavern = { version, profiles: { [avatar]: { fields, createdAt, updatedAt, source, lastDiff? } } }` — saved with the chat, invisible to the character card. `lastDiff` records the field-level before/after of the most recent background update (cleared by manual edits).
 - No secrets are stored; connection profiles reference the Connection Manager's own records.
 - Every generation makes up to `1 (bootstrap) + steps` extra LLM calls — mind your provider quota/billing. Prompt-tail assembly makes no model call.
 
@@ -151,7 +155,7 @@ Use independent blocks for assessments that can use the same profile and convers
 
 ## Roadmap (out of v1)
 
-Per-field immutability locks; update-diff preview before applying (SkyrimNet-style); drag-to-reorder for steps; profile-value diff view; `{{smarttavern:Field}}` macros usable in character cards/presets; per-step reasoning/thinking presets.
+Per-field immutability locks; update-diff preview before applying (SkyrimNet-style); drag-to-reorder for steps; `{{smarttavern:Field}}` macros usable in character cards/presets; per-step reasoning/thinking presets.
 
 ## Regression checks
 

@@ -7,7 +7,7 @@ import {
     getStoredProfile, getMainCharacter, resolveMemberByMessageName, substituteParamsSafe,
 } from './state.js';
 import { generateVia, withInternalGeneration } from './gen.js';
-import { activityStart, activityEntry, activityFail, activityEnd } from './progress.js';
+import { activityStart, activityEntry, activityFail, activityEnd, activitySteps } from './progress.js';
 
 const busyKeys = new Set();
 
@@ -72,6 +72,18 @@ export function serializeProfile(profile, fields) {
         }
     }
     return blocks.join('\n\n');
+}
+
+/** Field-level diff between two field maps: only changed or newly added fields. */
+export function diffFields(previous, next) {
+    const out = Object.create(null);
+    if (!isPlainObject(previous) || !isPlainObject(next)) return out;
+    for (const [name, value] of Object.entries(next)) {
+        const before = typeof previous[name] === 'string' ? previous[name].trim() : '';
+        const after = typeof value === 'string' ? value.trim() : '';
+        if (before !== after) out[name] = { from: previous[name] ?? '', to: value ?? '' };
+    }
+    return out;
 }
 
 /** Lenient JSON extraction: strips code fences, slices the first '{' … last '}'. */
@@ -171,6 +183,7 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
     busyKeys.add(key);
     try {
         activityStart({ status: `${source === 'rebuild' ? 'Rebuilding' : 'Compiling'} profile · ${char.name}` });
+        activitySteps({ names: [] }); // profile runs have no passes — clear any stale chip row
         const context = getContext();
         const fields = Array.isArray(settings.fields) ? settings.fields : [];
         const schema = buildJsonSchema(fields);
@@ -190,6 +203,7 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
         const record = { fields: parsed.fields, createdAt: now, updatedAt: now, source };
         setStoredProfile(key, record);
         log(`profile ${source} written for "${key}"`);
+        notifyProfileUpdated({ key, silent: !notify, changedFields: Object.keys(parsed.fields) });
         if (notify) toastr.success(`Profile for ${char.name} ${source === 'rebuild' ? 'rebuilt' : 'created'}.`, 'SmartTavern');
         activityEnd({ ok: true, summary: `${source === 'rebuild' ? 'Profile rebuilt' : 'Profile created'} · ${char.name}` });
         return record;
@@ -220,6 +234,7 @@ export async function updateProfile(char, { notify = true } = {}) {
     busyKeys.add(key);
     try {
         activityStart({ status: `Updating profile · ${char.name}` });
+        activitySteps({ names: [] }); // profile runs have no passes — clear any stale chip row
         const context = getContext();
         const fields = Array.isArray(settings.fields) ? settings.fields : [];
         const schema = buildJsonSchema(fields);
@@ -235,14 +250,17 @@ export async function updateProfile(char, { notify = true } = {}) {
         activityEntry({ title: `Profile payload · ${rawContent.length} chars`, tone: 'info', text: rawContent });
         const parsed = normalizeProfileJson(extractJson(rawContent), fields, existing);
         if (!parsed) throw new Error('The model did not return a usable profile object');
+        const diff = diffFields(existing?.fields, parsed.fields);
         const record = {
             ...existing,
             fields: parsed.fields,
             updatedAt: (context.chat ?? []).length,
             source: 'update',
+            lastDiff: { at: (context.chat ?? []).length, source: 'update', fields: diff },
         };
         setStoredProfile(key, record);
-        log(`profile updated for "${key}"`);
+        log(`profile updated for "${key}" (${Object.keys(diff).length} field change(s))`);
+        notifyProfileUpdated({ key, silent: !notify, changedFields: Object.keys(diff) });
         if (notify) toastr.success(`Profile for ${char.name} updated.`, 'SmartTavern');
         activityEnd({ ok: true, summary: `Profile updated · ${char.name}` });
         return record;
@@ -257,6 +275,16 @@ export async function updateProfile(char, { notify = true } = {}) {
 
 export function resetProfile(key) {
     return deleteStoredProfile(key);
+}
+
+/**
+ * Single source of truth for the profile-updated DOM event. `silent` marks background
+ * auto-updates (no toast) — hud.js uses it to badge the character's avatars in chat.
+ */
+function notifyProfileUpdated({ key, silent, changedFields }) {
+    document.dispatchEvent(new CustomEvent('smarttavern:profile-updated', {
+        detail: { key, silent, changedFields: Array.isArray(changedFields) ? changedFields : [] },
+    }));
 }
 
 /**

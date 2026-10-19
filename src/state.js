@@ -140,6 +140,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
     // Dual-mode pipeline: 'refinement' post-edits the freshly generated reply (default);
     // 'expansion' injects step outputs before generation (classic behavior).
     pipelineMode: 'refinement',
+    // 'veiled' blurs the fresh reply in chat until the final pass lands (spoiler-free);
+    // 'off' keeps the classic behavior where every pass lands visibly in the message.
+    refinementDisplay: 'veiled',
+    veilAllowPeek: true,
     savePassesAsSwipes: true,
     updateInterval: 12,
     chatLookback: 24,
@@ -218,6 +222,14 @@ function normalizeSettings(settings) {
     let changed = false;
     if (!PIPELINE_MODES.includes(settings.pipelineMode)) {
         settings.pipelineMode = 'refinement';
+        changed = true;
+    }
+    if (settings.refinementDisplay !== 'veiled' && settings.refinementDisplay !== 'off') {
+        settings.refinementDisplay = 'veiled';
+        changed = true;
+    }
+    if (typeof settings.veilAllowPeek !== 'boolean') {
+        settings.veilAllowPeek = true;
         changed = true;
     }
     // Roles formerly selected the role of the generation instructions. They now

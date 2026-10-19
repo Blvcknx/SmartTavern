@@ -15,6 +15,7 @@ import {
 import { listConnectionProfiles } from './gen.js';
 import { runPipeline, getLastRunResult } from './pipeline.js';
 import { rebuildProfile, updateProfile, resetProfile, serializeProfile } from './profiles.js';
+import { chipsHtml } from './chips.js';
 
 const TABS = ['profile', 'steps', 'schema', 'results', 'settings'];
 
@@ -104,6 +105,13 @@ export function initPanel() {
     // Fired after programmatic profile writes (quick update from the avatar menu, panel buttons).
     document.addEventListener('smarttavern:profile-updated', () => {
         if (isPanelOpen() && activeTab === 'profile') renderProfileTab();
+    });
+
+    // Busy-state awareness: the activity HUD mirrors every tracked LLM run; mirror its
+    // state onto the panel so generation actions visibly pause while a run is in flight.
+    $(document).on('smarttavern:progress', (event) => {
+        const active = Boolean(event.originalEvent?.detail?.active);
+        $panel().toggleClass('is-busy', active);
     });
 
     log('floating panel ready');
@@ -265,6 +273,10 @@ function buildPanelHtml() {
             <a class="smarttavern_tab_button" data-tab="results" title="Latest pipeline run"><i class="fa-solid fa-square-poll-horizontal"></i><span>Results</span></a>
             <a class="smarttavern_tab_button" data-tab="settings" title="Settings"><i class="fa-solid fa-sliders"></i><span>Settings</span></a>
         </div>
+        <div id="smarttavern_busy_banner" title="A SmartTavern run is in flight — generation actions resume when it finishes">
+            <i class="fa-solid fa-circle-notch fa-spin"></i>
+            <span>SmartTavern is running — actions are paused</span>
+        </div>
         <div class="smarttavern_panel_body">
 
             <div class="smarttavern_tab_panel" data-tab="profile">
@@ -279,9 +291,9 @@ function buildPanelHtml() {
                     Edit any field above — changes save automatically. Future LLM updates merge around your edits.
                 </div>
                 <div class="smarttavern_row_actions">
-                    <a id="smarttavern_profile_update" class="menu_button" title="Low-drift update from the recent conversation"><i class="fa-solid fa-arrows-rotate"></i><span>Update now</span></a>
-                    <a id="smarttavern_profile_rebuild" class="menu_button" title="Full rewrite from the character card"><i class="fa-solid fa-wand-magic-sparkles"></i><span>Rebuild</span></a>
-                    <a id="smarttavern_profile_reset" class="menu_button" title="Delete the stored profile"><i class="fa-solid fa-trash"></i><span>Reset</span></a>
+                    <a id="smarttavern_profile_update" class="menu_button smarttavern_busy_guard" title="Low-drift update from the recent conversation"><i class="fa-solid fa-arrows-rotate"></i><span>Update now</span></a>
+                    <a id="smarttavern_profile_rebuild" class="menu_button smarttavern_busy_guard" title="Full rewrite from the character card"><i class="fa-solid fa-wand-magic-sparkles"></i><span>Rebuild</span></a>
+                    <a id="smarttavern_profile_reset" class="menu_button smarttavern_busy_guard" title="Delete the stored profile"><i class="fa-solid fa-trash"></i><span>Reset</span></a>
                 </div>
             </div>
 
@@ -321,7 +333,7 @@ function buildPanelHtml() {
 
             <div class="smarttavern_tab_panel" data-tab="results">
                 <div class="smarttavern_row_actions">
-                    <a id="smarttavern_run_now" class="menu_button" title="Dry run: executes the steps without changing anything (refinement mode previews the final reply)"><i class="fa-solid fa-play"></i><span>Run pipeline now</span></a>
+                    <a id="smarttavern_run_now" class="menu_button smarttavern_busy_guard" title="Dry run: executes the steps without changing anything (refinement mode previews the final reply)"><i class="fa-solid fa-play"></i><span>Run pipeline now</span></a>
                 </div>
                 <div id="smarttavern_results_body"></div>
             </div>
@@ -334,9 +346,21 @@ function buildPanelHtml() {
                     </select>
                 </label>
                 <div class="smarttavern_refinement_only">
-                    <label class="checkbox" title="Each pass that changes the reply is appended to the message swipes so you can browse the draft and every revision">
+                    <label>Refinement display
+                        <select id="smarttavern_refinementDisplay" title="Veiled blurs the fresh reply in chat until the final pass is ready; Off shows every pass as it lands">
+                            <option value="veiled"${settings.refinementDisplay !== 'off' ? ' selected' : ''}>Veiled — hide the draft until refinement finishes</option>
+                            <option value="off"${settings.refinementDisplay === 'off' ? ' selected' : ''}>Off — show each pass as it is written</option>
+                        </select>
+                    </label>
+                    <div class="smarttavern_veil_only">
+                        <label class="checkbox" title="While held, the veil partially unblurs so you can check the current draft">
+                            <input id="smarttavern_veilAllowPeek" type="checkbox" ${settings.veilAllowPeek !== false ? 'checked' : ''}>
+                            <span>Allow hold-to-peek at the draft while refining</span>
+                        </label>
+                    </div>
+                    <label class="checkbox" title="Each pass that changes the reply is appended to the message swipes so you can browse the draft and every revision. Veiled runs keep only draft + final.">
                         <input id="smarttavern_savePassesAsSwipes" type="checkbox" ${settings.savePassesAsSwipes ? 'checked' : ''}>
-                        <span>Save each refinement pass as a message swipe</span>
+                        <span>Save refinement passes as message swipes</span>
                     </label>
                 </div>
                 <div class="smarttavern_hint" id="smarttavern_mode_hint"></div>
@@ -419,14 +443,15 @@ function buildPanelHtml() {
 
                 <label>Profile updater connection profile
                     <select id="smarttavern_profileUpdateProfileId" class="smarttavern_profile_select"></select>
+                    <span class="smarttavern_missing_profile" id="smarttavern_updater_missing_profile" title="The pinned connection profile no longer exists — requests fall back to the active connection"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
                 </label>
 
                 <hr>
 
                 <div class="smarttavern_row_actions">
                     <a id="smarttavern_view_profiles" class="menu_button"><i class="fa-solid fa-eye"></i><span>View profiles</span></a>
-                    <a id="smarttavern_update_all" class="menu_button"><i class="fa-solid fa-arrows-rotate"></i><span>Update all</span></a>
-                    <a id="smarttavern_reset_all" class="menu_button"><i class="fa-solid fa-trash"></i><span>Reset all</span></a>
+                    <a id="smarttavern_update_all" class="menu_button smarttavern_busy_guard"><i class="fa-solid fa-arrows-rotate"></i><span>Update all</span></a>
+                    <a id="smarttavern_reset_all" class="menu_button smarttavern_busy_guard"><i class="fa-solid fa-trash"></i><span>Reset all</span></a>
                 </div>
             </div>
 
@@ -464,6 +489,7 @@ const PANEL_CONTROLS = [
     ['smarttavern_autoUpdate', 'autoUpdate', 'checkbox'],
     ['smarttavern_bootstrapOnFirstMessage', 'bootstrapOnFirstMessage', 'checkbox'],
     ['smarttavern_savePassesAsSwipes', 'savePassesAsSwipes', 'checkbox'],
+    ['smarttavern_veilAllowPeek', 'veilAllowPeek', 'checkbox'],
     ['smarttavern_updateInterval', 'updateInterval', 'number'],
     ['smarttavern_chatLookback', 'chatLookback', 'number'],
     ['smarttavern_profileUpdateLookback', 'profileUpdateLookback', 'number'],
@@ -524,13 +550,23 @@ function wireGeneralControls() {
         applyModeVisibility();
         refreshStatus();
     });
+
+    const displayEl = $panel().find('#smarttavern_refinementDisplay').get(0);
+    displayEl?.addEventListener('change', () => {
+        getSettings().refinementDisplay = displayEl.value === 'off' ? 'off' : 'veiled';
+        saveSettings();
+        applyModeVisibility();
+    });
 }
 
 /** Shows only the settings relevant to the active pipeline mode. */
 function applyModeVisibility() {
-    const refinement = getSettings().pipelineMode !== 'expansion';
+    const settings = getSettings();
+    const refinement = settings.pipelineMode !== 'expansion';
+    const veiled = refinement && settings.refinementDisplay !== 'off';
     $panel().find('.smarttavern_expansion_only').toggle(!refinement);
     $panel().find('.smarttavern_refinement_only').toggle(refinement);
+    $panel().find('.smarttavern_veil_only').toggle(veiled);
     $panel().find('#smarttavern_mode_hint').text(refinement
         ? 'Refinement mode: SillyTavern writes the reply, then each enabled step audits and refines it in order (see the Steps tab). No prompt injection happens before the reply.'
         : 'Expansion mode: enabled steps run before generation and their outputs are injected into the reply prompt as context.');
@@ -586,9 +622,13 @@ function renderProfileTab() {
 
     const record = profileTabCharKey ? getStoredProfile(profileTabCharKey) : null;
     const char = currentProfileChar();
+    const changedFields = Object.keys(record?.lastDiff?.fields ?? {});
 
     $panel().find('#smarttavern_profile_meta').html(record
         ? `source: ${escapeHtml(record.source ?? 'unknown')} · last updated: message ${escapeHtml(record.updatedAt ?? '?')}`
+            + (changedFields.length
+                ? ` · <a id="smarttavern_profile_diff" class="menu_button" title="Show what the last background update changed">${changedFields.length} field change(s) — view</a>`
+                : '')
         : 'No profile stored yet.');
 
     const $fields = $panel().find('#smarttavern_profile_fields').empty();
@@ -626,6 +666,7 @@ function wireProfileTab() {
     });
 
     // Hand edits write straight into the live store record; the debounced save persists it.
+    // A manual edit invalidates the recorded background-update diff.
     $panel().on('input', '.smarttavern_bio_value', function () {
         const key = profileTabCharKey;
         const record = key ? getStoredProfile(key) : null;
@@ -633,7 +674,22 @@ function wireProfileTab() {
         if (!record || !name) return;
         record.fields[name] = String(this.value);
         record.source = 'manual';
+        delete record.lastDiff;
+        $panel().find('#smarttavern_profile_diff').remove();
         scheduleBioSave(key);
+    });
+
+    // Field-level before/after of the last background update.
+    $panel().on('click', '#smarttavern_profile_diff', async () => {
+        const record = profileTabCharKey ? getStoredProfile(profileTabCharKey) : null;
+        const diff = record?.lastDiff?.fields;
+        if (!diff || !Object.keys(diff).length) return;
+        const container = document.createElement('div');
+        for (const [name, change] of Object.entries(diff)) {
+            appendSection(container, `${name} — before`, change.from ?? '(empty)');
+            appendSection(container, `${name} — after`, change.to ?? '(empty)');
+        }
+        await showContentPopup(`Profile changes · ${currentProfileChar()?.name ?? profileTabCharKey}`, container);
     });
 
     $panel().find('#smarttavern_profile_update').on('click', async () => {
@@ -642,7 +698,6 @@ function wireProfileTab() {
         try {
             const result = await updateProfile(char, { notify: true });
             if (!result) toastr.info('Update already in progress for this character.', 'SmartTavern');
-            else document.dispatchEvent(new CustomEvent('smarttavern:profile-updated', { detail: { key: charKey(char) } }));
         } catch (error) {
             console.error('[SmartTavern] profile update failed', error);
             toastr.error(`Profile update failed — ${error?.message ?? error}`, 'SmartTavern');
@@ -660,7 +715,6 @@ function wireProfileTab() {
         try {
             const result = await rebuildProfile(char, { notify: true });
             if (!result) toastr.info('Rebuild already in progress for this character.', 'SmartTavern');
-            else document.dispatchEvent(new CustomEvent('smarttavern:profile-updated', { detail: { key: charKey(char) } }));
         } catch (error) {
             console.error('[SmartTavern] profile rebuild failed', error);
             toastr.error(`Profile rebuild failed — ${error?.message ?? error}`, 'SmartTavern');
@@ -754,6 +808,7 @@ function renderStepEditor() {
                         value="${step.lookback ?? ''}" placeholder="Global"
                         title="Messages of chat history for {{chat}} in this step (0 = none, empty = global default)">
                     <select class="smarttavern_step_profile smarttavern_profile_select" title="Connection profile for this step"></select>
+                    <span class="smarttavern_missing_profile smarttavern_step_profile_badge" title="The pinned connection profile no longer exists — this step falls back to the active connection"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
                     <div class="smarttavern_row_actions">
                         <a class="menu_button menu_button_icon smarttavern_step_up" title="Move up"><i class="fa-solid fa-arrow-up"></i></a>
                         <a class="menu_button menu_button_icon smarttavern_step_down" title="Move down"><i class="fa-solid fa-arrow-down"></i></a>
@@ -811,8 +866,7 @@ function renderStepEditor() {
     refreshProfileSelects();
 }
 
-function profileOptionsHtml(selectedId = '') {
-    const profiles = listConnectionProfiles();
+function profileOptionsHtml(selectedId = '', profiles = listConnectionProfiles()) {
     // A stored id that no longer resolves falls back to the active connection in gen.js;
     // render it that way instead of leaving the select with no selected option.
     if (selectedId && !profiles.some(p => p.id === selectedId)) selectedId = '';
@@ -825,13 +879,6 @@ function profileOptionsHtml(selectedId = '') {
     return html;
 }
 
-/** Signature of the option list shared by every profile select. */
-function profileListSignature() {
-    return listConnectionProfiles()
-        .map(p => `${p.id ?? ''}|${p.name ?? ''}|${p.mode ?? ''}`)
-        .join(';');
-}
-
 /**
  * Rebuilds the connection-profile options of every profile select. Rewriting a select's
  * options while its native dropdown is open makes Chromium re-create the popup (looks
@@ -840,18 +887,25 @@ function profileListSignature() {
  */
 export function refreshProfileSelects() {
     const settings = getSettings();
-    const listSignature = profileListSignature();
+    const profiles = listConnectionProfiles();
+    const listSignature = profiles
+        .map(p => `${p.id ?? ''}|${p.name ?? ''}|${p.mode ?? ''}`)
+        .join(';');
+    const isMissing = id => Boolean(id) && !profiles.some(p => p.id === id);
+    const updateBadge = ($badge, id) => { if ($badge?.length) $badge.toggleClass('is-visible', isMissing(id)); };
     const refresh = (select, selectedId) => {
         const signature = `${listSignature}#${selectedId ?? ''}`;
         const $select = $(select);
         if ($select.data('stProfileOptions') === signature) return;
         $select.data('stProfileOptions', signature);
-        $select.html(profileOptionsHtml(selectedId ?? ''));
+        $select.html(profileOptionsHtml(selectedId ?? '', profiles));
     };
     const updater = $panel().find('#smarttavern_profileUpdateProfileId').get(0);
     if (updater) refresh(updater, settings.profileUpdateProfileId ?? '');
+    updateBadge($panel().find('#smarttavern_updater_missing_profile'), settings.profileUpdateProfileId ?? '');
     $panel().find('#smarttavern_steps .smarttavern_step_profile').each(function (index) {
         refresh(this, settings.steps?.[index]?.profileId ?? '');
+        updateBadge($(this).closest('.smarttavern_step_card').find('.smarttavern_step_profile_badge'), settings.steps?.[index]?.profileId ?? '');
     });
 }
 
@@ -992,10 +1046,20 @@ function renderResultsTab() {
         `Target: ${result.char?.name ?? '?'} · ${result.source} · ${when}`,
         serializeProfile(result.profile, getSettings().fields) || '(no profile stored)',
     );
+    const statsByName = new Map((result.stepStats ?? []).map(stat => [stat.name, stat]));
+    if ((result.stepStats ?? []).length) {
+        const chips = document.createElement('div');
+        chips.className = 'smarttavern_results_chips';
+        chips.innerHTML = chipsHtml(
+            result.stepStats.map(stat => stat.name),
+            result.stepStats.map(stat => (stat.failed ? 'failed' : 'done')),
+        );
+        body.append(chips);
+    }
     const enabledSteps = (getSettings().steps ?? []).filter(s => s?.enabled !== false);
     for (const step of enabledSteps) {
         const output = result.stepOutputs?.[step.name] ?? '';
-        appendSection(body, step.name || 'Step', output || '(no output — failed or empty, see browser console)');
+        appendSection(body, stepStatsTitle(step.name || 'Step', statsByName.get(step.name)), output || '(no output — failed or empty, see browser console)');
     }
     if (result.injectionText) {
         appendSection(
@@ -1004,6 +1068,13 @@ function renderResultsTab() {
             result.injectionText,
         );
     }
+}
+
+/** Section title with the per-step timing/size suffix when stats were recorded. */
+function stepStatsTitle(name, stat) {
+    if (!stat) return name;
+    const secs = (stat.elapsedMs / 1000).toFixed(1);
+    return `${name} · ${secs}s · ${stat.chars} chars${stat.failed ? ' · failed' : ''}`;
 }
 
 /** Dry-runs the pipeline and surfaces the outputs (Results tab, or a popup if the floating UI is off). */
@@ -1016,8 +1087,9 @@ export async function showRunResults() {
     if (getSettings().disableFloatingUI) {
         const container = document.createElement('div');
         appendSection(container, `Target: ${result.char?.name ?? '?'}`, serializeProfile(result.profile, getSettings().fields) || '(no profile stored)');
+        const statsByName = new Map((result.stepStats ?? []).map(stat => [stat.name, stat]));
         for (const step of (getSettings().steps ?? []).filter(s => s?.enabled !== false)) {
-            appendSection(container, step.name || 'Step', result.stepOutputs?.[step.name] || '(no output — failed or empty, see browser console)');
+            appendSection(container, stepStatsTitle(step.name || 'Step', statsByName.get(step.name)), result.stepOutputs?.[step.name] || '(no output — failed or empty, see browser console)');
         }
         if (result.injectionText) {
             appendSection(
@@ -1069,7 +1141,6 @@ export async function runUpdateCommand(arg) {
     try {
         const result = await updateProfile(char, { notify: true });
         if (!result) toastr.info('Update already in progress for this character.', 'SmartTavern');
-        else document.dispatchEvent(new CustomEvent('smarttavern:profile-updated', { detail: { key: charKey(char) } }));
     } catch (error) {
         console.error('[SmartTavern] /smarttavern-update failed', error);
         toastr.error(`Profile update failed — ${error?.message ?? error}`, 'SmartTavern');
@@ -1082,7 +1153,6 @@ export async function runRebuildCommand(arg) {
     try {
         const result = await rebuildProfile(char, { notify: true });
         if (!result) toastr.info('Rebuild already in progress for this character.', 'SmartTavern');
-        else document.dispatchEvent(new CustomEvent('smarttavern:profile-updated', { detail: { key: charKey(char) } }));
     } catch (error) {
         console.error('[SmartTavern] /smarttavern-rebuild failed', error);
         toastr.error(`Profile rebuild failed — ${error?.message ?? error}`, 'SmartTavern');

@@ -19,7 +19,8 @@ import {
 import { system_message_types } from '../../../../system-messages.js';
 import { generateVia, withInternalGeneration, isInternalGeneration } from './gen.js';
 import { bootstrapProfile, serializeProfile } from './profiles.js';
-import { activityStart, activityStatus, activityEntry, activityFail, activityEnd } from './progress.js';
+import { activityStart, activityStatus, activityEntry, activityFail, activityEnd, activitySteps, activityStepState } from './progress.js';
+import { applyVeil, setVeilStep, setVeilStatus, revealVeil } from './veil.js';
 import { stagePromptTail, clearPromptTail } from './tail.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
@@ -52,6 +53,7 @@ function recordLastRun(result, source) {
         char: result.char,
         profile: result.profile,
         stepOutputs: result.stepOutputs,
+        stepStats: result.stepStats ?? [],
         injectionText: result.injectionText ?? '',
         source,
         at: Date.now(),
@@ -231,9 +233,12 @@ async function runSteps({ char, profile, chat, settings }) {
     const stepOutputs = Object.create(null);
     const steps = (Array.isArray(settings.steps) ? settings.steps : [])
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
+    const stepStats = Array.from({ length: steps.length });
+    activitySteps({ names: steps.map(s => s.name || 'Unnamed step') });
     const runStep = async (step, index) => {
         const label = step.name || 'Unnamed step';
         activityStatus(`Step ${index + 1}/${steps.length} · ${label}`);
+        activityStepState(index, 'running');
         const startedAt = Date.now();
         try {
             const earlierOutputs = Object.fromEntries(steps.slice(0, index)
@@ -250,6 +255,8 @@ async function runSteps({ char, profile, chat, settings }) {
             }));
             const output = String(result?.content ?? '').trim();
             stepOutputs[step.name] = output;
+            stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, failed: false };
+            activityStepState(index, 'done');
             activityEntry({
                 title: `${label} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s · ${output.length} chars`,
                 text: output,
@@ -258,6 +265,8 @@ async function runSteps({ char, profile, chat, settings }) {
         } catch (error) {
             warn(`pipeline step "${label}" failed`, error);
             stepOutputs[step.name] = '';
+            stepStats[index] = { name: label, chars: 0, elapsedMs: Date.now() - startedAt, failed: true };
+            activityStepState(index, 'failed');
             activityFail(`Step "${label}" failed — ${error?.message ?? error}`);
         }
     };
@@ -278,7 +287,7 @@ async function runSteps({ char, profile, chat, settings }) {
         await Promise.all(ready.map(index => runStep(steps[index], index)));
         ready.forEach(index => pending.delete(index));
     }
-    return stepOutputs;
+    return { stepOutputs, stepStats };
 }
 
 /**
@@ -340,14 +349,14 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             tone: 'info',
         });
 
-        const stepOutputs = await runSteps({ char, profile, chat: arr, settings });
+        const { stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings });
         const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings });
         const injectionText = stepBlocks(settings, stepOutputs).length
             ? (settings.injectAnchor === 'prompt-end'
                 ? substituteParamsSafe(expandMacros(settings.tailPrompt ?? '', resolve)).trim()
                 : assembleInjection({ settings, char, profile, chat: arr, stepOutputs }))
             : '';
-        if (!inject) return recordLastRun({ char, profile, stepOutputs, injectionText }, 'dry run');
+        if (!inject) return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'dry run');
 
         if (settings.injectAnchor === 'prompt-end') {
             if (injectionText) {
@@ -359,12 +368,12 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
                 summary = 'Reply prompt tail prepared';
                 activityEntry({ title: `Prompt tail prepared · ${role} · ${injectionText.length} chars`, tone: 'info', text: injectionText });
             } else summary = 'Nothing to inject';
-            return recordLastRun({ char, profile, stepOutputs, injectionText }, 'generation');
+            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'generation');
         }
         const blocks = assembleInjectionBlocks({ settings, char, profile, chat: arr, stepOutputs });
         if (!blocks.length) {
             summary = 'Nothing to inject';
-            return recordLastRun({ char, profile, stepOutputs, injectionText }, 'generation');
+            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'generation');
         }
 
         let index = resolveInjectIndex(arr, settings);
@@ -372,7 +381,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             injectEphemeral(arr, block.text, settings, block.role, index++);
             activityEntry({ title: `Injecting ${block.text.length} chars as ${block.role}`, tone: 'info', text: block.text });
         }
-        return recordLastRun({ char, profile, stepOutputs, injectionText }, 'generation');
+        return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'generation');
     } catch (error) {
         failed = true;
         summary = 'Pipeline failed — see console for details';
@@ -479,6 +488,20 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         : (getMainCharacter() ?? resolveTargetChar(arr));
     if (!char) return null;
 
+    const steps = (Array.isArray(settings.steps) ? settings.steps : [])
+        .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
+
+    // Veiled mode blurs the rendered draft until the final pass lands. The veil goes up
+    // BEFORE the optional bootstrap so a first-reply draft is never readable "for free"
+    // while the profile compiles. Dry runs preview from the panel and never veil the
+    // chat. A veiled run also saves only draft + final as swipes — per-pass swipes would
+    // reintroduce the spoiler in one click.
+    const veiled = !dryRun && settings.refinementDisplay === 'veiled' && steps.length > 0 && applyVeil(messageId, {
+        names: steps.map(s => s.name || 'Unnamed step'),
+        allowPeek: settings.veilAllowPeek !== false,
+    });
+    activitySteps({ names: steps.map(s => s.name || 'Unnamed step') });
+
     const key = charKey(char);
     const store = getChatStore();
     if (bootstrap && settings.bootstrapOnFirstMessage && !store.profiles[key] && !failedBootstraps.has(bootstrapKey())) {
@@ -492,14 +515,12 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
     }
     const profile = getStoredProfile(key);
 
-    const steps = (Array.isArray(settings.steps) ? settings.steps : [])
-        .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
-
     refinementBusy = true;
     activityStart({ status: `${dryRun ? 'Refinement dry run' : 'Refining reply'} · ${char.name}` });
     let failed = false;
     let summary = 'No pass changed the reply';
     const stepOutputs = Object.create(null);
+    const stepStats = Array.from({ length: steps.length });
     let workingDraft = originalDraft;
     let changed = 0;
 
@@ -516,6 +537,9 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
             const step = steps[index];
             const label = step.name || 'Unnamed step';
             activityStatus(`Pass ${index + 1}/${steps.length} · ${label}`);
+            activityStepState(index, 'running');
+            setVeilStatus(messageId, `Pass ${index + 1}/${steps.length} · ${label}`);
+            setVeilStep(messageId, index, 'running');
             const startedAt = Date.now();
             const currentDraft = workingDraft;
             try {
@@ -532,6 +556,9 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 }));
                 const output = String(result?.content ?? '').trim();
                 stepOutputs[step.name] = output;
+                stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, failed: false };
+                activityStepState(index, 'done');
+                setVeilStep(messageId, index, 'done');
                 activityEntry({
                     title: `${label} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s · ${output.length} chars`,
                     text: output,
@@ -542,7 +569,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                     changed++;
                     if (!dryRun) {
                         message.mes = workingDraft;
-                        if (settings.savePassesAsSwipes) {
+                        if (settings.savePassesAsSwipes && !veiled) {
                             if (!Array.isArray(message.swipes) || !message.swipes.length) {
                                 message.swipes = [originalDraft];
                                 message.swipe_id = 0;
@@ -556,6 +583,9 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
             } catch (error) {
                 warn(`refinement step "${label}" failed`, error);
                 stepOutputs[step.name] = '';
+                stepStats[index] = { name: label, chars: 0, elapsedMs: Date.now() - startedAt, failed: true };
+                activityStepState(index, 'failed');
+                setVeilStep(messageId, index, 'failed');
                 activityFail(`Pass "${label}" failed — ${error?.message ?? error}`);
             }
         }
@@ -569,16 +599,30 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
             // the interceptor clears this flag whenever a fresh generation starts.
             if (isPlainObject(message.extra)) message.extra.smarttavernRefined = true;
             else message.extra = { smarttavernRefined: true };
+            if (veiled && settings.savePassesAsSwipes) {
+                // Veiled runs keep the swipe history clean: everything up to the current
+                // position plus the final revision — no intermediate spoilers.
+                if (!Array.isArray(message.swipes) || !message.swipes.length) {
+                    message.swipes = [originalDraft];
+                    message.swipe_id = 0;
+                }
+                message.swipes.length = (message.swipe_id ?? 0) + 1;
+                message.swipes.push(workingDraft);
+                message.swipe_id = message.swipes.length - 1;
+            }
             await saveRefinedChat();
         }
-        return { char, profile, stepOutputs, workingDraft, changed };
+        return { char, profile, stepOutputs, stepStats, workingDraft, changed };
     } catch (error) {
         failed = true;
         summary = 'Refinement failed — see console for details';
         activityFail(summary);
         return null;
     } finally {
-        recordLastRun({ char, profile, stepOutputs, injectionText: workingDraft }, 'refinement');
+        recordLastRun({ char, profile, stepOutputs, stepStats, injectionText: workingDraft }, 'refinement');
+        // Failure reveals instantly; completion animates. message.mes always holds the
+        // best draft saved so far, so both paths show real content.
+        if (veiled) revealVeil(messageId, { failed });
         activityEnd({ ok: !failed, summary });
         refinementBusy = false;
     }

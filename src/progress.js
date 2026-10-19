@@ -4,6 +4,7 @@
 // call with its output content as it arrives. Internal calls are not token-streamed, so
 // content appears per completed call; a spinner row marks the call in flight.
 import { getSettings } from './state.js';
+import { chipsHtml, setChipState } from './chips.js';
 
 const IDLE_HIDE_MS = 15000;
 const TICK_MS = 500;
@@ -13,6 +14,7 @@ let $chipIcon = null;
 let $chipText = null;
 let $caretIcon = null;
 let $current = null;
+let $steps = null;
 let $log = null;
 
 let expanded = false;
@@ -48,6 +50,7 @@ function build() {
                     <span>SmartTavern — generation activity</span>
                     <i class="fa-solid fa-xmark smarttavern_act_close" title="Hide"></i>
                 </div>
+                <div class="smarttavern_act_steps"></div>
                 <div class="smarttavern_act_current"></div>
                 <div class="smarttavern_act_log"></div>
             </div>
@@ -56,6 +59,7 @@ function build() {
     $chipText = $root.find('.smarttavern_act_chip_text');
     $caretIcon = $root.find('.smarttavern_act_caret');
     $current = $root.find('.smarttavern_act_current');
+    $steps = $root.find('.smarttavern_act_steps');
     $log = $root.find('.smarttavern_act_log');
     $root.on('click', '#smarttavern_activity_chip', () => setExpanded(!expanded));
     $root.on('click', '.smarttavern_act_close', hide);
@@ -82,6 +86,7 @@ function hide() {
     if ($root) {
         $root.removeClass('show');
         $log.empty();
+        $steps.empty().removeClass('is-active');
         setCurrent(null);
     }
     expanded = false;
@@ -188,6 +193,22 @@ export function activityStatus(status) {
     setCurrent(statusText);
     renderStatus();
     emitState();
+}
+
+/** Renders the pass-tracker chip row for the current run; empty names clear it. */
+export function activitySteps({ names = [], states = [] } = {}) {
+    build();
+    if (!$steps) return;
+    if (!names.length) {
+        $steps.empty().removeClass('is-active');
+        return;
+    }
+    $steps.addClass('is-active').html(chipsHtml(names, states));
+}
+
+/** Flips one pass chip on the HUD's step row. */
+export function activityStepState(index, state) {
+    setChipState($steps, index, state);
 }
 
 /** Appends a completed entry (call output or informational note) to the log. */
