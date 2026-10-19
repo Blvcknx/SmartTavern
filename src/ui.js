@@ -27,6 +27,10 @@ export function initUI() {
     });
 
     // Pick up newly created connection profiles without re-rendering everything.
+    // mousedown runs before the native dropdown opens (so a refresh lands before the popup);
+    // focus covers keyboard opening. refreshProfileSelects only touches the DOM when the
+    // option list or selection actually changed, so the second call is a no-op and never
+    // re-creates the popup while it is open.
     $(document).on('mousedown focus', '.smarttavern_profile_select', () => refreshProfileSelects());
 
     log('UI initialized');
@@ -54,7 +58,6 @@ function buildDrawerHtml() {
 
                 <label class="checkbox">
                     <input id="smarttavern_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}>
-                    <i class="fa-solid fa-check"></i>
                     <span>Enable SmartTavern (pipeline injection)</span>
                 </label>
 

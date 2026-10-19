@@ -11,6 +11,16 @@
     margin-bottom: 6px;
 }
 
+/* One native tickbox per option; ST core styles inputs itself, so the old
+   `label.checkbox` + fa-check icon pattern rendered a second, dead glyph. */
+#smarttavern_settings label.checkbox,
+#smarttavern_panel label.checkbox {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+
 #smarttavern_settings .smarttavern_grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));

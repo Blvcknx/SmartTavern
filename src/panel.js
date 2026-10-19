@@ -336,29 +336,24 @@ function buildPanelHtml() {
                 <div class="smarttavern_refinement_only">
                     <label class="checkbox" title="Each pass that changes the reply is appended to the message swipes so you can browse the draft and every revision">
                         <input id="smarttavern_savePassesAsSwipes" type="checkbox" ${settings.savePassesAsSwipes ? 'checked' : ''}>
-                        <i class="fa-solid fa-check"></i>
                         <span>Save each refinement pass as a message swipe</span>
                     </label>
                 </div>
                 <div class="smarttavern_hint" id="smarttavern_mode_hint"></div>
                 <label class="checkbox">
                     <input id="smarttavern_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}>
-                    <i class="fa-solid fa-check"></i>
                     <span>Enable SmartTavern (pipeline injection)</span>
                 </label>
                 <label class="checkbox">
                     <input id="smarttavern_autoUpdate" type="checkbox" ${settings.autoUpdate ? 'checked' : ''}>
-                    <i class="fa-solid fa-check"></i>
                     <span>Auto-update profiles in the background</span>
                 </label>
                 <label class="checkbox">
                     <input id="smarttavern_bootstrapOnFirstMessage" type="checkbox" ${settings.bootstrapOnFirstMessage ? 'checked' : ''}>
-                    <i class="fa-solid fa-check"></i>
                     <span>Bootstrap profile on first message (full rewrite of the card into the schema)</span>
                 </label>
                 <label class="checkbox" title="Hides the avatar menu, the wand-menu button and this panel; the settings drawer stays available">
                     <input id="smarttavern_disableFloatingUI" type="checkbox" ${settings.disableFloatingUI ? 'checked' : ''}>
-                    <i class="fa-solid fa-check"></i>
                     <span>Disable floating UI</span>
                 </label>
 
@@ -747,7 +742,6 @@ function renderStepEditor() {
                     <div class="smarttavern_step_chevron fa-solid fa-chevron-down" title="Collapse / expand"></div>
                     <label class="checkbox" title="Include this step in the pipeline">
                         <input class="smarttavern_step_enabled" type="checkbox" ${step.enabled !== false ? 'checked' : ''}>
-                        <i class="fa-solid fa-check"></i>
                         <span>Enabled</span>
                     </label>
                     <input class="text_margin_input smarttavern_step_name" type="text" value="${escapeHtml(step.name)}" title="Step name (target of {{step:Name}})">
@@ -818,8 +812,12 @@ function renderStepEditor() {
 }
 
 function profileOptionsHtml(selectedId = '') {
-    let html = `<option value="" ${!selectedId ? 'selected' : ''}>Active connection</option>`;
-    for (const profile of listConnectionProfiles()) {
+    const profiles = listConnectionProfiles();
+    // A stored id that no longer resolves falls back to the active connection in gen.js;
+    // render it that way instead of leaving the select with no selected option.
+    if (selectedId && !profiles.some(p => p.id === selectedId)) selectedId = '';
+    let html = `<option value=""${!selectedId ? ' selected' : ''}>Active connection</option>`;
+    for (const profile of profiles) {
         const label = `${profile.name || profile.id} (${profile.mode ?? 'cc'})`;
         const selected = profile.id === selectedId ? ' selected' : '';
         html += `<option value="${escapeHtml(profile.id ?? '')}"${selected}>${escapeHtml(label)}</option>`;
@@ -827,17 +825,34 @@ function profileOptionsHtml(selectedId = '') {
     return html;
 }
 
+/** Signature of the option list shared by every profile select. */
+function profileListSignature() {
+    return listConnectionProfiles()
+        .map(p => `${p.id ?? ''}|${p.name ?? ''}|${p.mode ?? ''}`)
+        .join(';');
+}
+
+/**
+ * Rebuilds the connection-profile options of every profile select. Rewriting a select's
+ * options while its native dropdown is open makes Chromium re-create the popup (looks
+ * like a second dropdown spawning) and can swallow the pending pick, so the DOM is
+ * touched only when the option list or the selection actually changed.
+ */
 export function refreshProfileSelects() {
     const settings = getSettings();
-    const $updater = $panel().find('#smarttavern_profileUpdateProfileId');
-    if ($updater.length) {
-        $updater.html(profileOptionsHtml(settings.profileUpdateProfileId ?? ''));
-    }
+    const listSignature = profileListSignature();
+    const refresh = (select, selectedId) => {
+        const signature = `${listSignature}#${selectedId ?? ''}`;
+        const $select = $(select);
+        if ($select.data('stProfileOptions') === signature) return;
+        $select.data('stProfileOptions', signature);
+        $select.html(profileOptionsHtml(selectedId ?? ''));
+    };
+    const updater = $panel().find('#smarttavern_profileUpdateProfileId').get(0);
+    if (updater) refresh(updater, settings.profileUpdateProfileId ?? '');
     $panel().find('#smarttavern_steps .smarttavern_step_profile').each(function (index) {
-        const step = settings.steps?.[index];
-        $(this).html(profileOptionsHtml(step?.profileId ?? ''));
+        refresh(this, settings.steps?.[index]?.profileId ?? '');
     });
-
 }
 
 // --------------------------------------------------------------------------------------------
