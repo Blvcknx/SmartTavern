@@ -3,7 +3,8 @@
 A single, self-contained SillyTavern UI extension that replicates SkyrimNet-style "living world" logic:
 
 1. **Living per-chat character profiles** — a dynamic, LLM-maintained bio with a user-defined schema, stored **per chat** and fully independent of the parent character card.
-2. **Reasoning block pipeline** — user-editable steps, each an isolated LLM call, whose generated assessments assemble into a configurable prompt tail for the upcoming reply. Its role defaults to assistant and can be changed to user or system. Independent steps can run together; explicit output references preserve dependencies. SmartTavern **augments** SillyTavern's prompt assembly; presets and World Info keep working.
+2. **Reasoning block pipeline** — user-editable steps, each an isolated LLM call, whose generated assessments assemble into a configurable prompt tail for the upcoming reply. Its role defaults to assistant and can be changed to user or system. Independent steps can run together; explicit output references preserve dependencies. SmartTavern **augments** SillyTavern's prompt assembly; presets and World Info keep working. Selected via '_Expansion Preset_' button in **Steps**.
+3. **Refinement blocks** — an alternative to context expansion (which injects reasoning chunks before generating the final output). The algorithm approaches the problem from the opposite direction, going through multiple passes to refine the draft reply. Selected via '_Refinement Preset_' button in **Steps**.
 
 No server plugin, no build step — install via the default extension installer.
 
