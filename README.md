@@ -3,8 +3,9 @@
 A single, self-contained SillyTavern UI extension that replicates SkyrimNet-style "living world" logic:
 
 1. **Living per-chat character profiles** — a dynamic, LLM-maintained bio with a user-defined schema, stored **per chat** and fully independent of the parent character card.
-2. **Reasoning block pipeline** — user-editable steps, each an isolated LLM call, whose generated assessments assemble into a configurable prompt tail for the upcoming reply. Its role defaults to assistant and can be changed to user or system. Independent steps can run together; explicit output references preserve dependencies. SmartTavern **augments** SillyTavern's prompt assembly; presets and World Info keep working. Selected via '_Expansion Preset_' button in **Steps**.
-3. **Refinement blocks** — an alternative to context expansion (which injects reasoning chunks before generating the final output). The algorithm approaches the problem from the opposite direction, going through multiple passes to refine the draft reply. Selected via '_Refinement Preset_' button in **Steps**.
+2. **Dual reasoning pipelines** — two user-editable step lists, each entry an isolated LLM call, that run together without interfering:
+   - **Expansion** (before the reply): steps generate context that assembles into a configurable prompt tail for the upcoming reply. Independent steps can run together; explicit output references preserve dependencies. SmartTavern **augments** SillyTavern's prompt assembly; presets and World Info keep working.
+   - **Refinement** (after the reply): passes audit and surgically edit the freshly generated reply in order — optionally hidden behind a veil until the final pass lands.
 
 No server plugin, no build step — install via the default extension installer.
 
@@ -37,29 +38,38 @@ Right-click on the character avatar (long press on mobiles) will open the contex
 flowchart TD
     A[User sends message] --> B[SillyTavern Generate]
     B --> C[smarttavernInterceptor<br/>runs on the per-generation core chat]
-    C --> D{Profile stored?}
-    D -- no + bootstrap on --> E[Bootstrap: full card rewrite into schema]
-    D -- yes --> F
-    E --> F[Generate blocks<br/>wait for referenced earlier outputs]
-    F --> G[Assemble reply-tail template locally<br/>profile + generated blocks + guidance]
-    G --> H[Reserve context space<br/>then move tail after prompt assembly]
-    H --> I[Generation prompt includes block<br/>WI + presets unaffected]
-    I --> J[Reply arrives]
-    J --> K{Auto-update due?<br/>every N messages}
-    K -- yes --> L[Background profile update<br/>low-drift merge]
-    K -- no --> M[Done]
-    L --> M
+    C --> D{Expansion enabled?}
+    D -- yes --> E{Profile stored?}
+    E -- no + bootstrap on --> F[Bootstrap: full card rewrite into schema]
+    E -- yes --> G
+    F --> G[Generate expansion blocks<br/>wait for referenced earlier outputs]
+    G --> H[Assemble reply-tail template locally<br/>profile + generated blocks + guidance]
+    H --> I[Reserve context space<br/>then move tail after prompt assembly]
+    I --> J[Generation prompt includes block<br/>WI + presets unaffected]
+    D -- no --> J2[Reply drafted without SmartTavern context]
+    J --> K[Reply rendered]
+    J2 --> K
+    K --> L{Refinement enabled<br/>and fresh reply?}
+    L -- yes --> M[Refinement passes edit the fresh reply in order<br/>veil lifts when the final pass lands]
+    L -- no --> N
+    M --> N{Auto-update due?<br/>every N messages}
+    N -- yes --> O[Background profile update<br/>low-drift merge]
+    N -- no --> P[Done]
+    O --> P
 ```
 
 Key implementation facts (verified against ST 1.13–1.19 source):
 
 - The extension registers a `generate_interceptor`. ST calls it with the **per-generation core chat array** — a filtered/mapped *copy* of the real history. The injected state block therefore feeds World Info scanning and the final prompt for that one generation **without ever leaking into the saved chat history**.
+- **Two independent pipelines run together.** *Expansion* runs inside the interceptor before generation and injects its outputs into the reply prompt; *refinement* runs after the reply is rendered (`CHARACTER_MESSAGE_RENDERED`), editing the fresh draft in place. Each has its own step list, enable toggle and per-step Connection Manager routing — disabling either leaves the other fully functional.
+- **Refinement (and the veil) only ever touches a freshly generated reply.** The interceptor marks each real generation; only the first rendered character reply after that mark is refined. Chat loads, scrollback, swipe views and a new chat's greeting (`first_message`) are never refined or veiled.
 - The default position is **End of assembled reply prompt**. SmartTavern first inserts a marked, ephemeral reservation into the core chat so ST includes the tail in its context budgeting. At `CHAT_COMPLETION_PROMPT_READY`, it removes the reservation and appends the assembled tail as the last message with the selected role. Other preset instructions remain intact. Markers distinguish this request from unrelated internal requests.
 - Text-completion mode uses `GENERATE_AFTER_COMBINE_PROMPTS`, formats the tail using the active instruct settings (or named plain text), and restores an assistant generation cue after it. If a custom formatter prevents safe relocation, markers are stripped and the assessment stays at its budgeted history position. Backend-specific post-processing may still reshape messages after these hooks; role behavior depends on the provider.
 - The older history anchors remain available for comparisons. There, each block has its own output role and uses the injection header/footer. Prompt-end mode instead uses the **Prompt-tail role** and **Reply prompt-tail template** settings for the complete tail.
 - Generation instructions always go to the block model as a user request. Only generated output is injected into the main reply prompt. Assistant context supplies prior assessments; it does not force a provider to import them into a private reasoning channel or accept fabricated thought signatures.
 - Existing configurations migrate once to prompt-end injection with assistant role. Step prompts and connection profiles are preserved. The redundant final consolidation pass, its editor, and its saved settings have been removed: assembling the template makes no extra LLM call. After migration, manually chosen history anchors and role settings persist normally.
-- Profile updates fire on `MESSAGE_RECEIVED` once `chat.length - updatedAt >= updateInterval` messages have accumulated for the character who just replied. They run in the background and merge with **little-to-no personality drift** (Personality / Values / Aspirations / Fears are held stable by the updater prompt).
+- The former single *Pipeline mode* migrated into the two independent pipelines: refinement users' step lists moved to **Refinement passes** (expansion gets its default preset back), while expansion users keep their steps and gain the default refinement preset. Both pipelines default to on and can be toggled separately.
+- Profile updates fire on `MESSAGE_RECEIVED` once `chat.length - updatedAt >= updateInterval` messages have accumulated for the character who just replied. They run in the background and merge with **little-to-no personality drift** (Personality / Values / Aspirations / Fears are held stable by the updater prompt). When refinement is enabled the update is deferred until the passes finish, so the updater reads the refined reply.
 - All internal LLM calls go through one adapter:
   - with a **Connection Manager profile id** → `ConnectionManagerRequestService.sendRequest()` against that saved API/preset/instruct (no global state mutation); Chat Completion structured output uses the `response_format: json_schema` override payload;
   - without one (or on any error) → `generateRaw()` on the active connection (`responseLength` = token budget, `jsonSchema` passed through, lenient JSON parsing as fallback).
@@ -71,7 +81,7 @@ Everything is summoned as a compact panel over the chat window — no drawer dig
 
 - **Right-click any character avatar** in the chat (long-press on touch devices) → quick menu: *Edit living bio*, *Edit pipeline*, *Update bio now*, *Last result*.
 - Other entry points: **Extensions (wand) menu → SmartTavern**, the **Open SmartTavern panel** button in the extension settings drawer, and the `/st-hud` toggle.
-- Tabs: **Profile** (the character's living bio, editable in place — manual edits save automatically with source `manual`), **Steps** (pipeline step editor, cards collapse on header click), **Schema** (profile field editor), **Results** (the latest pipeline run — dry run or captured from the last generation), **Settings** (everything else).
+- Tabs: **Profile** (the character's living bio, editable in place — manual edits save automatically with source `manual`), **Steps** (two editors — expansion steps and refinement passes; cards collapse on header click), **Schema** (profile field editor), **Results** (the latest run of each pipeline — dry run or captured from the last generation), **Settings** (everything else).
 - Drag the header to move the panel; double-click the header to reset to the default (left-center) position. Tab and position are remembered.
 - `Esc` closes the panel (native popups keep priority).
 - On screens ≤ 900 px the panel becomes a near-fullscreen sheet and dragging is disabled.
@@ -84,8 +94,9 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Setting | Meaning |
 | --- | --- |
 | Enable SmartTavern | Master toggle for the pipeline injection |
-| Pipeline mode | Refinement (default): the reply is drafted first, then each enabled step refines it in order. Expansion: steps run before generation and inject context. |
-| Refinement display | **Veiled** (default): the fresh reply is blurred in chat until the final pass lands — pass progress shows as chips on the message and a hold-to-peek button can partially unblur it. **Off**: every pass lands visibly. |
+| Enable expansion | Master toggle for the pre-reply context pipeline (on by default) |
+| Enable refinement | Master toggle for the post-reply editing pipeline (on by default) |
+| Refinement display | **Veiled** (default): the fresh reply is blurred in chat until the final pass lands — pass progress shows as chips on the message and a hold-to-peek button can partially unblur it. **Off**: every pass lands visibly. The veil only ever appears on a freshly generated reply — never on chat loads or a new chat's greeting. |
 | Allow hold-to-peek | Shows the hold-to-peek button on the veil (on by default) |
 | Save refinement passes as swipes | Appends changed revisions to the message swipes. Veiled runs keep only draft + final so the swipes cannot spoil the result. |
 | Auto-update profiles | Background maintenance on `MESSAGE_RECEIVED` |
@@ -99,12 +110,13 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Injection depth | Used only with custom history depth: 0 = after the newest message, 1 = before it |
 | Injection name / header / footer | Settings for history positions; `{{char}}` and other macros resolve |
 | Profile schema fields | Rows: name + description — the JSON schema is built from this list (defaults: Brief Summary, Appearance, Background, Personality incl. sexual preferences, Aspirations, Fears, Values) |
-| Pipeline steps | Cards: enabled, name, connection profile, prompt; reorder / duplicate / delete; defaults: **Physical Condition** → **Mental Condition** |
-| Step execution | Parallel where independent (default), or sequential. `{{step:Name}}` waits for that earlier step; `{{steps}}` waits for all earlier steps. Active-connection calls are serialized because ST temporarily changes shared generation settings. |
-| Block role | Role of each generated output when using a history anchor; prompt-end mode uses the global tail role. Does not change the role of generation instructions. |
+| Expansion steps | Cards: enabled, name, role, per-step lookback, connection profile, prompt; reorder / duplicate / delete; defaults: **Physical Condition** → **Mental Condition** |
+| Refinement passes | Same cards minus the role selector (passes are strictly sequential and work on the draft); defaults: **Body & Spatial Awareness** → **Character & Psychological Authenticity** → **Prose & Wording Polish** |
+| Step execution | Expansion only: parallel where independent (default), or sequential. `{{step:Name}}` waits for that earlier step; `{{steps}}` waits for all earlier steps. Refinement passes are always strictly sequential. Active-connection calls are serialized because ST temporarily changes shared generation settings. |
+| Block role | Expansion steps only: role of each generated output when using a history anchor; prompt-end mode uses the global tail role. Refinement passes have no role selector. |
 | Profile updater connection profile | Saved Connection Manager profile used by bootstrap/update/rebuild |
 | Disable floating UI | Master switch for the floating panel, avatar context menu and wand-menu button |
-| Run pipeline now (Results tab) | Dry run: executes the steps and shows raw outputs without injecting |
+| Run expansion / Run refinement (Results tab) | Dry run each pipeline: expansion runs its steps without injecting; refinement previews what the passes would change about the last character reply, saving nothing |
 
 ### Step prompt macros
 
@@ -117,8 +129,9 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | `{{field:Name}}` | A single profile field (case-insensitive) |
 | `{{step:Step Name}}` | An earlier step's output (case-insensitive) |
 | `{{steps}}` | Earlier completed outputs in a step prompt; all generated outputs in the reply-tail template, in configured order |
+| `{{draft}}` / `{{original_draft}}` | Refinement passes only: the current working draft / the original reply before any pass touched it |
 
-These macros also work in the reply-tail template. Include `{{steps}}` or selected `{{step:Name}}` references to supply the generated assessments. Unknown macros are left intact for SillyTavern's own substitution pass. The Results tab shows the assembled reply context so you can inspect exactly what the template produced.
+These macros also work in the reply-tail template. Include `{{steps}}` or selected `{{step:Name}}` references to supply the generated assessments. `{{step:Name}}` and `{{steps}}` resolve against the list of the pipeline the prompt belongs to — a refinement pass never sees expansion outputs, and vice versa. Unknown macros are left intact for SillyTavern's own substitution pass. The Results tab shows the assembled reply context (expansion) and the final refined reply (refinement) so you can inspect exactly what each pipeline produced.
 
 ### Per-step model routing
 
@@ -134,7 +147,7 @@ Use independent blocks for assessments that can use the same profile and convers
 | `/smarttavern-update [char]` | `/st-update` | Run a profile update now |
 | `/smarttavern-rebuild [char]` | `/st-rebuild` | Full rewrite from the card (bootstrap prompt) |
 | `/smarttavern-reset [char]` | `/st-reset` | Delete the stored profile |
-| `/smarttavern-run` | `/st-run` | Dry run of the pipeline; shows raw step outputs |
+| `/smarttavern-run` | `/st-run` | Dry run of every enabled pipeline (expansion, then refinement); shows raw outputs |
 | `/smarttavern-hud` | `/st-hud` | Toggle the floating panel |
 
 **smarttavern_dump**: open the browser console and run
@@ -145,7 +158,7 @@ Use independent blocks for assessments that can use the same profile and convers
 - Global config: `extensionSettings.smarttavern` (in `settings.json`).
 - Profiles: `chatMetadata.smarttavern = { version, profiles: { [avatar]: { fields, createdAt, updatedAt, source, lastDiff? } } }` — saved with the chat, invisible to the character card. `lastDiff` records the field-level before/after of the most recent background update (cleared by manual edits).
 - No secrets are stored; connection profiles reference the Connection Manager's own records.
-- Every generation makes up to `1 (bootstrap) + steps` extra LLM calls — mind your provider quota/billing. Prompt-tail assembly makes no model call.
+- Every generation makes up to `1 (bootstrap) + expansion steps + refinement passes` extra LLM calls — mind your provider quota/billing. Prompt-tail assembly makes no model call.
 
 ## Caveats
 
@@ -157,10 +170,6 @@ Use independent blocks for assessments that can use the same profile and convers
 ## Roadmap (out of v1)
 
 Per-field immutability locks; update-diff preview before applying (SkyrimNet-style); drag-to-reorder for steps; `{{smarttavern:Field}}` macros usable in character cards/presets; per-step reasoning/thinking presets.
-
-## Regression checks
-
-Run `node --experimental-vm-modules --test tests/pipeline.test.mjs`. These checks use mocked model responses and cover output roles, migration, prompt isolation, dependencies, removal of consolidation calls, prompt-tail placement and formatting, empty outputs, ephemeral cleanup, and active-connection serialization.
 
 ## License
 

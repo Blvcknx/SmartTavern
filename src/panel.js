@@ -7,13 +7,13 @@
 // document.getElementById would fail on detached nodes.
 import { getContext } from '../../../../extensions.js';
 import {
-    DEFAULT_FIELDS, DEFAULT_STEPS, DEFAULT_REFINEMENT_STEPS, PIPELINE_MODES, STEP_ROLES,
+    DEFAULT_FIELDS, DEFAULT_STEPS, DEFAULT_REFINEMENT_STEPS, STEP_ROLES,
     getSettings, saveSettings, getChatStore, allStoredProfiles, clearAllProfiles,
     resolveTargetChar, getGroupMembers, getMainCharacter, charKey,
     getStoredProfile, setStoredProfile, log,
 } from './state.js';
 import { listConnectionProfiles } from './gen.js';
-import { runPipeline, getLastRunResult } from './pipeline.js';
+import { runPipeline, runRefinementDryRun, getLastRunResults } from './pipeline.js';
 import { rebuildProfile, updateProfile, resetProfile, serializeProfile } from './profiles.js';
 import { chipsHtml } from './chips.js';
 
@@ -299,23 +299,41 @@ function buildPanelHtml() {
 
             <div class="smarttavern_tab_panel" data-tab="steps">
                 <div class="smarttavern_hint">
-                    Each enabled step is an isolated LLM call. Steps can read earlier outputs
-                    via {{step:Step Name}} and the profile via {{definitions}} or {{field:Name}}.
-                    In refinement mode steps run strictly in order and edit {{draft}} (the current
-                    reply revision; pass 1 starts from {{original_draft}}) — wrap the revised reply
-                    in &lt;revised_reply&gt;...&lt;/revised_reply&gt; or answer &lt;audit&gt;PASS&lt;/audit&gt; to keep the draft.
-                    In expansion mode independent steps can run together; references to earlier
-                    outputs preserve their order. Each step may pin its own Connection Manager profile.
-                    The lookback number sets this step's chat history for {{chat}} (0 = none, empty =
-                    global default); {{chat:N}} requests exactly N messages. Per-block roles apply to
-                    history positions; prompt-end mode uses the tail role in Settings. Click a card
-                    header to collapse it.
+                    Two independent pipelines run together: <b>expansion</b> steps generate context
+                    that is injected into the reply prompt before generation; <b>refinement</b> passes
+                    audit and edit the fresh reply after it. Each enabled entry is an isolated LLM call.
+                </div>
+
+                <div class="smarttavern_steps_section_title"><i class="fa-solid fa-diagram-project"></i><span>Expansion steps — pre-reply context</span></div>
+                <div class="smarttavern_hint">
+                    Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{field:Name}}, {{chat}},
+                    {{chat:N}}, {{step:Name}} for earlier outputs, {{steps}} for all earlier outputs.
+                    Independent steps run together; explicit references preserve order. Each step may pin
+                    its own Connection Manager profile; the lookback sets this step's {{chat}} history
+                    (0 = none, empty = global default). Per-block roles apply to history injection
+                    positions; prompt-end mode uses the tail role in Settings. Click a card header to
+                    collapse it.
                 </div>
                 <div id="smarttavern_steps"></div>
                 <div class="smarttavern_row_actions">
-                    <a id="smarttavern_add_step" class="menu_button"><i class="fa-solid fa-plus"></i><span>Add step</span></a>
-                    <a id="smarttavern_restore_refinement_steps" class="menu_button" title="Replace the step list with the default 3-pass refinement preset (Body / Character / Prose)"><i class="fa-solid fa-rotate-left"></i><span>Refinement preset</span></a>
-                    <a id="smarttavern_restore_expansion_steps" class="menu_button" title="Replace the step list with the default expansion preset (Physical / Mental Condition)"><i class="fa-solid fa-rotate-left"></i><span>Expansion preset</span></a>
+                    <a id="smarttavern_add_step" class="menu_button"><i class="fa-solid fa-plus"></i><span>Add expansion step</span></a>
+                    <a id="smarttavern_restore_expansion_steps" class="menu_button" title="Replace the expansion list with the default preset (Physical / Mental Condition) — refinement passes are untouched"><i class="fa-solid fa-rotate-left"></i><span>Expansion preset</span></a>
+                </div>
+
+                <hr>
+
+                <div class="smarttavern_steps_section_title"><i class="fa-solid fa-user-pen"></i><span>Refinement passes — post-reply editing</span></div>
+                <div class="smarttavern_hint">
+                    Passes run strictly in order against the fresh reply: each receives the current draft
+                    via {{draft}} (pass 1 starts from {{original_draft}}). Wrap the revised reply in
+                    &lt;revised_reply&gt;...&lt;/revised_reply&gt; or answer &lt;audit&gt;PASS&lt;/audit&gt; to keep the draft.
+                    Same macros as expansion steps, plus {{draft}} / {{original_draft}}. Each pass may pin
+                    its own Connection Manager profile and lookback.
+                </div>
+                <div id="smarttavern_refinement_steps"></div>
+                <div class="smarttavern_row_actions">
+                    <a id="smarttavern_add_refinement_step" class="menu_button"><i class="fa-solid fa-plus"></i><span>Add refinement pass</span></a>
+                    <a id="smarttavern_restore_refinement_steps" class="menu_button" title="Replace the refinement list with the default 3-pass preset (Body / Character / Prose) — expansion steps are untouched"><i class="fa-solid fa-rotate-left"></i><span>Refinement preset</span></a>
                 </div>
             </div>
 
@@ -333,17 +351,20 @@ function buildPanelHtml() {
 
             <div class="smarttavern_tab_panel" data-tab="results">
                 <div class="smarttavern_row_actions">
-                    <a id="smarttavern_run_now" class="menu_button smarttavern_busy_guard" title="Dry run: executes the steps without changing anything (refinement mode previews the final reply)"><i class="fa-solid fa-play"></i><span>Run pipeline now</span></a>
+                    <a id="smarttavern_run_expansion" class="menu_button smarttavern_busy_guard" title="Dry run: execute the expansion steps without injecting anything and show raw outputs"><i class="fa-solid fa-diagram-project"></i><span>Run expansion (dry)</span></a>
+                    <a id="smarttavern_run_refinement" class="menu_button smarttavern_busy_guard" title="Dry run: execute the refinement passes against the last character reply without saving anything"><i class="fa-solid fa-user-pen"></i><span>Run refinement (dry)</span></a>
                 </div>
                 <div id="smarttavern_results_body"></div>
             </div>
 
             <div class="smarttavern_tab_panel" data-tab="settings">
-                <label>Pipeline mode
-                    <select id="smarttavern_pipelineMode" title="Refinement edits the reply after generation; expansion injects step outputs before generation">
-                        <option value="refinement"${settings.pipelineMode !== 'expansion' ? ' selected' : ''}>Final refinement (post-reply multi-pass editing)</option>
-                        <option value="expansion"${settings.pipelineMode === 'expansion' ? ' selected' : ''}>Context expansion (pre-reply state injection)</option>
-                    </select>
+                <label class="checkbox" title="Refinement runs AFTER generation: each enabled pass audits and edits the fresh reply in order. Only refinement ever veils the reply.">
+                    <input id="smarttavern_refinementEnabled" type="checkbox" ${settings.refinementEnabled !== false ? 'checked' : ''}>
+                    <span>Enable refinement (post-reply editing)</span>
+                </label>
+                <label class="checkbox" title="Expansion runs BEFORE generation: enabled steps generate context that is injected into the reply prompt. It never edits the reply itself.">
+                    <input id="smarttavern_expansionEnabled" type="checkbox" ${settings.expansionEnabled !== false ? 'checked' : ''}>
+                    <span>Enable expansion (pre-reply context injection)</span>
                 </label>
                 <div class="smarttavern_refinement_only">
                     <label>Refinement display
@@ -382,7 +403,7 @@ function buildPanelHtml() {
                 </label>
 
                 <div class="smarttavern_grid">
-                    <label>Step execution
+                    <label title="How independent expansion steps are scheduled; refinement passes are always sequential">Step execution (expansion)
                         <select id="smarttavern_stepExecution">
                             <option value="dependencies"${settings.stepExecution !== 'sequential' ? ' selected' : ''}>Parallel where independent</option>
                             <option value="sequential"${settings.stepExecution === 'sequential' ? ' selected' : ''}>Sequential</option>
@@ -486,6 +507,8 @@ function buildPanel() {
 
 const PANEL_CONTROLS = [
     ['smarttavern_enabled', 'enabled', 'checkbox'],
+    ['smarttavern_refinementEnabled', 'refinementEnabled', 'checkbox'],
+    ['smarttavern_expansionEnabled', 'expansionEnabled', 'checkbox'],
     ['smarttavern_autoUpdate', 'autoUpdate', 'checkbox'],
     ['smarttavern_bootstrapOnFirstMessage', 'bootstrapOnFirstMessage', 'checkbox'],
     ['smarttavern_savePassesAsSwipes', 'savePassesAsSwipes', 'checkbox'],
@@ -514,8 +537,10 @@ function wireGeneralControls() {
             else settings[key] = String(el.value);
             saveSettings();
             refreshStatus();
-            // The enable toggle exists in both the drawer and this panel — keep them in sync.
-            // The global selector resolves to the drawer's checkbox (first in document order).
+            // Pipeline toggles re-scope the visible settings; the enable toggle exists in
+            // both the drawer and this panel — keep them in sync (the global selector
+            // resolves to the drawer's checkbox, first in document order).
+            if (id === 'smarttavern_refinementEnabled' || id === 'smarttavern_expansionEnabled') applyModeVisibility();
             if (id === 'smarttavern_enabled') $('#smarttavern_enabled').prop('checked', el.checked);
         });
     }
@@ -543,14 +568,6 @@ function wireGeneralControls() {
         saveSettings();
     });
 
-    const modeEl = $panel().find('#smarttavern_pipelineMode').get(0);
-    modeEl?.addEventListener('change', () => {
-        getSettings().pipelineMode = PIPELINE_MODES.includes(modeEl.value) ? modeEl.value : 'refinement';
-        saveSettings();
-        applyModeVisibility();
-        refreshStatus();
-    });
-
     const displayEl = $panel().find('#smarttavern_refinementDisplay').get(0);
     displayEl?.addEventListener('change', () => {
         getSettings().refinementDisplay = displayEl.value === 'off' ? 'off' : 'veiled';
@@ -559,17 +576,23 @@ function wireGeneralControls() {
     });
 }
 
-/** Shows only the settings relevant to the active pipeline mode. */
+/** Shows only the settings relevant to the enabled pipelines. */
 function applyModeVisibility() {
     const settings = getSettings();
-    const refinement = settings.pipelineMode !== 'expansion';
+    const refinement = settings.refinementEnabled !== false;
+    const expansion = settings.expansionEnabled !== false;
     const veiled = refinement && settings.refinementDisplay !== 'off';
-    $panel().find('.smarttavern_expansion_only').toggle(!refinement);
+    $panel().find('.smarttavern_expansion_only').toggle(expansion);
     $panel().find('.smarttavern_refinement_only').toggle(refinement);
     $panel().find('.smarttavern_veil_only').toggle(veiled);
-    $panel().find('#smarttavern_mode_hint').text(refinement
-        ? 'Refinement mode: SillyTavern writes the reply, then each enabled step audits and refines it in order (see the Steps tab). No prompt injection happens before the reply.'
-        : 'Expansion mode: enabled steps run before generation and their outputs are injected into the reply prompt as context.');
+    $panel().find('#smarttavern_mode_hint').text(
+        refinement && expansion
+            ? 'Both pipelines run together: expansion injects generated context before the reply; refinement edits the fresh reply afterwards.'
+            : refinement
+                ? 'Refinement only: SillyTavern drafts the reply, then each enabled pass audits and refines it in order (see the Steps tab). No prompt injection happens before the reply.'
+                : expansion
+                    ? 'Expansion only: enabled steps run before generation and their outputs are injected into the reply prompt as context. The reply itself is never edited.'
+                    : 'Both pipelines are disabled — SmartTavern only maintains the living profiles.');
 }
 
 export function refreshStatus() {
@@ -787,8 +810,26 @@ function moveArrayItem(array, index, delta, onFinish) {
 
 function renderStepEditor() {
     const settings = getSettings();
-    const $container = $panel().find('#smarttavern_steps').empty();
-    settings.steps.forEach((step, index) => {
+    renderStepCards(
+        $panel().find('#smarttavern_steps'),
+        Array.isArray(settings.steps) ? settings.steps : [],
+        { refinement: false },
+    );
+    renderStepCards(
+        $panel().find('#smarttavern_refinement_steps'),
+        Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [],
+        { refinement: true },
+    );
+    refreshProfileSelects();
+}
+
+/** Renders one pipeline's editable step cards into `container`. */
+function renderStepCards($container, steps, { refinement = false } = {}) {
+    const placeholder = refinement
+        ? 'Prompt for this pass. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{draft}}, {{original_draft}}. Wrap the revised reply in <revised_reply></revised_reply> or answer <audit>PASS</audit> to keep the draft.'
+        : 'Prompt for this step. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{steps}}.';
+    $container.empty();
+    steps.forEach((step, index) => {
         const role = STEP_ROLES.includes(step.role) ? step.role : 'assistant';
         const card = $(`
             <div class="smarttavern_step_card">
@@ -799,11 +840,12 @@ function renderStepEditor() {
                         <span>Enabled</span>
                     </label>
                     <input class="text_margin_input smarttavern_step_name" type="text" value="${escapeHtml(step.name)}" title="Step name (target of {{step:Name}})">
+                    ${refinement ? '' : `
                     <select class="smarttavern_step_role" title="Role for history injection; prompt-end mode uses the tail role from Settings">
                         <option value="user"${role === 'user' ? ' selected' : ''}>User</option>
                         <option value="system"${role === 'system' ? ' selected' : ''}>System</option>
                         <option value="assistant"${role === 'assistant' ? ' selected' : ''}>Assistant</option>
-                    </select>
+                    </select>`}
                     <input class="text_margin_input smarttavern_step_lookback" type="number" min="0" max="200" step="1"
                         value="${step.lookback ?? ''}" placeholder="Global"
                         title="Messages of chat history for {{chat}} in this step (0 = none, empty = global default)">
@@ -816,7 +858,7 @@ function renderStepEditor() {
                         <a class="menu_button menu_button_icon smarttavern_step_delete" title="Delete step"><i class="fa-solid fa-trash"></i></a>
                     </div>
                 </div>
-                <textarea class="smarttavern_step_prompt" rows="6" placeholder="Prompt for this step. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{draft}}, {{original_draft}}, {{field:Name}}, {{step:Name}}. Refinement steps: wrap the revised reply in <revised_reply></revised_reply> or answer <audit>PASS</audit> to keep the draft.">${escapeHtml(step.prompt)}</textarea>
+                <textarea class="smarttavern_step_prompt" rows="6" placeholder="${escapeHtml(placeholder)}">${escapeHtml(step.prompt)}</textarea>
             </div>`);
         // Header click collapses the card; interactive controls are excluded.
         card.find('.smarttavern_step_header').on('click', (event) => {
@@ -824,46 +866,46 @@ function renderStepEditor() {
             card.toggleClass('collapsed');
         });
         card.find('.smarttavern_step_enabled').on('change', function () {
-            settings.steps[index].enabled = /** @type {HTMLInputElement} */ (this).checked;
+            steps[index].enabled = /** @type {HTMLInputElement} */ (this).checked;
             saveSettings();
         });
         card.find('.smarttavern_step_name').on('input', function () {
-            settings.steps[index].name = String(/** @type {HTMLInputElement} */ (this).value);
+            steps[index].name = String(/** @type {HTMLInputElement} */ (this).value);
             saveSettings();
         });
         card.find('.smarttavern_step_prompt').on('input', function () {
-            settings.steps[index].prompt = String(/** @type {HTMLTextAreaElement} */ (this).value);
+            steps[index].prompt = String(/** @type {HTMLTextAreaElement} */ (this).value);
             saveSettings();
         });
+        card.find('.smarttavern_step_profile').data('stStep', step);
         card.find('.smarttavern_step_profile').on('change', function () {
-            settings.steps[index].profileId = String(/** @type {HTMLSelectElement} */ (this).value ?? '');
+            steps[index].profileId = String(/** @type {HTMLSelectElement} */ (this).value ?? '');
             saveSettings();
         });
         card.find('.smarttavern_step_role').on('change', function () {
-            settings.steps[index].role = String(/** @type {HTMLSelectElement} */ (this).value);
+            steps[index].role = String(/** @type {HTMLSelectElement} */ (this).value);
             saveSettings();
         });
         card.find('.smarttavern_step_lookback').on('change', function () {
             const raw = String(/** @type {HTMLInputElement} */ (this).value ?? '').trim();
-            settings.steps[index].lookback = raw === '' ? null : coerceNumber(this, null);
+            steps[index].lookback = raw === '' ? null : coerceNumber(this, null);
             saveSettings();
         });
-        card.find('.smarttavern_step_up').on('click', () => moveArrayItem(settings.steps, index, -1, () => { saveSettings(); renderStepEditor(); }));
-        card.find('.smarttavern_step_down').on('click', () => moveArrayItem(settings.steps, index, +1, () => { saveSettings(); renderStepEditor(); }));
+        card.find('.smarttavern_step_up').on('click', () => moveArrayItem(steps, index, -1, () => { saveSettings(); renderStepEditor(); }));
+        card.find('.smarttavern_step_down').on('click', () => moveArrayItem(steps, index, +1, () => { saveSettings(); renderStepEditor(); }));
         card.find('.smarttavern_step_duplicate').on('click', () => {
-            const copy = { ...settings.steps[index], name: `${settings.steps[index].name} copy` };
-            settings.steps.splice(index + 1, 0, copy);
+            const copy = { ...steps[index], name: `${steps[index].name} copy` };
+            steps.splice(index + 1, 0, copy);
             saveSettings();
             renderStepEditor();
         });
         card.find('.smarttavern_step_delete').on('click', () => {
-            settings.steps.splice(index, 1);
+            steps.splice(index, 1);
             saveSettings();
             renderStepEditor();
         });
         $container.append(card);
     });
-    refreshProfileSelects();
 }
 
 function profileOptionsHtml(selectedId = '', profiles = listConnectionProfiles()) {
@@ -903,9 +945,12 @@ export function refreshProfileSelects() {
     const updater = $panel().find('#smarttavern_profileUpdateProfileId').get(0);
     if (updater) refresh(updater, settings.profileUpdateProfileId ?? '');
     updateBadge($panel().find('#smarttavern_updater_missing_profile'), settings.profileUpdateProfileId ?? '');
-    $panel().find('#smarttavern_steps .smarttavern_step_profile').each(function (index) {
-        refresh(this, settings.steps?.[index]?.profileId ?? '');
-        updateBadge($(this).closest('.smarttavern_step_card').find('.smarttavern_step_profile_badge'), settings.steps?.[index]?.profileId ?? '');
+    // Both step lists render through the same card builder; each select carries its own
+    // step object so index-based lookups cannot cross wires between the two pipelines.
+    $panel().find('.smarttavern_step_profile').each(function () {
+        const step = $(this).data('stStep');
+        refresh(this, step?.profileId ?? '');
+        updateBadge($(this).closest('.smarttavern_step_card').find('.smarttavern_step_profile_badge'), step?.profileId ?? '');
     });
 }
 
@@ -931,20 +976,29 @@ async function restoreDefaultFields() {
     renderFieldEditor();
 }
 
-function addStep() {
+/** Appends a new step to the given pipeline list ("steps" | "refinementSteps"). */
+function addStep(listKey) {
     const settings = getSettings();
-    settings.steps.push({ name: `Step ${settings.steps.length + 1}`, enabled: true, role: 'assistant', profileId: '', lookback: null, prompt: '' });
+    const list = Array.isArray(settings[listKey]) ? settings[listKey] : (settings[listKey] = []);
+    list.push({
+        name: `${listKey === 'refinementSteps' ? 'Pass' : 'Step'} ${list.length + 1}`,
+        enabled: true,
+        role: 'assistant',
+        profileId: '',
+        lookback: null,
+        prompt: '',
+    });
     saveSettings();
     renderStepEditor();
 }
 
 async function restoreDefaultRefinementSteps() {
     const confirmed = await confirmPopup(
-        'Load the default refinement steps?',
-        'This replaces your step list with the 3-pass refinement preset: Body & Spatial Awareness, Character & Psychological Authenticity, and Prose & Wording Polish.',
+        'Load the default refinement passes?',
+        'This replaces your refinement pass list with the 3-pass preset: Body & Spatial Awareness, Character & Psychological Authenticity, and Prose & Wording Polish. Expansion steps are not touched.',
     );
     if (!confirmed) return;
-    getSettings().steps = structuredClone(DEFAULT_REFINEMENT_STEPS).map(s => ({ ...s }));
+    getSettings().refinementSteps = structuredClone(DEFAULT_REFINEMENT_STEPS).map(s => ({ ...s }));
     saveSettings();
     renderStepEditor();
 }
@@ -952,7 +1006,7 @@ async function restoreDefaultRefinementSteps() {
 async function restoreDefaultExpansionSteps() {
     const confirmed = await confirmPopup(
         'Load the default expansion steps?',
-        'This replaces your step list with the Physical/Mental Condition expansion preset.',
+        'This replaces your expansion step list with the Physical/Mental Condition preset. Refinement passes are not touched.',
     );
     if (!confirmed) return;
     getSettings().steps = structuredClone(DEFAULT_STEPS).map(s => ({ ...s }));
@@ -963,10 +1017,12 @@ async function restoreDefaultExpansionSteps() {
 function wireDataButtons() {
     $panel().find('#smarttavern_add_field').on('click', addField);
     $panel().find('#smarttavern_restore_fields').on('click', restoreDefaultFields);
-    $panel().find('#smarttavern_add_step').on('click', addStep);
+    $panel().find('#smarttavern_add_step').on('click', () => addStep('steps'));
+    $panel().find('#smarttavern_add_refinement_step').on('click', () => addStep('refinementSteps'));
     $panel().find('#smarttavern_restore_refinement_steps').on('click', restoreDefaultRefinementSteps);
     $panel().find('#smarttavern_restore_expansion_steps').on('click', restoreDefaultExpansionSteps);
-    $panel().find('#smarttavern_run_now').on('click', () => showRunResults());
+    $panel().find('#smarttavern_run_expansion').on('click', () => runDryPipeline('expansion'));
+    $panel().find('#smarttavern_run_refinement').on('click', () => runDryPipeline('refinement'));
     $panel().find('#smarttavern_view_profiles').on('click', viewProfiles);
     $panel().find('#smarttavern_update_all').on('click', updateAllProfiles);
     $panel().find('#smarttavern_reset_all').on('click', resetAllProfiles);
@@ -1032,21 +1088,28 @@ async function resetAllProfiles() {
 
 function renderResultsTab() {
     const body = $panel().find('#smarttavern_results_body').empty().get(0);
-    const result = getLastRunResult();
-    if (!result) {
+    const results = getLastRunResults();
+    if (!results.expansion && !results.refinement) {
         const hint = document.createElement('div');
         hint.className = 'smarttavern_hint';
-        hint.textContent = 'No pipeline run recorded yet. Use "Run pipeline now" for a dry run — or just chat: each generated reply (refinement mode) or state block (expansion mode) is captured here automatically.';
+        hint.textContent = 'No pipeline run recorded yet. Use the dry-run buttons above — or just chat: every expansion context block and every refined reply is captured here automatically.';
         body.append(hint);
         return;
     }
+    renderRunResult(body, results.expansion, 'expansion');
+    renderRunResult(body, results.refinement, 'refinement');
+}
+
+/** Renders one pipeline's recorded run as a labeled section group. */
+function renderRunResult(body, result, pipeline) {
+    if (!result) return;
+    const label = pipeline === 'refinement' ? 'Refinement run' : 'Expansion run';
     const when = new Date(result.at).toLocaleTimeString();
     appendSection(
         body,
-        `Target: ${result.char?.name ?? '?'} · ${result.source} · ${when}`,
+        `${label} · ${result.source} · ${result.char?.name ?? '?'} · ${when}`,
         serializeProfile(result.profile, getSettings().fields) || '(no profile stored)',
     );
-    const statsByName = new Map((result.stepStats ?? []).map(stat => [stat.name, stat]));
     if ((result.stepStats ?? []).length) {
         const chips = document.createElement('div');
         chips.className = 'smarttavern_results_chips';
@@ -1056,15 +1119,13 @@ function renderResultsTab() {
         );
         body.append(chips);
     }
-    const enabledSteps = (getSettings().steps ?? []).filter(s => s?.enabled !== false);
-    for (const step of enabledSteps) {
-        const output = result.stepOutputs?.[step.name] ?? '';
-        appendSection(body, stepStatsTitle(step.name || 'Step', statsByName.get(step.name)), output || '(no output — failed or empty, see browser console)');
+    for (const stat of (result.stepStats ?? [])) {
+        appendSection(body, stepStatsTitle(stat.name || 'Step', stat), result.stepOutputs?.[stat.name] || '(no output — failed or empty, see browser console)');
     }
     if (result.injectionText) {
         appendSection(
             body,
-            result.source === 'refinement' ? 'Final refined reply' : 'Assembled reply context',
+            pipeline === 'refinement' ? 'Final refined reply' : 'Assembled reply context',
             result.injectionText,
         );
     }
@@ -1077,31 +1138,50 @@ function stepStatsTitle(name, stat) {
     return `${name} · ${secs}s · ${stat.chars} chars${stat.failed ? ' · failed' : ''}`;
 }
 
-/** Dry-runs the pipeline and surfaces the outputs (Results tab, or a popup if the floating UI is off). */
-export async function showRunResults() {
-    const result = await runPipeline({ inject: false, bootstrap: false, type: 'normal' });
+/**
+ * Dry-runs one pipeline ('expansion' | 'refinement') and surfaces the outputs
+ * (Results tab, or a popup if the floating UI is off).
+ */
+async function runDryPipeline(pipeline) {
+    const settings = getSettings();
+    const result = pipeline === 'refinement'
+        ? await runRefinementDryRun()
+        : await runPipeline({ inject: false, bootstrap: false, type: 'normal' });
     if (!result) {
-        toastr.warning('SmartTavern is disabled, or there is no character/chat to run against.', 'SmartTavern');
-        return;
+        toastr.warning(pipeline === 'refinement'
+            ? 'Refinement is disabled, already running, or there is no character reply to refine.'
+            : 'Expansion is disabled, or there is no character/chat to run against.', 'SmartTavern');
+        return null;
     }
-    if (getSettings().disableFloatingUI) {
+    if (settings.disableFloatingUI) {
         const container = document.createElement('div');
         appendSection(container, `Target: ${result.char?.name ?? '?'}`, serializeProfile(result.profile, getSettings().fields) || '(no profile stored)');
-        const statsByName = new Map((result.stepStats ?? []).map(stat => [stat.name, stat]));
-        for (const step of (getSettings().steps ?? []).filter(s => s?.enabled !== false)) {
-            appendSection(container, stepStatsTitle(step.name || 'Step', statsByName.get(step.name)), result.stepOutputs?.[step.name] || '(no output — failed or empty, see browser console)');
+        for (const stat of (result.stepStats ?? [])) {
+            appendSection(container, stepStatsTitle(stat.name || 'Step', stat), result.stepOutputs?.[stat.name] || '(no output — failed or empty, see browser console)');
         }
-        if (result.injectionText) {
-            appendSection(
-                container,
-                result.source === 'refinement' ? 'Final refined reply' : 'Assembled reply context',
-                result.injectionText,
-            );
+        // Expansion assembles an injection; refinement produces a final working draft.
+        const finalText = String(/** @type {any} */ (result)[pipeline === 'refinement' ? 'workingDraft' : 'injectionText'] ?? '');
+        if (finalText) {
+            appendSection(container, pipeline === 'refinement' ? 'Final refined reply' : 'Assembled reply context', finalText);
         }
-        await showContentPopup('SmartTavern — pipeline dry run', container);
-        return;
+        await showContentPopup(`SmartTavern — ${pipeline} dry run`, container);
+        return result;
     }
     openPanel('results');
+    return result;
+}
+
+/** Runs every enabled pipeline as a dry run (slash command /smarttavern-run). */
+export async function showRunResults() {
+    const settings = getSettings();
+    const jobs = [];
+    if (settings.expansionEnabled !== false) jobs.push('expansion');
+    if (settings.refinementEnabled !== false) jobs.push('refinement');
+    if (!jobs.length) {
+        toastr.warning('Both SmartTavern pipelines are disabled — nothing to run.', 'SmartTavern');
+        return;
+    }
+    for (const job of jobs) await runDryPipeline(job);
 }
 
 // --------------------------------------------------------------------------------------------

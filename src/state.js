@@ -62,11 +62,7 @@ export const DEFAULT_STEPS = Object.freeze([
     },
 ]);
 
-// Valid pipeline modes: 'refinement' post-edits the freshly generated reply;
-// 'expansion' injects step outputs into the reply prompt before generation.
-export const PIPELINE_MODES = Object.freeze(['refinement', 'expansion']);
-
-// Preset for 'refinement' mode: each pass audits and surgically edits the fresh reply.
+// Preset for 'refinement' pipeline: each pass audits and surgically edits the fresh reply.
 // Per-step `lookback`: messages of chat history for {{chat}} in that step
 // (null = use the global `chatLookback`, 0 = no chat history).
 export const DEFAULT_REFINEMENT_STEPS = Object.freeze([
@@ -137,9 +133,11 @@ export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     autoUpdate: true,
     bootstrapOnFirstMessage: true,
-    // Dual-mode pipeline: 'refinement' post-edits the freshly generated reply (default);
-    // 'expansion' injects step outputs before generation (classic behavior).
-    pipelineMode: 'refinement',
+    // Dual pipelines that run together: 'expansion' injects its step outputs into
+    // the reply prompt BEFORE generation; 'refinement' post-edits the fresh reply
+    // AFTER it. Each pipeline has its own step list and can be toggled off.
+    expansionEnabled: true,
+    refinementEnabled: true,
     // 'veiled' blurs the fresh reply in chat until the final pass lands (spoiler-free);
     // 'off' keeps the classic behavior where every pass lands visibly in the message.
     refinementDisplay: 'veiled',
@@ -180,7 +178,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
     disableFloatingUI: false,
     ui: { tab: 'profile', x: null, y: null },
     fields: clone(DEFAULT_FIELDS),
-    steps: clone(DEFAULT_STEPS),
+    steps: clone(DEFAULT_STEPS),                 // expansion steps (pre-reply context)
+    refinementSteps: clone(DEFAULT_REFINEMENT_STEPS), // refinement passes (post-reply editing)
 });
 
 function clone(value) {
@@ -215,13 +214,33 @@ export function deepMerge(target, source) {
 }
 
 /**
- * Repairs invalid modes/roles/anchors/lookbacks and migrates the removed
- * consolidation pass to local prompt-tail assembly. Existing steps keep their content.
+ * Repairs invalid roles/anchors/lookbacks, migrates the removed consolidation pass to
+ * local prompt-tail assembly, and migrates the single pipelineMode + shared step list
+ * into the two independent pipelines (expansion steps + refinement passes).
  */
 function normalizeSettings(settings) {
     let changed = false;
-    if (!PIPELINE_MODES.includes(settings.pipelineMode)) {
-        settings.pipelineMode = 'refinement';
+
+    // v2: the mutually exclusive pipelineMode split into two independent pipelines.
+    // The old shared step list always belonged to the active mode, so it migrates
+    // into the matching list; the other list gets its own defaults back. The old
+    // `pipelineMode` key marks a pre-v2 config (deepMerge has already filled the
+    // new lists with defaults, so its presence is the upgrade signal).
+    if (settings.pipelinesVersion !== 2) {
+        if (settings.pipelineMode !== undefined) {
+            if (settings.pipelineMode !== 'expansion') {
+                // The old list held refinement passes: move them to their own list and
+                // give expansion its default preset back.
+                if (Array.isArray(settings.steps) && settings.steps.length) settings.refinementSteps = settings.steps;
+                settings.steps = clone(DEFAULT_STEPS);
+            }
+        }
+        if (!Array.isArray(settings.refinementSteps)) settings.refinementSteps = clone(DEFAULT_REFINEMENT_STEPS);
+        if (!Array.isArray(settings.steps)) settings.steps = clone(DEFAULT_STEPS);
+        settings.refinementEnabled = settings.refinementEnabled !== false;
+        settings.expansionEnabled = settings.expansionEnabled !== false;
+        delete settings.pipelineMode;
+        settings.pipelinesVersion = 2;
         changed = true;
     }
     if (settings.refinementDisplay !== 'veiled' && settings.refinementDisplay !== 'off') {
@@ -235,26 +254,32 @@ function normalizeSettings(settings) {
     // Roles formerly selected the role of the generation instructions. They now
     // describe generated output in the reply prompt. Start existing configs as assistant.
     if (settings.outputRolesVersion !== 1) {
-        for (const step of (Array.isArray(settings.steps) ? settings.steps : [])) {
-            if (isPlainObject(step)) step.role = 'assistant';
+        for (const list of [settings.steps, settings.refinementSteps]) {
+            for (const step of (Array.isArray(list) ? list : [])) {
+                if (isPlainObject(step)) step.role = 'assistant';
+            }
         }
         settings.outputRolesVersion = 1;
         changed = true;
     }
-    for (const step of (Array.isArray(settings.steps) ? settings.steps : [])) {
-        if (!isPlainObject(step)) continue;
-        if (!STEP_ROLES.includes(step.role)) {
-            step.role = 'assistant';
-            changed = true;
+    const normalizeStepList = (steps) => {
+        for (const step of (Array.isArray(steps) ? steps : [])) {
+            if (!isPlainObject(step)) continue;
+            if (!STEP_ROLES.includes(step.role)) {
+                step.role = 'assistant';
+                changed = true;
+            }
+            const lookback = typeof step.lookback === 'number' && Number.isFinite(step.lookback)
+                ? Math.max(0, Math.round(step.lookback))
+                : null;
+            if (step.lookback !== lookback) {
+                step.lookback = lookback;
+                changed = true;
+            }
         }
-        const lookback = typeof step.lookback === 'number' && Number.isFinite(step.lookback)
-            ? Math.max(0, Math.round(step.lookback))
-            : null;
-        if (step.lookback !== lookback) {
-            step.lookback = lookback;
-            changed = true;
-        }
-    }
+    };
+    normalizeStepList(settings.steps);
+    normalizeStepList(settings.refinementSteps);
     if (!INJECT_ANCHORS.includes(settings.injectAnchor)) {
         settings.injectAnchor = 'prompt-end';
         changed = true;

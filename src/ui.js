@@ -51,9 +51,12 @@ function buildDrawerHtml() {
             </div>
             <div class="inline-drawer-content">
                 <div class="smarttavern_hint">
-                    Living per-chat character profiles plus generated reasoning blocks for the next reply.
-                    Right-click a character's avatar in chat (long-press on touch devices), use the
-                    wand menu, or press the button below to summon the floating panel.
+                    Living per-chat character profiles plus two pipelines that run together:
+                    expansion steps inject generated reasoning blocks into the upcoming reply
+                    prompt, and refinement passes edit the fresh reply afterwards (optionally
+                    veiled until they finish). Right-click a character's avatar in chat (long-press
+                    on touch devices), use the wand menu, or press the button below to summon
+                    the floating panel.
                 </div>
 
                 <label class="checkbox">
@@ -104,7 +107,7 @@ function registerSlashCommands() {
         { name: 'smarttavern-update', help: 'Run a profile update for a character right now', run: (arg) => runUpdateCommand(arg) },
         { name: 'smarttavern-rebuild', help: 'Fully rewrite the profile from the character card', run: (arg) => runRebuildCommand(arg) },
         { name: 'smarttavern-reset', help: 'Delete the stored profile for a character', run: (arg) => runResetCommand(arg) },
-        { name: 'smarttavern-run', help: 'Run the reasoning pipeline (dry run) and show raw step outputs', run: (_arg) => showRunResults() },
+        { name: 'smarttavern-run', help: 'Dry-run every enabled pipeline (expansion steps + refinement passes) and show raw outputs', run: (_arg) => showRunResults() },
         { name: 'smarttavern-hud', help: 'Toggle the SmartTavern floating panel', run: (_arg) => togglePanel() },
     ];
 

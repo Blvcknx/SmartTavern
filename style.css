@@ -99,6 +99,16 @@
     margin: 4px 0;
 }
 
+/* Steps tab: section titles that separate the expansion steps from the refinement passes. */
+.smarttavern_steps_section_title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 10px 0 4px;
+    font-weight: 600;
+    opacity: 0.85;
+}
+
 .smarttavern_popup_section_title {
     font-weight: bold;
     margin: 10px 0 2px 0;

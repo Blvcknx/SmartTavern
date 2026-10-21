@@ -8,7 +8,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "blvcknx",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "homePage": "",
     "generate_interceptor": "smarttavernInterceptor",
     "minimum_client_version": "1.12.6"

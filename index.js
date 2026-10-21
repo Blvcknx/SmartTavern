@@ -3,7 +3,10 @@
 // wires lifecycle events and builds the settings UI.
 import { getContext } from '../../../extensions.js';
 import { loadSettings, getSettings, log, warn } from './src/state.js';
-import { smarttavernInterceptor, sweepEphemeral, resetBootstrapFailures, runRefinementPipeline } from './src/pipeline.js';
+import {
+    smarttavernInterceptor, sweepEphemeral, resetBootstrapFailures,
+    runRefinementPipeline, hasFreshReply,
+} from './src/pipeline.js';
 import { maybeAutoUpdate } from './src/profiles.js';
 import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
@@ -36,7 +39,7 @@ async function initSmartTavern() {
     // Background profile maintenance after each character reply.
     context.eventSource.on(events.MESSAGE_RECEIVED, onMessageReceived);
 
-    // Refinement mode: refine the fresh reply once it is rendered, then run the
+    // Refinement pipeline: refine the fresh reply once it is rendered, then run the
     // profile auto-update so it reads the refined message (never in parallel).
     const refineEvent = events.CHARACTER_MESSAGE_RENDERED ?? events.MESSAGE_RECEIVED;
     context.eventSource.on(refineEvent, onCharacterMessageRendered);
@@ -64,20 +67,25 @@ function onMessageReceived(messageId) {
         if (!message) return;
         if (message.is_user || message.is_system || message.smarttavern_ephemeral) return;
         const settings = getSettings();
-        // In refinement mode the auto-update runs after refinement completes
+        // When refinement is active the auto-update runs after refinement completes
         // (see onCharacterMessageRendered) so it reads the refined reply.
-        if (settings.enabled && settings.pipelineMode === 'refinement') return;
+        if (settings.enabled && settings.refinementEnabled) return;
         maybeAutoUpdate(message);
     } catch (error) {
         warn('MESSAGE_RECEIVED handler failed', error);
     }
 }
 
-async function onCharacterMessageRendered(messageId) {
+async function onCharacterMessageRendered(messageId, type) {
     try {
         const context = getContext();
         const settings = getSettings();
-        if (!settings.enabled || settings.pipelineMode !== 'refinement') return;
+        if (!settings.enabled || !settings.refinementEnabled) return;
+        // Only freshly GENERATED replies are refined — never a character greeting
+        // ('first_message' fires when a new chat starts or a card is re-created) and
+        // never messages that are merely re-rendered (chat loads, scrollback).
+        // `hasFreshReply` is true only after the interceptor marked a real generation.
+        if (type === 'first_message' || !hasFreshReply()) return;
         await runRefinementPipeline(messageId);
         // Auto-update only after refinement finishes, so the updater reads the refined reply.
         maybeAutoUpdate(context.chat?.[messageId]);
