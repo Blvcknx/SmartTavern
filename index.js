@@ -11,6 +11,7 @@ import { maybeAutoUpdate } from './src/profiles.js';
 import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
 import { initPromptTail } from './src/tail.js';
+import { initDescriptionOverride } from './src/description.js';
 import { dismissAllVeils } from './src/veil.js';
 
 async function initSmartTavern() {
@@ -19,6 +20,10 @@ async function initSmartTavern() {
     // ST exposes eventTypes; older builds/extensions may use event_types.
     const events = context.event_types ?? context.eventTypes;
     initPromptTail();
+    // Living description: swap the card's description for the stored profile in the
+    // assembled prompt (chat completion messages / combined prompt). Registered after
+    // the tail so both makeLast hooks keep their relative order.
+    initDescriptionOverride();
 
     // manifest.json points at this global function name (generate_interceptor);
     // it must exist before the next generation starts.

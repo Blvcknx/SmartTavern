@@ -133,6 +133,11 @@ export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     autoUpdate: true,
     bootstrapOnFirstMessage: true,
+    // Swap the card's description text for the stored living profile inside the
+    // assembled generation prompt (Prompt Manager "Char Description" entry, instruct
+    // story string, {{description}} macro in custom prompts). The card itself is never
+    // modified; without a stored profile the original description is kept.
+    replaceDescription: true,
     // Dual pipelines that run together: 'expansion' injects its step outputs into
     // the reply prompt BEFORE generation; 'refinement' post-edits the fresh reply
     // AFTER it. Each pipeline has its own step list and can be toggled off.
@@ -249,6 +254,10 @@ function normalizeSettings(settings) {
     }
     if (typeof settings.veilAllowPeek !== 'boolean') {
         settings.veilAllowPeek = true;
+        changed = true;
+    }
+    if (typeof settings.replaceDescription !== 'boolean') {
+        settings.replaceDescription = true;
         changed = true;
     }
     // Roles formerly selected the role of the generation instructions. They now

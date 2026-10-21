@@ -397,6 +397,10 @@ function buildPanelHtml() {
                     <input id="smarttavern_bootstrapOnFirstMessage" type="checkbox" ${settings.bootstrapOnFirstMessage ? 'checked' : ''}>
                     <span>Bootstrap profile on first message (full rewrite of the card into the schema)</span>
                 </label>
+                <label class="checkbox" title="The stored living profile replaces the card's description text in the assembled prompt (Char Description entry, instruct story string, {{description}} macro in custom prompts). The card itself is never modified; without a stored profile the original description is used.">
+                    <input id="smarttavern_replaceDescription" type="checkbox" ${settings.replaceDescription ? 'checked' : ''}>
+                    <span>Replace the card description with the living profile</span>
+                </label>
                 <label class="checkbox" title="Hides the avatar menu, the wand-menu button and this panel; the settings drawer stays available">
                     <input id="smarttavern_disableFloatingUI" type="checkbox" ${settings.disableFloatingUI ? 'checked' : ''}>
                     <span>Disable floating UI</span>
@@ -511,6 +515,7 @@ const PANEL_CONTROLS = [
     ['smarttavern_expansionEnabled', 'expansionEnabled', 'checkbox'],
     ['smarttavern_autoUpdate', 'autoUpdate', 'checkbox'],
     ['smarttavern_bootstrapOnFirstMessage', 'bootstrapOnFirstMessage', 'checkbox'],
+    ['smarttavern_replaceDescription', 'replaceDescription', 'checkbox'],
     ['smarttavern_savePassesAsSwipes', 'savePassesAsSwipes', 'checkbox'],
     ['smarttavern_veilAllowPeek', 'veilAllowPeek', 'checkbox'],
     ['smarttavern_updateInterval', 'updateInterval', 'number'],
