@@ -178,6 +178,11 @@ export const DEFAULT_SETTINGS = Object.freeze({
     updaterMaxTokens: 5000,
     stepMaxTokens: 5000,
     stepExecution: 'dependencies',
+    // Internal LLM calls (pipeline steps, profile bootstrap/update) are retried when
+    // they fail, come back empty, or collapse into a repetition loop. `genRetries`
+    // counts EXTRA attempts after the first; the delay grows linearly per attempt.
+    genRetries: 2,
+    genRetryDelayMs: 500,
     // Floating UI: the summoned panel, the avatar context menu and the wand-menu button.
     // `ui` stores the last open tab and the panel position (null = default, left-center).
     disableFloatingUI: false,
@@ -304,6 +309,16 @@ function normalizeSettings(settings) {
     }
     if (!STEP_ROLES.includes(settings.tailRole)) {
         settings.tailRole = 'assistant';
+        changed = true;
+    }
+    const genRetries = clampInt(settings.genRetries, 0, 5, 2);
+    if (settings.genRetries !== genRetries) {
+        settings.genRetries = genRetries;
+        changed = true;
+    }
+    const genRetryDelayMs = clampInt(settings.genRetryDelayMs, 0, 30000, 500);
+    if (settings.genRetryDelayMs !== genRetryDelayMs) {
+        settings.genRetryDelayMs = genRetryDelayMs;
         changed = true;
     }
     if (changed) saveSettings();

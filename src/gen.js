@@ -2,7 +2,8 @@
 // Connection Manager) with fallback to the active connection, plus a reentrancy guard
 // so our internal LLM calls never trigger the pipeline itself.
 import { getContext } from '../../../../extensions.js';
-import { warn } from './state.js';
+import { getSettings, clampInt, warn } from './state.js';
+import { activityEntry } from './progress.js';
 
 let internalDepth = 0;
 
@@ -79,7 +80,13 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         const service = getServiceFromContext() ?? await loadServiceFallback();
         if (service && typeof service.sendRequest === 'function') {
             try {
-                return await generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema });
+                const result = await generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema });
+                // A technically successful request can still return garbage (sampling
+                // collapse, reasoning corruption). Treat that like a failure so the
+                // active connection gets a chance before any retry logic kicks in.
+                const degenerate = resultDegenerateReason(result);
+                if (!degenerate) return result;
+                warn(`Profiled request returned ${degenerate}; falling back to the active connection.`);
             } catch (error) {
                 warn('Profiled request via Connection Manager failed; falling back to the active connection.', error);
             }
@@ -155,4 +162,76 @@ async function generateViaActive(context, { systemPrompt, prompt, maxTokens, jso
     });
     // With a schema, generateRaw returns an extracted JSON string; without, the cleaned message.
     return { content: String(text ?? ''), reasoning: '' };
+}
+
+// --------------------------------------------------------------------------------------------
+// Output sanity checks and retries
+// --------------------------------------------------------------------------------------------
+
+// Some models occasionally collapse into emitting one tiny fragment forever
+// ("!!!!{p{p{p{…"), often in the reasoning channel. Such a payload is garbage even
+// though the request itself succeeded, so it is treated as a failure everywhere:
+// profiled requests fall back to the active connection, generateWithRetry re-attempts.
+const DEGENERATE_WINDOW = 2000;
+const DEGENERATE_MATCH_RE = /(.{1,8}?)(?:\1){19,}/s;
+const DEGENERATE_MIN_SHARE = 0.6;
+
+/** True for empty output or output dominated by one short, endlessly repeated fragment. */
+export function looksDegenerate(text) {
+    const value = String(text ?? '').trim();
+    if (!value) return true;
+    const check = (sample) => {
+        const match = sample.match(DEGENERATE_MATCH_RE);
+        return Boolean(match) && (match[0].length / sample.length) >= DEGENERATE_MIN_SHARE;
+    };
+    // Head and tail are checked separately: a corrupted stream can start clean and
+    // derail midway, and short legitimate repetitions (markdown rules, dotted
+    // leaders) never dominate a whole sample.
+    return check(value.length > DEGENERATE_WINDOW ? value.slice(0, DEGENERATE_WINDOW) : value)
+        || check(value.length > DEGENERATE_WINDOW ? value.slice(-DEGENERATE_WINDOW) : value);
+}
+
+/** Why a finished call's result is unusable, or null when it looks fine. */
+function resultDegenerateReason(result) {
+    if (!result) return 'no result';
+    if (looksDegenerate(result.content)) return 'empty or degenerate output';
+    // The active-connection path has no reasoning channel — only judge it when present.
+    if (result.reasoning && looksDegenerate(result.reasoning)) return 'degenerate reasoning';
+    return null;
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * generateVia with retries. A call is re-attempted when it throws, returns empty or
+ * degenerate output, or fails the optional `validate(result)` check (e.g. JSON
+ * parseability for profile runs). The delay grows linearly with the attempt number.
+ * Once attempts are exhausted the last error is rethrown, or an unusable final
+ * result raises a descriptive error.
+ */
+export async function generateWithRetry(options = {}) {
+    const settings = getSettings();
+    const attempts = 1 + clampInt(settings.genRetries, 0, 5, 2);
+    const baseDelay = clampInt(settings.genRetryDelayMs, 0, 30000, 500);
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        let result;
+        try {
+            result = await generateVia(options);
+        } catch (error) {
+            warn(`internal generation attempt ${attempt}/${attempts} failed`, error);
+            if (attempt === attempts) throw error;
+            activityEntry({ title: `Attempt ${attempt}/${attempts} failed — retrying`, text: String(error?.message ?? error), tone: 'info' });
+            await sleep(baseDelay * attempt);
+            continue;
+        }
+        const reason = resultDegenerateReason(result)
+            ?? (typeof options.validate === 'function' && !options.validate(result) ? 'failed the result check' : null);
+        if (!reason) return result;
+        warn(`internal generation attempt ${attempt}/${attempts} was unusable (${reason})`);
+        if (attempt === attempts) throw new Error(`Unusable model output after ${attempts} attempt(s) — ${reason}`);
+        activityEntry({ title: `Attempt ${attempt}/${attempts} unusable — retrying (${reason})`, tone: 'info' });
+        await sleep(baseDelay * attempt);
+    }
 }

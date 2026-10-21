@@ -6,7 +6,7 @@ import {
     cardText, chatExcerpt, charKey, setStoredProfile, deleteStoredProfile,
     getStoredProfile, getMainCharacter, resolveMemberByMessageName, substituteParamsSafe,
 } from './state.js';
-import { generateVia, withInternalGeneration } from './gen.js';
+import { generateWithRetry, withInternalGeneration } from './gen.js';
 import { activityStart, activityEntry, activityFail, activityEnd, activitySteps } from './progress.js';
 
 const busyKeys = new Set();
@@ -188,12 +188,15 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
         const fields = Array.isArray(settings.fields) ? settings.fields : [];
         const schema = buildJsonSchema(fields);
         const excerpt = chatExcerpt(context.chat, settings.profileUpdateLookback);
-        const result = await withInternalGeneration(() => generateVia({
+        const result = await withInternalGeneration(() => generateWithRetry({
             profileId: settings.profileUpdateProfileId,
             systemPrompt: BOOTSTRAP_SYSTEM,
             prompt: buildBootstrapPrompt(char, fields, excerpt),
             maxTokens: settings.updaterMaxTokens,
             jsonSchema: schema,
+            // Retry not only on transport errors and degenerate output, but also when
+            // the model returns something that cannot be parsed into a profile.
+            validate: (res) => normalizeProfileJson(extractJson(String(res?.content ?? '')), fields, null) !== null,
         }));
         const rawContent = String(result?.content ?? '');
         activityEntry({ title: `Profile payload · ${rawContent.length} chars`, tone: 'info', text: rawContent });
@@ -239,12 +242,13 @@ export async function updateProfile(char, { notify = true } = {}) {
         const fields = Array.isArray(settings.fields) ? settings.fields : [];
         const schema = buildJsonSchema(fields);
         const excerpt = chatExcerpt(context.chat, settings.profileUpdateLookback);
-        const result = await withInternalGeneration(() => generateVia({
+        const result = await withInternalGeneration(() => generateWithRetry({
             profileId: settings.profileUpdateProfileId,
             systemPrompt: UPDATE_SYSTEM,
             prompt: buildUpdatePrompt(char, existing, fields, excerpt),
             maxTokens: settings.updaterMaxTokens,
             jsonSchema: schema,
+            validate: (res) => normalizeProfileJson(extractJson(String(res?.content ?? '')), fields, existing) !== null,
         }));
         const rawContent = String(result?.content ?? '');
         activityEntry({ title: `Profile payload · ${rawContent.length} chars`, tone: 'info', text: rawContent });

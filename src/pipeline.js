@@ -19,7 +19,7 @@ import {
     clampInt, substituteParamsSafe, STEP_ROLES,
 } from './state.js';
 import { system_message_types } from '../../../../system-messages.js';
-import { generateVia, withInternalGeneration, isInternalGeneration } from './gen.js';
+import { generateWithRetry, withInternalGeneration, isInternalGeneration } from './gen.js';
 import { bootstrapProfile, serializeProfile } from './profiles.js';
 import { activityStart, activityStatus, activityEntry, activityFail, activityEnd, activitySteps, activityStepState } from './progress.js';
 import { applyVeil, setVeilStep, setVeilStatus, revealVeil } from './veil.js';
@@ -277,7 +277,7 @@ async function runSteps({ char, profile, chat, settings }) {
             const resolve = makeMacroResolver({ char, profile, chat, stepOutputs: earlierOutputs, settings, stepsList: steps, step });
             const expanded = expandMacros(step.prompt, resolve);
             const text = substituteParamsSafe(expanded);
-            const result = await withInternalGeneration(() => generateVia({
+            const result = await withInternalGeneration(() => generateWithRetry({
                 profileId: step.profileId || '',
                 systemPrompt: STEP_SYSTEM,
                 prompt: text,
@@ -576,7 +576,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                     stepsList: steps, step, currentDraft, originalDraft, draftMessageId: messageId,
                 });
                 const text = substituteParamsSafe(expandMacros(step.prompt, resolve));
-                const result = await withInternalGeneration(() => generateVia({
+                const result = await withInternalGeneration(() => generateWithRetry({
                     profileId: step.profileId || '',
                     systemPrompt: REFINEMENT_SYSTEM,
                     prompt: text,

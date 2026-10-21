@@ -428,6 +428,12 @@ function buildPanelHtml() {
                     <label>Updater max tokens
                         <input id="smarttavern_updaterMaxTokens" class="text_margin_input" type="number" min="16" max="8192" step="16" value="${settings.updaterMaxTokens}">
                     </label>
+                    <label title="Extra attempts when an internal LLM call fails, comes back empty, or collapses into a repetition loop (reasoning corruption). Applies to pipeline steps and profile updates alike.">LLM retries per call
+                        <input id="smarttavern_genRetries" class="text_margin_input" type="number" min="0" max="5" step="1" value="${settings.genRetries}">
+                    </label>
+                    <label title="Base wait before each retry; grows linearly with the attempt number">Retry delay (ms)
+                        <input id="smarttavern_genRetryDelayMs" class="text_margin_input" type="number" min="0" max="30000" step="100" value="${settings.genRetryDelayMs}">
+                    </label>
                     <label title="Only applies when the position is set to Custom depth">Injection depth (custom position only)
                         <input id="smarttavern_injectDepth" class="text_margin_input" type="number" min="0" max="50" step="1" value="${settings.injectDepth}">
                     </label>
@@ -523,6 +529,8 @@ const PANEL_CONTROLS = [
     ['smarttavern_profileUpdateLookback', 'profileUpdateLookback', 'number'],
     ['smarttavern_stepMaxTokens', 'stepMaxTokens', 'number'],
     ['smarttavern_updaterMaxTokens', 'updaterMaxTokens', 'number'],
+    ['smarttavern_genRetries', 'genRetries', 'number'],
+    ['smarttavern_genRetryDelayMs', 'genRetryDelayMs', 'number'],
     ['smarttavern_injectDepth', 'injectDepth', 'number'],
     ['smarttavern_injectName', 'injectName', 'text'],
     ['smarttavern_injectionHeader', 'injectionHeader', 'text'],
