@@ -1131,12 +1131,13 @@ function renderRunResult(body, result, pipeline) {
         chips.className = 'smarttavern_results_chips';
         chips.innerHTML = chipsHtml(
             result.stepStats.map(stat => stat.name),
-            result.stepStats.map(stat => (stat.failed ? 'failed' : 'done')),
+            result.stepStats.map(stat => (stat.cancelled || stat.skipped ? 'skipped' : stat.failed ? 'failed' : 'done')),
         );
         body.append(chips);
     }
     for (const stat of (result.stepStats ?? [])) {
-        appendSection(body, stepStatsTitle(stat.name || 'Step', stat), result.stepOutputs?.[stat.name] || '(no output — failed or empty, see browser console)');
+        appendSection(body, stepStatsTitle(stat.name || 'Step', stat), stat.cancelled || stat.skipped
+            ? '(skipped — refinement stopped)' : result.stepOutputs?.[stat.name] || '(no output — failed or empty, see browser console)');
     }
     if (result.injectionText) {
         appendSection(

@@ -19,7 +19,7 @@ import {
     clampInt, substituteParamsSafe, STEP_ROLES, captureChatScope,
 } from './state.js';
 import { system_message_types } from '../../../../system-messages.js';
-import { generateWithRetry, withInternalGeneration, isInternalGeneration } from './gen.js';
+import { generateWithRetry, withInternalGeneration, isInternalGeneration, createGenerationControl, isAbortError, throwIfAborted } from './gen.js';
 import { bootstrapProfile, serializeProfile } from './profiles.js';
 import { activityStart, activityStatus, activityEntry, activityFail, activityEnd, activitySteps, activityStepState } from './progress.js';
 import { applyVeil, setVeilStep, setVeilStatus, revealVeil } from './veil.js';
@@ -42,6 +42,15 @@ let lastRefinementRun = null;
 
 // Re-entrancy guard: renders (swipe views, scrollback) can re-fire the refinement event.
 let refinementBusy = false;
+let activeRefinement = null;
+
+/** Accept the last completed pass and discard the currently running pass. */
+export function stopRefinement() {
+    if (!activeRefinement) return false;
+    activeRefinement.accepted = true;
+    activeRefinement.cancel();
+    return true;
+}
 
 // Fresh-reply tracking: the interceptor bumps `generationEpoch` on every real
 // generation, so refinement can tell a freshly generated reply apart from an existing
@@ -93,8 +102,9 @@ function recordLastRun(result, pipeline, source) {
     return result;
 }
 
-function bootstrapKey() {
-    return String(getContext().chatId ?? 'no-chat');
+function bootstrapKey(char) {
+    const context = getContext();
+    return JSON.stringify([context.groupId ?? context.characterId, context.chatId ?? 'no-chat', charKey(char)]);
 }
 
 export function resetBootstrapFailures() {
@@ -264,11 +274,11 @@ export function injectEphemeral(chatArr, text, settings, role = 'assistant', ind
 // Pipeline
 // --------------------------------------------------------------------------------------------
 
-async function runSteps({ char, profile, chat, settings }) {
+async function runSteps({ char, profile, chat, settings, signal }) {
     const stepOutputs = Object.create(null);
     const steps = (Array.isArray(settings.steps) ? settings.steps : [])
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
-    const stepStats = Array.from({ length: steps.length });
+    const stepStats = steps.map(step => ({ name: step.name || 'Unnamed step', chars: 0, elapsedMs: 0, skipped: true }));
     activitySteps({ names: steps.map(s => s.name || 'Unnamed step') });
     const runStep = async (step, index) => {
         const label = step.name || 'Unnamed step';
@@ -276,6 +286,7 @@ async function runSteps({ char, profile, chat, settings }) {
         activityStepState(index, 'running');
         const startedAt = Date.now();
         try {
+            throwIfAborted(signal);
             const earlierOutputs = Object.fromEntries(steps.slice(0, index)
                 .filter(previous => Object.hasOwn(stepOutputs, previous.name))
                 .map(previous => [previous.name, stepOutputs[previous.name]]));
@@ -283,6 +294,7 @@ async function runSteps({ char, profile, chat, settings }) {
             const expanded = expandMacros(step.prompt, resolve);
             const text = substituteParamsSafe(expanded);
             const result = await withInternalGeneration(() => generateWithRetry({
+                signal,
                 profileId: step.profileId || '',
                 systemPrompt: STEP_SYSTEM,
                 prompt: text,
@@ -298,6 +310,7 @@ async function runSteps({ char, profile, chat, settings }) {
             });
             log(`step "${label}" finished (${output.length} chars)`);
         } catch (error) {
+            if (isAbortError(error)) throw error;
             warn(`pipeline step "${label}" failed`, error);
             stepOutputs[step.name] = '';
             stepStats[index] = { name: label, chars: 0, elapsedMs: Date.now() - startedAt, failed: true };
@@ -307,21 +320,20 @@ async function runSteps({ char, profile, chat, settings }) {
     };
     // Only explicit macro dependencies impose ordering. {{steps}} needs all earlier
     // outputs. Forward references stay empty, matching sequential execution.
-    const pending = new Set(steps.map((_, index) => index));
-    while (pending.size) {
-        const ready = [...pending].filter(index => {
-            if (settings.stepExecution === 'sequential') return index === Math.min(...pending);
-            const macros = [...String(steps[index].prompt).matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)]
-                .map(match => match[1].trim().toLowerCase());
-            return ![...pending].some(previous => previous < index && (
-                macros.includes('steps') ||
-                String(steps[previous].name ?? '').trim().toLowerCase() === String(steps[index].name ?? '').trim().toLowerCase() ||
-                macros.some(macro => macro.startsWith('step:') && macro.slice(5).trim() === String(steps[previous].name ?? '').trim().toLowerCase())
-            ));
+    const tasks = [];
+    steps.forEach((step, index) => {
+        const macros = [...String(step.prompt).matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)]
+            .map(match => match[1].trim().toLowerCase());
+        const dependencies = steps.slice(0, index).flatMap((previous, previousIndex) => {
+            const name = String(previous.name ?? '').trim().toLowerCase();
+            const depends = settings.stepExecution === 'sequential' || macros.includes('steps')
+                || name === String(step.name ?? '').trim().toLowerCase()
+                || macros.some(macro => macro.startsWith('step:') && macro.slice(5).trim() === name);
+            return depends ? [tasks[previousIndex]] : [];
         });
-        await Promise.all(ready.map(index => runStep(steps[index], index)));
-        ready.forEach(index => pending.delete(index));
-    }
+        tasks.push(Promise.all(dependencies).then(() => runStep(step, index)));
+    });
+    await Promise.all(tasks);
     return { stepOutputs, stepStats };
 }
 
@@ -353,24 +365,25 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
 
     const key = charKey(char);
     const store = getChatStore();
-
-    if (bootstrap && settings.bootstrapOnFirstMessage && !store.profiles[key] && !failedBootstraps.has(bootstrapKey())) {
-        try {
-            toastr.info(`SmartTavern is compiling the living profile for ${char.name}…`, 'SmartTavern', { timeOut: 10000 });
-            await withInternalGeneration(() => bootstrapProfile(char, { notify: false }));
-        } catch (error) {
-            failedBootstraps.add(bootstrapKey());
-            warn(`profile bootstrap failed for ${char.name}; continuing without injection`, error);
-        }
-    }
-
-    if (!isCurrentChat()) return null;
-    const profile = getStoredProfile(key);
+    const failureKey = bootstrapKey(char);
+    const control = createGenerationControl();
     const isDryRun = !inject;
     activityStart({ status: `${isDryRun ? 'Dry run' : 'Pipeline'} · ${char.name}` });
     let failed = false;
     let summary = isDryRun ? 'Dry run finished' : 'State block injected';
     try {
+        if (bootstrap && settings.bootstrapOnFirstMessage && !store.profiles[key] && !failedBootstraps.has(failureKey)) {
+            try {
+                toastr.info(`SmartTavern is compiling the living profile for ${char.name}…`, 'SmartTavern', { timeOut: 10000 });
+                await withInternalGeneration(() => bootstrapProfile(char, { notify: false, signal: control.signal }));
+            } catch (error) {
+                if (isAbortError(error)) throw error;
+                failedBootstraps.add(failureKey);
+                warn(`profile bootstrap failed for ${char.name}; continuing without injection`, error);
+            }
+        }
+        if (!isCurrentChat()) return null;
+        const profile = getStoredProfile(key);
         activityEntry({
             title: profile
                 ? `Living profile loaded — ${Object.keys(profile.fields ?? {}).length} fields`
@@ -378,7 +391,8 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             tone: 'info',
         });
 
-        const { stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings });
+        const { stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings, signal: control.signal });
+        throwIfAborted(control.signal);
         if (!isCurrentChat()) return null;
         const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings, stepsList: settings.steps });
         const injectionText = stepBlocks(settings.steps, stepOutputs).length
@@ -413,11 +427,17 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         }
         return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'expansion', 'generation');
     } catch (error) {
+        if (isAbortError(error)) {
+            control.cancel();
+            summary = 'Expansion cancelled';
+            return null;
+        }
         failed = true;
         summary = 'Pipeline failed — see console for details';
         activityFail(summary);
         throw error;
     } finally {
+        control.dispose();
         activityEnd({ ok: !failed, summary });
     }
 }
@@ -554,6 +574,9 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
 
     const steps = (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
+    const control = createGenerationControl();
+    control.accepted = false;
+    if (!dryRun) activeRefinement = control;
 
     // Veiled mode blurs the rendered draft until the final pass lands. The veil goes up
     // BEFORE the optional bootstrap so a first-reply draft is never readable "for free"
@@ -563,6 +586,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
     const veiled = !dryRun && settings.refinementDisplay === 'veiled' && steps.length > 0 && applyVeil(messageId, {
         names: steps.map(s => s.name || 'Unnamed pass'),
         allowPeek: settings.veilAllowPeek !== false,
+        onEnough: stopRefinement,
     });
 
     const key = charKey(char);
@@ -572,17 +596,21 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
     let failed = false;
     let summary = 'No pass changed the reply';
     const stepOutputs = Object.create(null);
-    const stepStats = Array.from({ length: steps.length });
+    const stepStats = steps.map(step => ({ name: step.name || 'Unnamed pass', chars: 0, elapsedMs: 0, skipped: true }));
     let workingDraft = originalDraft;
     let changed = 0;
+    let refinementSwipeAdded = false;
+    const failureKey = bootstrapKey(char);
 
+    activityStart({ status: `${dryRun ? 'Refinement dry run' : 'Refining reply'} · ${char.name}` });
     try {
-        if (bootstrap && settings.bootstrapOnFirstMessage && !store.profiles[key] && !failedBootstraps.has(bootstrapKey())) {
+        if (bootstrap && settings.bootstrapOnFirstMessage && !store.profiles[key] && !failedBootstraps.has(failureKey)) {
             try {
                 toastr.info(`SmartTavern is compiling the living profile for ${char.name}…`, 'SmartTavern', { timeOut: 10000 });
-                await withInternalGeneration(() => bootstrapProfile(char, { notify: false }));
+                await withInternalGeneration(() => bootstrapProfile(char, { notify: false, signal: control.signal }));
             } catch (error) {
-                failedBootstraps.add(bootstrapKey());
+                if (isAbortError(error)) throw error;
+                failedBootstraps.add(failureKey);
                 warn(`profile bootstrap failed for ${char.name}; continuing without a profile`, error);
             }
         }
@@ -590,7 +618,6 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         profile = getStoredProfile(key);
         // Profile runs clear the step row, so restore it after bootstrap.
         activitySteps({ names: steps.map(s => s.name || 'Unnamed pass') });
-        activityStart({ status: `${dryRun ? 'Refinement dry run' : 'Refining reply'} · ${char.name}` });
         activityEntry({
             title: profile
                 ? `Living profile loaded — ${Object.keys(profile.fields ?? {}).length} fields`
@@ -616,6 +643,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 });
                 const text = substituteParamsSafe(expandMacros(step.prompt, resolve));
                 const result = await withInternalGeneration(() => generateWithRetry({
+                    signal: control.signal,
                     profileId: step.profileId || '',
                     systemPrompt: REFINEMENT_SYSTEM,
                     prompt: text,
@@ -637,12 +665,13 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                     changed++;
                     if (!dryRun) {
                         message.mes = workingDraft;
-                        if (settings.savePassesAsSwipes && !veiled) {
+                        if (settings.savePassesAsSwipes && (!veiled || !refinementSwipeAdded)) {
                             appendRefinementSwipe(message, workingDraft, originalDraft);
+                            refinementSwipeAdded = true;
                         }
                         // Keep the selected swipe consistent even when saving extra
                         // revisions is disabled; switching away and back must not undo edits.
-                        if (!veiled && Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
+                        if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
                             message.swipes[message.swipe_id] = workingDraft;
                         }
                         expectedDraft = message.mes;
@@ -652,6 +681,13 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                     }
                 }
             } catch (error) {
+                if (isAbortError(error)) {
+                    if (!control.accepted || !isCurrentDraft()) return null;
+                    stepStats[index] = { name: label, chars: 0, elapsedMs: Date.now() - startedAt, cancelled: true };
+                    activityStepState(index, 'skipped');
+                    setVeilStep(messageId, index, 'skipped');
+                    break;
+                }
                 warn(`refinement step "${label}" failed`, error);
                 stepOutputs[step.name] = '';
                 stepStats[index] = { name: label, chars: 0, elapsedMs: Date.now() - startedAt, failed: true };
@@ -664,28 +700,37 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         summary = changed
             ? (dryRun ? `Dry run · ${changed} pass(es) would revise the reply` : `Reply refined · ${changed} pass(es) applied`)
             : (dryRun ? 'Dry run · no pass would change the reply' : 'No pass changed the reply');
+        if (control.accepted) summary = 'Refinement stopped · kept the last completed pass';
 
         if (!dryRun && changed) {
             // Mark as refined so re-renders (swipe views, scrollback) do not refine again;
             // the interceptor clears this flag whenever a fresh generation starts.
             if (isPlainObject(message.extra)) message.extra.smarttavernRefined = true;
             else message.extra = { smarttavernRefined: true };
-            if (veiled && settings.savePassesAsSwipes) {
-                // Keep just the final revision from this run, plus existing alternatives.
-                appendRefinementSwipe(message, workingDraft, originalDraft);
-            }
             if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
                 message.swipes[message.swipe_id] = workingDraft;
             }
             await saveRefinedChat();
         }
-        return { char, profile, stepOutputs, stepStats, workingDraft, changed };
+        return { char, profile, stepOutputs, stepStats, workingDraft, changed, stopped: control.accepted };
     } catch (error) {
+        if (isAbortError(error)) {
+            summary = control.accepted ? 'Refinement stopped · kept the original draft' : 'Refinement cancelled';
+            return control.accepted && isCurrentDraft()
+                ? { char, profile, stepOutputs, stepStats, workingDraft, changed, stopped: true } : null;
+        }
         failed = true;
         summary = 'Refinement failed — see console for details';
         activityFail(summary);
         return null;
     } finally {
+        control.dispose();
+        if (activeRefinement === control) activeRefinement = null;
+        stepStats.forEach((stat, index) => {
+            if (!stat.skipped && !stat.cancelled) return;
+            activityStepState(index, 'skipped');
+            if (veiled && isCurrentChat()) setVeilStep(messageId, index, 'skipped');
+        });
         recordLastRun({ char, profile, stepOutputs, stepStats, injectionText: workingDraft }, 'refinement', dryRun ? 'dry run' : 'refinement');
         // Failure reveals instantly; completion animates. message.mes always holds the
         // best draft saved so far, so both paths show real content.

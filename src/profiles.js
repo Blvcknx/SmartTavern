@@ -6,7 +6,7 @@ import {
     cardText, chatExcerpt, charKey, setStoredProfile, deleteStoredProfile,
     getStoredProfile, getMainCharacter, resolveMemberByMessageName, substituteParamsSafe, captureChatScope,
 } from './state.js';
-import { generateWithRetry, withInternalGeneration } from './gen.js';
+import { generateWithRetry, withInternalGeneration, createGenerationControl, isAbortError, throwIfAborted } from './gen.js';
 import { activityStart, activityEntry, activityFail, activityEnd, activitySteps } from './progress.js';
 
 const busyKeys = new Set();
@@ -175,8 +175,9 @@ export function buildUpdatePrompt(char, profile, fields, excerpt) {
  * Full rewrite: compiles the character card (+ recent excerpt) into a fresh profile.
  * Used for the first generation of a character (bootstrap) and for explicit rebuilds.
  */
-export async function bootstrapProfile(char, { source = 'bootstrap', notify = true } = {}) {
+export async function bootstrapProfile(char, { source = 'bootstrap', notify = true, signal = null } = {}) {
     if (!char) throw new Error('No character provided');
+    throwIfAborted(signal);
     const settings = getSettings();
     const key = charKey(char);
     const isCurrentChat = captureChatScope();
@@ -184,6 +185,8 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
     const previousFields = JSON.stringify(previous?.fields);
     if (busyKeys.has(key)) return null;
     busyKeys.add(key);
+    const control = createGenerationControl();
+    const requestSignal = signal ?? control.signal;
     try {
         activityStart({ status: `${source === 'rebuild' ? 'Rebuilding' : 'Compiling'} profile · ${char.name}` });
         activitySteps({ names: [] }); // profile runs have no passes — clear any stale chip row
@@ -192,6 +195,7 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
         const schema = buildJsonSchema(fields);
         const excerpt = chatExcerpt(context.chat, settings.profileUpdateLookback);
         const result = await withInternalGeneration(() => generateWithRetry({
+            signal: requestSignal,
             profileId: settings.profileUpdateProfileId,
             systemPrompt: BOOTSTRAP_SYSTEM,
             prompt: buildBootstrapPrompt(char, fields, excerpt),
@@ -219,10 +223,15 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
         activityEnd({ ok: true, summary: `${source === 'rebuild' ? 'Profile rebuilt' : 'Profile created'} · ${char.name}` });
         return record;
     } catch (error) {
+        if (isAbortError(error)) {
+            activityEnd({ ok: true, summary: 'Profile compilation cancelled' });
+            throw error;
+        }
         activityFail(`Profile ${source} failed — ${error?.message ?? error}`);
         activityEnd({ ok: false, summary: 'Profile update failed' });
         throw error;
     } finally {
+        control.dispose();
         busyKeys.delete(key);
     }
 }
@@ -245,6 +254,7 @@ export async function updateProfile(char, { notify = true } = {}) {
     const settings = getSettings();
     if (busyKeys.has(key)) return null;
     busyKeys.add(key);
+    const control = createGenerationControl();
     try {
         activityStart({ status: `Updating profile · ${char.name}` });
         activitySteps({ names: [] }); // profile runs have no passes — clear any stale chip row
@@ -253,6 +263,7 @@ export async function updateProfile(char, { notify = true } = {}) {
         const schema = buildJsonSchema(fields);
         const excerpt = chatExcerpt(context.chat, settings.profileUpdateLookback);
         const result = await withInternalGeneration(() => generateWithRetry({
+            signal: control.signal,
             profileId: settings.profileUpdateProfileId,
             systemPrompt: UPDATE_SYSTEM,
             prompt: buildUpdatePrompt(char, existing, fields, excerpt),
@@ -284,10 +295,15 @@ export async function updateProfile(char, { notify = true } = {}) {
         activityEnd({ ok: true, summary: `Profile updated · ${char.name}` });
         return record;
     } catch (error) {
+        if (isAbortError(error)) {
+            activityEnd({ ok: true, summary: 'Profile update cancelled' });
+            return null;
+        }
         activityFail(`Profile update failed — ${error?.message ?? error}`);
         activityEnd({ ok: false, summary: 'Profile update failed' });
         throw error;
     } finally {
+        control.dispose();
         busyKeys.delete(key);
     }
 }

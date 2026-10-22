@@ -636,6 +636,12 @@
     border-color: var(--SmartThemeQuoteColor);
 }
 
+.smarttavern_veil .smarttavern_veil_enough {
+    width: auto;
+    margin: 0;
+    padding: 5px 12px;
+}
+
 .smarttavern_veil.is-leaving {
     animation: smarttavern_veil_fade 0.5s ease forwards;
     pointer-events: none;

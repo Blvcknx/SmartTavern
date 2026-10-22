@@ -33,7 +33,7 @@ export function stagePromptTail(text, role) {
 }
 
 function currentTail(event) {
-    if (isInternalGeneration() || !pending || event?.dryRun) return null;
+    if (isInternalGeneration(event) || !pending || event?.dryRun) return null;
     if (getContext().chatId !== pending.chatId) {
         clearPromptTail();
         return null;
@@ -70,6 +70,7 @@ function cleanStaleChat(chat) {
 }
 
 export function appendChatTail(event) {
+    if (isInternalGeneration(event)) return;
     const tail = currentTail(event);
     if (!Array.isArray(event.chat)) return;
     if (!tail) {
@@ -107,6 +108,7 @@ export function appendChatTail(event) {
 }
 
 export function appendTextTail(event) {
+    if (isInternalGeneration(event)) return;
     const tail = currentTail(event);
     if (typeof event.prompt !== 'string') return;
     if (!tail) {

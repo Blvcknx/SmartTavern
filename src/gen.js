@@ -6,18 +6,84 @@ import { getSettings, clampInt, warn } from './state.js';
 import { activityEntry } from './progress.js';
 
 let internalDepth = 0;
+const internalEvents = new WeakSet();
+// generateRaw emits the same prompt hooks as a foreground reply. Identify its
+// event by a temporary marker, strip it before dispatch, and retain event identity
+// for later hooks without globally classifying other requests as internal.
+const rawMarkers = new Set();
+let rawSequence = 0;
 
-export function isInternalGeneration() {
+export function isInternalGeneration(event = null) {
+    if (event && typeof event === 'object') {
+        if (internalEvents.has(event)) return true;
+        const clean = text => {
+            if (typeof text !== 'string') return text;
+            for (const marker of rawMarkers) {
+                if (!text.includes(marker)) continue;
+                internalEvents.add(event);
+                text = text.split(marker).join('');
+            }
+            return text;
+        };
+        if (typeof event.prompt === 'string') event.prompt = clean(event.prompt);
+        for (const message of event.chat ?? []) {
+            if (typeof message.content === 'string') message.content = clean(message.content);
+            else if (Array.isArray(message.content)) {
+                for (const part of message.content) if (part && typeof part.text === 'string') part.text = clean(part.text);
+            }
+        }
+        if (internalEvents.has(event)) return true;
+    }
     return internalDepth > 0;
 }
 
-export async function withInternalGeneration(fn) {
+// Only guard synchronous entry. Keeping this set across an await also suppresses
+// unrelated foreground generations while a background profile request is pending.
+export function withInternalGeneration(fn) {
     internalDepth++;
     try {
-        return await fn();
+        return fn();
     } finally {
         internalDepth--;
     }
+}
+
+export function isAbortError(error) {
+    return error?.name === 'AbortError' || (error?.cause && isAbortError(error.cause));
+}
+
+function abortReason(signal) {
+    return signal?.reason ?? new DOMException('Generation cancelled', 'AbortError');
+}
+
+export function throwIfAborted(signal) {
+    if (signal?.aborted) throw abortReason(signal);
+}
+
+// Some older active-connection APIs cannot abort their transport. Release the
+// caller immediately but keep the physical request in activeQueue until it settles.
+function abortable(promise, signal) {
+    if (!signal) return promise;
+    return new Promise((resolve, reject) => {
+        const abort = () => reject(abortReason(signal));
+        signal.addEventListener('abort', abort, { once: true });
+        Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+        if (signal.aborted) abort();
+    });
+}
+
+/** One cancellation scope shared by a run, its queued calls and retry delays. */
+export function createGenerationControl() {
+    const controller = new AbortController();
+    const context = getContext();
+    const events = context.event_types ?? context.eventTypes ?? {};
+    const types = [events.GENERATION_STOPPED, events.CHAT_CHANGED].filter(Boolean);
+    const cancel = () => controller.abort(new DOMException('Generation cancelled', 'AbortError'));
+    for (const type of types) context.eventSource?.on(type, cancel);
+    return {
+        signal: controller.signal, cancel,
+        dispose() { for (const type of types) context.eventSource?.removeListener(type, cancel); },
+    };
 }
 
 let sharedServicePromise = null;
@@ -66,9 +132,11 @@ export function getConnectionProfile(id) {
  * @param {string|Array} [options.prompt] Plain text (preferred) or Chat Completion message array
  * @param {number} [options.maxTokens]
  * @param {object|null} [options.jsonSchema] `{ name, description?, strict?, value }`; `value` is the JSON schema
+ * @param {AbortSignal|null} [options.signal] Cancels queued calls, retries and supported transports
  * @returns {Promise<{content: string, reasoning: string}>}
  */
-export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null } = {}) {
+export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null } = {}) {
+    throwIfAborted(signal);
     const context = getContext();
     const profile = profileId ? getConnectionProfile(profileId) : null;
 
@@ -80,7 +148,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         const service = getServiceFromContext() ?? await loadServiceFallback();
         if (service && typeof service.sendRequest === 'function') {
             try {
-                const result = await generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema });
+                const result = await abortable(generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal }), signal);
                 // A technically successful request can still return garbage (sampling
                 // collapse, reasoning corruption). Treat that like a failure so the
                 // active connection gets a chance before any retry logic kicks in.
@@ -88,6 +156,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
                 if (!degenerate) return result;
                 warn(`Profiled request returned ${degenerate}; falling back to the active connection.`);
             } catch (error) {
+                if (signal?.aborted || isAbortError(error)) throw error;
                 warn('Profiled request via Connection Manager failed; falling back to the active connection.', error);
             }
         } else {
@@ -95,12 +164,16 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         }
     }
 
-    const request = activeQueue.then(() => generateViaActive(context, { systemPrompt, prompt, maxTokens, jsonSchema }));
+    const request = activeQueue.then(() => {
+        throwIfAborted(signal);
+        return generateViaActive(context, { systemPrompt, prompt, maxTokens, jsonSchema });
+    });
     activeQueue = request.catch(() => {});
-    return request;
+    return abortable(request, signal);
 }
 
-async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema }) {
+async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal }) {
+    throwIfAborted(signal);
     const isChatCompletion = (profile.mode ?? 'cc') === 'cc';
     let payloadPrompt;
     const overridePayload = {};
@@ -132,6 +205,7 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
 
     const result = await service.sendRequest(profile.id, payloadPrompt, maxTokens, {
         stream: false,
+        signal,
         extractData: true,
         includePreset: true,
         includeInstruct: true,
@@ -154,12 +228,19 @@ async function generateViaActive(context, { systemPrompt, prompt, maxTokens, jso
     if (typeof context.generateRaw !== 'function') {
         throw new Error('SillyTavern context does not expose generateRaw()');
     }
-    const text = await context.generateRaw({
-        systemPrompt,
-        prompt,
-        responseLength: maxTokens > 0 ? maxTokens : null,
-        jsonSchema: jsonSchema ? { ...jsonSchema, returnInvalid: true } : null,
-    });
+    const marker = `[SMARTTAVERN-INTERNAL-${Date.now()}-${++rawSequence}]`;
+    rawMarkers.add(marker);
+    let text;
+    try {
+        text = await withInternalGeneration(() => context.generateRaw({
+            systemPrompt: `${marker}${systemPrompt}`,
+            prompt,
+            responseLength: maxTokens > 0 ? maxTokens : null,
+            jsonSchema: jsonSchema ? { ...jsonSchema, returnInvalid: true } : null,
+        }));
+    } finally {
+        rawMarkers.delete(marker);
+    }
     // With a schema, generateRaw returns an extracted JSON string; without, the cleaned message.
     return { content: String(text ?? ''), reasoning: '' };
 }
@@ -200,8 +281,14 @@ function resultDegenerateReason(result) {
     return null;
 }
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+        throwIfAborted(signal);
+        const finish = () => { signal?.removeEventListener('abort', abort); resolve(); };
+        const timer = setTimeout(finish, ms);
+        const abort = () => { clearTimeout(timer); reject(abortReason(signal)); };
+        signal?.addEventListener('abort', abort, { once: true });
+    });
 }
 
 /**
@@ -216,14 +303,16 @@ export async function generateWithRetry(options = {}) {
     const attempts = 1 + clampInt(settings.genRetries, 0, 5, 2);
     const baseDelay = clampInt(settings.genRetryDelayMs, 0, 30000, 500);
     for (let attempt = 1; attempt <= attempts; attempt++) {
+        throwIfAborted(options.signal);
         let result;
         try {
             result = await generateVia(options);
         } catch (error) {
+            if (options.signal?.aborted || isAbortError(error)) throw error;
             warn(`internal generation attempt ${attempt}/${attempts} failed`, error);
             if (attempt === attempts) throw error;
             activityEntry({ title: `Attempt ${attempt}/${attempts} failed — retrying`, text: String(error?.message ?? error), tone: 'info' });
-            await sleep(baseDelay * attempt);
+            await sleep(baseDelay * attempt, options.signal);
             continue;
         }
         const reason = resultDegenerateReason(result)
@@ -232,6 +321,6 @@ export async function generateWithRetry(options = {}) {
         warn(`internal generation attempt ${attempt}/${attempts} was unusable (${reason})`);
         if (attempt === attempts) throw new Error(`Unusable model output after ${attempts} attempt(s) — ${reason}`);
         activityEntry({ title: `Attempt ${attempt}/${attempts} unusable — retrying (${reason})`, tone: 'info' });
-        await sleep(baseDelay * attempt);
+        await sleep(baseDelay * attempt, options.signal);
     }
 }

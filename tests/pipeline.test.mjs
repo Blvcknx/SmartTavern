@@ -7,19 +7,26 @@ import { SourceTextModule, createContext } from 'node:vm';
 async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false } = {}) {
     const requests = [];
     const savedChat = [{ is_user: true, name: 'User', mes: 'Hello' }];
+    const listeners = new Map();
     const context = {
+        event_types: { GENERATION_STOPPED: 'stop', CHAT_CHANGED: 'chat' },
+        eventSource: {
+            on(type, fn) { if (!listeners.has(type)) listeners.set(type, new Set()); listeners.get(type).add(fn); },
+            removeListener(type, fn) { listeners.get(type)?.delete(fn); },
+            emit(type, ...args) { for (const fn of [...(listeners.get(type) ?? [])]) fn(...args); },
+        },
         extensionSettings: { smarttavern: { genRetries: 0, bootstrapOnFirstMessage: false, promptTailVersion: 1, injectAnchor: 'before-last-user', ...settings }, connectionManager: { profiles: [{ id: 'model', mode: 'cc' }] } },
         chat: savedChat, chatMetadata: {}, characterId: 0,
         characters: [{ name: 'Alice', avatar: 'alice.png' }], name1: 'User', name2: 'Alice',
         saveSettingsDebounced() {}, substituteParams: text => text,
         saveMetadata() {}, saveMetadataDebounced() {}, saveChat: async () => {}, updateMessageBlock() {},
-        ConnectionManagerRequestService: { async sendRequest(id, messages) {
-            requests.push({ id, messages });
+        ConnectionManagerRequestService: { async sendRequest(id, messages, _maxTokens, custom) {
+            requests.push({ id, messages, signal: custom?.signal });
             return respond(messages, requests.length);
         } },
         generateRaw: async options => { requests.push(options); return 'ACTIVE OUTPUT'; },
     };
-    const sandbox = createContext({ context, console: { log() {}, warn() {} }, toastr: { warning() {}, info() {}, success() {} },
+    const sandbox = createContext({ context, AbortController, DOMException, setTimeout, clearTimeout, console: { log() {}, warn() {} }, toastr: { warning() {}, info() {}, success() {} },
         document: { dispatchEvent() {} }, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
     });
     const modules = new Map();
@@ -385,6 +392,7 @@ test('disabling mid-assembly strips the reservation and omits its tail', async (
 
 test('lifecycle cancellation and chat changes cannot leak stale reservations', async () => {
     const h = await harness();
+    delete h.context.event_types;
     const listeners = new Map();
     h.context.eventTypes = Object.fromEntries([
         'GENERATION_STARTED', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED',
@@ -411,4 +419,187 @@ test('a custom text formatter keeps assessment in place without leaking markers'
     const event = { prompt: `CUSTOM-BEGIN${reservation}CUSTOM-END\nPRESET` };
     h.tail.appendTextTail(event);
     assert.equal(event.prompt, 'CUSTOM-BEGINWORKING NOTESCUSTOM-END\nPRESET');
+});
+
+test('a background profile request does not suppress foreground expansion or refinement tracking', async () => {
+    const started = deferred();
+    const response = deferred();
+    const h = await harness({ fields: [{ name: 'Summary' }], profileUpdateProfileId: 'model', steps: [step('A', 'ASSESS')] },
+        async (_messages, index) => { if (index === 1) { started.resolve(); return response.promise; } return { content: 'Assessment' }; });
+    h.state.setStoredProfile('alice.png', { fields: { Summary: 'Original' } });
+    const update = h.profiles.updateProfile(h.context.characters[0], { notify: false });
+    await started.promise;
+    const core = [...h.savedChat];
+    await h.pipeline.smarttavernInterceptor(core, 10000, () => {}, 'normal');
+    assert.equal(h.pipeline.hasFreshReply(), true);
+    assert.equal(core.filter(m => m.smarttavern_ephemeral).length, 1);
+    response.resolve({ content: '{"Summary":"Updated"}' });
+    await update;
+});
+
+test('each group member gets a bootstrap attempt after another member fails', async () => {
+    const h = await harness({ bootstrapOnFirstMessage: true, fields: [{ name: 'Summary' }], profileUpdateProfileId: 'model', steps: [step('A', 'ASSESS')] },
+        async () => ({ content: 'invalid profile' }));
+    h.context.groupId = 'group';
+    h.context.chatId = 'chat';
+    h.context.characters.push({ name: 'Bob', avatar: 'bob.png' });
+    h.context.groups = [{ id: 'group', members: ['alice.png', 'bob.png'] }];
+    await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    h.context.name2 = 'Bob';
+    await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.equal(h.requests.filter(r => r.messages[0].content.includes('profile compiler')).length, 2);
+});
+
+test('a dependent step starts as soon as its prerequisite finishes', async () => {
+    const a = deferred(), b = deferred(), bothStarted = deferred(), cStarted = deferred();
+    let count = 0;
+    const h = await harness({ steps: [step('A', 'A'), step('B', 'B'), step('C', 'C {{step:A}}')] }, async messages => {
+        const prompt = messages.at(-1).content;
+        if (++count === 2) bothStarted.resolve();
+        if (prompt === 'A') return a.promise;
+        if (prompt === 'B') return b.promise;
+        cStarted.resolve();
+        return { content: 'C output' };
+    });
+    const run = h.pipeline.runPipeline({ inject: false });
+    await bothStarted.promise;
+    a.resolve({ content: 'A output' });
+    await cStarted.promise;
+    assert.equal(h.requests[2].messages.at(-1).content, 'C A output');
+    b.resolve({ content: 'B output' });
+    await run;
+});
+
+test('wrapped abort errors never fall back or retry', async () => {
+    const h = await harness({ genRetries: 2 }, async () => { throw new Error('API request failed', { cause: new DOMException('Stopped', 'AbortError') }); });
+    let active = 0;
+    h.context.generateRaw = async () => { active++; return 'Unexpected fallback'; };
+    await assert.rejects(h.gen.generateWithRetry({ profileId: 'model', prompt: 'test' }));
+    assert.equal(h.requests.length, 1);
+    assert.equal(active, 0);
+});
+
+test('Stop cancels expansion, queued active requests and dependent steps', async () => {
+    const started = deferred(), response = deferred();
+    const h = await harness({ genRetries: 2, steps: [step('A', 'A'), step('B', 'B'), step('C', '{{step:A}}')] });
+    h.state.getSettings().steps.forEach(s => { s.profileId = ''; });
+    let calls = 0;
+    h.context.generateRaw = async () => { calls++; started.resolve(); return response.promise; };
+    const core = [...h.savedChat];
+    const run = h.pipeline.runPipeline({ chat: core });
+    await started.promise;
+    h.context.eventSource.emit('stop');
+    assert.equal(await run, null);
+    response.resolve('Late output');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls, 1);
+    assert.equal(core.length, 1);
+});
+
+for (const savePassesAsSwipes of [true, false]) {
+    test(`That's enough accepts the completed veiled pass immediately (save swipes: ${savePassesAsSwipes})`, async () => {
+        const started = deferred(), response = deferred();
+        const h = await harness({ genRetries: 2, savePassesAsSwipes, refinementSteps: [step('A', '{{draft}}'), step('B', '{{draft}}'), step('C', '{{draft}}')] },
+            async (_messages, index) => { if (index === 1) return { content: 'First revision' }; started.resolve(); return response.promise; }, { veiled: true });
+        const message = { name: 'Alice', mes: 'Original', swipes: ['Original', 'Alternative'], swipe_id: 0 };
+        h.savedChat.push(message);
+        h.pipeline.markFreshGeneration();
+        const run = h.pipeline.runRefinementPipeline(1);
+        await started.promise;
+        assert.equal(message.swipes[message.swipe_id], 'First revision');
+        assert.equal(h.pipeline.stopRefinement(), true);
+        const result = await run;
+        assert.equal(result.stopped, true);
+        assert.equal(result.workingDraft, 'First revision');
+        assert.equal(message.mes, 'First revision');
+        assert.equal(message.swipes[message.swipe_id], message.mes);
+        assert.equal(h.requests[1].signal.aborted, true);
+        assert.equal(h.pipeline.isRefinementBusy(), false);
+        response.resolve({ content: 'Discarded late output' });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(message.mes, 'First revision');
+        assert.equal(h.requests.length, 2);
+        if (savePassesAsSwipes) assert.deepEqual(message.swipes, ['Original', 'Alternative', 'First revision']);
+        else assert.deepEqual(message.swipes, ['First revision', 'Alternative']);
+    });
+}
+
+test("That's enough during the first pass keeps the original draft", async () => {
+    const started = deferred(), response = deferred();
+    const h = await harness({ refinementSteps: [step('A', '{{draft}}')] }, () => { started.resolve(); return response.promise; }, { veiled: true });
+    const message = { name: 'Alice', mes: 'Original', swipes: ['Original'], swipe_id: 0 };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const run = h.pipeline.runRefinementPipeline(1);
+    await started.promise;
+    h.pipeline.stopRefinement();
+    assert.equal((await run).workingDraft, 'Original');
+    assert.equal(message.mes, 'Original');
+    assert.deepEqual(message.swipes, ['Original']);
+    response.resolve({ content: 'Discarded' });
+});
+
+test('global Stop preserves swipe consistency after a completed veiled pass', async () => {
+    const started = deferred(), response = deferred();
+    const h = await harness({ savePassesAsSwipes: true, refinementSteps: [step('A', '{{draft}}'), step('B', '{{draft}}')] },
+        async (_messages, index) => { if (index === 1) return { content: 'First revision' }; started.resolve(); return response.promise; }, { veiled: true });
+    const message = { name: 'Alice', mes: 'Original', swipes: ['Original'], swipe_id: 0 };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const run = h.pipeline.runRefinementPipeline(1);
+    await started.promise;
+    h.pipeline.cancelFreshReply();
+    h.context.eventSource.emit('stop');
+    assert.equal(await run, null);
+    assert.equal(message.mes, 'First revision');
+    assert.equal(message.swipes[message.swipe_id], message.mes);
+    response.resolve({ content: 'Discarded' });
+});
+
+test('internal active prompt hooks are identified per request and remove their marker', async () => {
+    const h = await harness();
+    const reservation = h.tail.stagePromptTail('FOREGROUND NOTES', 'assistant');
+    h.context.generateRaw = async ({ systemPrompt }) => {
+        await Promise.resolve(); // hooks can run after the synchronous guard is released
+        const event = { chat: [{ role: 'system', content: systemPrompt }, { role: 'user', content: 'Internal prompt' }] };
+        h.tail.appendChatTail(event);
+        assert.equal(h.gen.isInternalGeneration(event), true);
+        assert.doesNotMatch(JSON.stringify(event), /SMARTTAVERN-INTERNAL|FOREGROUND NOTES/);
+        return 'Internal result';
+    };
+    await h.gen.generateVia({ prompt: 'Internal prompt', systemPrompt: 'Internal system' });
+    const foreground = { chat: [{ role: 'assistant', content: reservation }] };
+    h.tail.appendChatTail(foreground);
+    assert.equal(foreground.chat.at(-1).content, 'FOREGROUND NOTES');
+});
+
+test('chip state updates retain the base class and keep targeting the same step indices', async () => {
+    const module = new SourceTextModule(await readFile(new URL('../src/chips.js', import.meta.url), 'utf8'));
+    await module.link(() => {});
+    await module.evaluate();
+    const chips = Array.from({ length: 3 }, () => ({ className: 'smarttavern_chip', icon: '' }));
+    const wrap = chip => ({
+        length: chip ? 1 : 0,
+        attr(_name, value) { chip.className = value; },
+        find() { return { attr(_name, value) { chip.icon = value; } }; },
+    });
+    const container = { length: 1, find() { return { eq(index) {
+        return wrap(chips.filter(chip => chip.className.split(/\s+/).includes('smarttavern_chip'))[index]);
+    } }; } };
+    chips.forEach((_chip, index) => {
+        module.namespace.setChipState(container, index, 'running');
+        module.namespace.setChipState(container, index, 'done');
+    });
+    assert.ok(chips.every(chip => chip.className === 'smarttavern_chip is-done'));
+    assert.ok(chips.every(chip => chip.icon === 'fa-solid fa-check'));
+});
+
+test('cancellation interrupts retry backoff without another provider request', async () => {
+    const h = await harness({ genRetries: 2, genRetryDelayMs: 30000 }, async () => ({ content: 'Unusable profile' }));
+    const controller = new AbortController();
+    const run = h.gen.generateWithRetry({ profileId: 'model', prompt: 'test', signal: controller.signal, validate: () => false });
+    await new Promise(resolve => setImmediate(resolve));
+    controller.abort(new DOMException('Stopped', 'AbortError'));
+    await assert.rejects(run, { name: 'AbortError' });
+    assert.equal(h.requests.length, 1);
 });

@@ -12,6 +12,7 @@ export function chipIcon(state) {
     if (state === 'running') return 'fa-solid fa-circle-notch fa-spin';
     if (state === 'done') return 'fa-solid fa-check';
     if (state === 'failed') return 'fa-solid fa-xmark';
+    if (state === 'skipped') return 'fa-solid fa-minus';
     // SillyTavern ships only the solid FA font (no fa-regular face), so a
     // `fa-regular fa-circle` silently renders as a solid dot. The pending state
     // uses a CSS-drawn hollow ring instead (see .smarttavern_chip_ring).
@@ -22,7 +23,7 @@ export function chipIcon(state) {
 export function chipsHtml(names, states = []) {
     return names.map((name, index) => {
         const state = states[index] ?? 'pending';
-        const stateClass = ['running', 'done', 'failed'].includes(state) ? ` is-${state}` : '';
+        const stateClass = ['running', 'done', 'failed', 'skipped'].includes(state) ? ` is-${state}` : '';
         return `<span class="smarttavern_chip${stateClass}" title="${escapeHtml(name)}">`
             + `<i class="${chipIcon(state)}"></i><span class="smarttavern_chip_name">${escapeHtml(name)}</span></span>`;
     }).join('');
@@ -33,7 +34,7 @@ export function setChipState($container, index, state) {
     if (!$container?.length) return;
     const $chip = $container.find('.smarttavern_chip').eq(index);
     if (!$chip.length) return;
-    const stateClass = ['running', 'done', 'failed'].includes(state) ? `is-${state}` : '';
-    $chip.attr('class', `smarttavern_chip${stateClass}`);
+    const stateClass = ['running', 'done', 'failed', 'skipped'].includes(state) ? `is-${state}` : '';
+    $chip.attr('class', `smarttavern_chip${stateClass ? ` ${stateClass}` : ''}`);
     $chip.find('i').attr('class', chipIcon(state));
 }

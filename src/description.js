@@ -36,7 +36,7 @@ export function initDescriptionOverride() {
 /** True when this generation's prompt should receive the living description swap. */
 function overrideActive(event) {
     // Dry runs (prompt inspectors) and our own internal calls keep the card description.
-    if (event?.dryRun || isInternalGeneration()) return false;
+    if (event?.dryRun || isInternalGeneration(event)) return false;
     const settings = getSettings();
     return Boolean(settings.enabled && settings.replaceDescription);
 }
