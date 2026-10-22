@@ -577,9 +577,9 @@
     inset: 0;
     z-index: 5;
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: center;
-    padding: 20px 12px;
+    padding: 12px;
     cursor: default;
 }
 
@@ -669,6 +669,18 @@
 .smarttavern_chip i {
     flex-shrink: 0;
     font-size: 0.8em;
+}
+
+/* Pending state: a hollow ring drawn in CSS. SillyTavern ships only the solid
+   Font Awesome font (no fa-regular face), so `fa-regular fa-circle` silently
+   renders as a filled dot and reads like an unknown/active state. */
+.smarttavern_chip i.smarttavern_chip_ring {
+    display: inline-block;
+    box-sizing: border-box;
+    width: 0.85em;
+    height: 0.85em;
+    border: 0.1em solid currentColor;
+    border-radius: 50%;
 }
 
 .smarttavern_chip.is-running {

@@ -16,7 +16,7 @@ import {
     log, warn, getSettings,
     cardText, chatExcerpt, charKey, getChatStore, getStoredProfile,
     resolveTargetChar, resolveMemberByMessageName, getMainCharacter, isPlainObject,
-    clampInt, substituteParamsSafe, STEP_ROLES,
+    clampInt, substituteParamsSafe, STEP_ROLES, captureChatScope,
 } from './state.js';
 import { system_message_types } from '../../../../system-messages.js';
 import { generateWithRetry, withInternalGeneration, isInternalGeneration } from './gen.js';
@@ -56,6 +56,11 @@ export function markFreshGeneration() {
 
 export function hasFreshReply() {
     return generationEpoch > refinedEpoch;
+}
+
+export function cancelFreshReply() {
+    generationEpoch++;
+    refinedEpoch = generationEpoch;
 }
 
 /** Consumes the fresh-reply mark; false when this render did not follow a generation. */
@@ -329,6 +334,7 @@ async function runSteps({ char, profile, chat, settings }) {
  */
 export async function runPipeline({ chat = null, inject = true, bootstrap = true, type = 'normal' } = {}) {
     const context = getContext();
+    const isCurrentChat = captureChatScope();
     const settings = getSettings();
     if (!settings.enabled || !settings.expansionEnabled) return null;
     if (type === 'quiet' || type === 'impersonate') return null;
@@ -358,6 +364,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         }
     }
 
+    if (!isCurrentChat()) return null;
     const profile = getStoredProfile(key);
     const isDryRun = !inject;
     activityStart({ status: `${isDryRun ? 'Dry run' : 'Pipeline'} · ${char.name}` });
@@ -372,6 +379,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         });
 
         const { stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings });
+        if (!isCurrentChat()) return null;
         const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings, stepsList: settings.steps });
         const injectionText = stepBlocks(settings.steps, stepOutputs).length
             ? (settings.injectAnchor === 'prompt-end'
@@ -480,6 +488,26 @@ async function updateRefinedMessage(messageId, message) {
     await saveRefinedChat();
 }
 
+/** Append a revision with matching metadata, preserving existing alternative replies. */
+function appendRefinementSwipe(message, draft, originalDraft) {
+    if (!Array.isArray(message.swipes) || !message.swipes.length) {
+        message.swipes = [originalDraft];
+        message.swipe_id = 0;
+    }
+    if (!Array.isArray(message.swipe_info)) message.swipe_info = [];
+    const makeInfo = () => ({
+        send_date: message.send_date, gen_started: message.gen_started,
+        gen_finished: message.gen_finished,
+        extra: JSON.parse(JSON.stringify(message.extra ?? {})),
+    });
+    for (let index = 0; index < message.swipes.length; index++) {
+        message.swipe_info[index] ??= makeInfo();
+    }
+    message.swipe_info[message.swipes.length] = makeInfo();
+    message.swipes.push(draft);
+    message.swipe_id = message.swipes.length - 1;
+}
+
 /**
  * Runs the enabled refinement passes strictly sequentially against the freshly generated
  * character reply. Every pass receives the current draft via {{draft}} and may return a
@@ -496,12 +524,13 @@ async function updateRefinedMessage(messageId, message) {
  */
 export async function runRefinementPipeline(messageId, { dryRun = false, bootstrap = true } = {}) {
     const context = getContext();
+    const isCurrentChat = captureChatScope();
+    const epoch = generationEpoch;
     const settings = getSettings();
     if (!settings.enabled || !settings.refinementEnabled) return null;
     if (isInternalGeneration() || refinementBusy) return null;
     // Fresh generations only: an existing message re-rendered (new chat load, scrollback)
     // must never be refined or veiled.
-    if (!dryRun && !consumeFreshReply()) return null;
 
     const arr = context.chat ?? [];
     const message = Number.isInteger(messageId) ? arr[messageId] : null;
@@ -515,6 +544,13 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         ? (resolveMemberByMessageName(message.name) ?? resolveTargetChar(arr))
         : (getMainCharacter() ?? resolveTargetChar(arr));
     if (!char) return null;
+    if (!dryRun && !consumeFreshReply()) return null;
+    let expectedDraft = message.mes;
+    let expectedSwipe = message.swipe_id;
+    const isCurrentDraft = () => isCurrentChat() && arr[messageId] === message
+        && message.mes === expectedDraft && message.swipe_id === expectedSwipe
+        && settings.enabled && settings.refinementEnabled
+        && (dryRun || generationEpoch === epoch);
 
     const steps = (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
@@ -528,23 +564,11 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         names: steps.map(s => s.name || 'Unnamed pass'),
         allowPeek: settings.veilAllowPeek !== false,
     });
-    activitySteps({ names: steps.map(s => s.name || 'Unnamed pass') });
 
     const key = charKey(char);
     const store = getChatStore();
-    if (bootstrap && settings.bootstrapOnFirstMessage && !store.profiles[key] && !failedBootstraps.has(bootstrapKey())) {
-        try {
-            toastr.info(`SmartTavern is compiling the living profile for ${char.name}…`, 'SmartTavern', { timeOut: 10000 });
-            await withInternalGeneration(() => bootstrapProfile(char, { notify: false }));
-        } catch (error) {
-            failedBootstraps.add(bootstrapKey());
-            warn(`profile bootstrap failed for ${char.name}; continuing without a profile`, error);
-        }
-    }
-    const profile = getStoredProfile(key);
-
+    let profile = null;
     refinementBusy = true;
-    activityStart({ status: `${dryRun ? 'Refinement dry run' : 'Refining reply'} · ${char.name}` });
     let failed = false;
     let summary = 'No pass changed the reply';
     const stepOutputs = Object.create(null);
@@ -553,6 +577,20 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
     let changed = 0;
 
     try {
+        if (bootstrap && settings.bootstrapOnFirstMessage && !store.profiles[key] && !failedBootstraps.has(bootstrapKey())) {
+            try {
+                toastr.info(`SmartTavern is compiling the living profile for ${char.name}…`, 'SmartTavern', { timeOut: 10000 });
+                await withInternalGeneration(() => bootstrapProfile(char, { notify: false }));
+            } catch (error) {
+                failedBootstraps.add(bootstrapKey());
+                warn(`profile bootstrap failed for ${char.name}; continuing without a profile`, error);
+            }
+        }
+        if (!isCurrentDraft()) return null;
+        profile = getStoredProfile(key);
+        // Profile runs clear the step row, so restore it after bootstrap.
+        activitySteps({ names: steps.map(s => s.name || 'Unnamed pass') });
+        activityStart({ status: `${dryRun ? 'Refinement dry run' : 'Refining reply'} · ${char.name}` });
         activityEntry({
             title: profile
                 ? `Living profile loaded — ${Object.keys(profile.fields ?? {}).length} fields`
@@ -562,6 +600,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
 
         // Refinement is inherently sequential: every pass refines the previous draft.
         for (let index = 0; index < steps.length; index++) {
+            if (!isCurrentDraft()) return null;
             const step = steps[index];
             const label = step.name || 'Unnamed pass';
             activityStatus(`Pass ${index + 1}/${steps.length} · ${label}`);
@@ -582,6 +621,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                     prompt: text,
                     maxTokens: settings.stepMaxTokens,
                 }));
+                if (!isCurrentDraft()) return null;
                 const output = String(result?.content ?? '').trim();
                 stepOutputs[step.name] = output;
                 stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, failed: false };
@@ -598,14 +638,17 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                     if (!dryRun) {
                         message.mes = workingDraft;
                         if (settings.savePassesAsSwipes && !veiled) {
-                            if (!Array.isArray(message.swipes) || !message.swipes.length) {
-                                message.swipes = [originalDraft];
-                                message.swipe_id = 0;
-                            }
-                            message.swipes.push(workingDraft);
-                            message.swipe_id = message.swipes.length - 1;
+                            appendRefinementSwipe(message, workingDraft, originalDraft);
                         }
+                        // Keep the selected swipe consistent even when saving extra
+                        // revisions is disabled; switching away and back must not undo edits.
+                        if (!veiled && Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
+                            message.swipes[message.swipe_id] = workingDraft;
+                        }
+                        expectedDraft = message.mes;
+                        expectedSwipe = message.swipe_id;
                         await updateRefinedMessage(messageId, message);
+                        if (!isCurrentDraft()) return null;
                     }
                 }
             } catch (error) {
@@ -628,15 +671,11 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
             if (isPlainObject(message.extra)) message.extra.smarttavernRefined = true;
             else message.extra = { smarttavernRefined: true };
             if (veiled && settings.savePassesAsSwipes) {
-                // Veiled runs keep the swipe history clean: everything up to the current
-                // position plus the final revision — no intermediate spoilers.
-                if (!Array.isArray(message.swipes) || !message.swipes.length) {
-                    message.swipes = [originalDraft];
-                    message.swipe_id = 0;
-                }
-                message.swipes.length = (message.swipe_id ?? 0) + 1;
-                message.swipes.push(workingDraft);
-                message.swipe_id = message.swipes.length - 1;
+                // Keep just the final revision from this run, plus existing alternatives.
+                appendRefinementSwipe(message, workingDraft, originalDraft);
+            }
+            if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
+                message.swipes[message.swipe_id] = workingDraft;
             }
             await saveRefinedChat();
         }
@@ -650,7 +689,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         recordLastRun({ char, profile, stepOutputs, stepStats, injectionText: workingDraft }, 'refinement', dryRun ? 'dry run' : 'refinement');
         // Failure reveals instantly; completion animates. message.mes always holds the
         // best draft saved so far, so both paths show real content.
-        if (veiled) revealVeil(messageId, { failed });
+        if (veiled && isCurrentChat()) revealVeil(messageId, { failed });
         activityEnd({ ok: !failed, summary });
         refinementBusy = false;
     }
@@ -662,6 +701,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
 
 export async function smarttavernInterceptor(chat, _contextSize, _abort, type) {
     try {
+        if (isInternalGeneration()) return;
         const settings = getSettings();
         if (type === 'quiet' || type === 'impersonate') return;
         if (!settings.enabled) return;

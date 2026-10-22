@@ -24,14 +24,15 @@ const TABS = ['profile', 'steps', 'schema', 'results', 'settings'];
 // --------------------------------------------------------------------------------------------
 
 export function escapeHtml(text) {
-    return $('<div>').text(String(text ?? '')).html();
+    const escapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return String(text ?? '').replace(/[&<>"']/g, ch => escapes[ch]);
 }
 
 export function coerceNumber(el, current) {
     const num = Number(el.value);
     if (!Number.isFinite(num)) return current;
-    const min = Number.isFinite(Number(el.min)) ? Number(el.min) : -Infinity;
-    const max = Number.isFinite(Number(el.max)) ? Number(el.max) : Infinity;
+    const min = el.min !== '' && Number.isFinite(Number(el.min)) ? Number(el.min) : -Infinity;
+    const max = el.max !== '' && Number.isFinite(Number(el.max)) ? Number(el.max) : Infinity;
     return Math.min(max, Math.max(min, Math.round(num)));
 }
 
@@ -96,7 +97,8 @@ export function initPanel() {
     window.addEventListener('resize', clampPanelIntoViewport);
 
     const context = getContext();
-    context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
+    context.eventSource.on((context.event_types ?? context.eventTypes).CHAT_CHANGED, () => {
+        clearTimeout(bioSaveTimer);
         profileTabCharKey = null;
         refreshStatus();
         if (isPanelOpen() && activeTab === 'profile') renderProfileTab();
@@ -208,6 +210,8 @@ function initDrag() {
         const onUp = () => {
             panelEl.classList.remove('dragging');
             window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            window.removeEventListener('pointercancel', onUp);
             persistUi({ x: panelEl.offsetLeft, y: panelEl.offsetTop });
         };
         window.addEventListener('pointermove', onMove);
@@ -551,10 +555,9 @@ function wireGeneralControls() {
             saveSettings();
             refreshStatus();
             // Pipeline toggles re-scope the visible settings; the enable toggle exists in
-            // both the drawer and this panel — keep them in sync (the global selector
-            // resolves to the drawer's checkbox, first in document order).
+            // both the drawer and this panel — keep them in sync.
             if (id === 'smarttavern_refinementEnabled' || id === 'smarttavern_expansionEnabled') applyModeVisibility();
-            if (id === 'smarttavern_enabled') $('#smarttavern_enabled').prop('checked', el.checked);
+            if (id === 'smarttavern_enabled') $('#smarttavern_drawer_enabled').prop('checked', el.checked);
         });
     }
 
@@ -689,9 +692,9 @@ function renderProfileTab() {
 
 function scheduleBioSave(key) {
     clearTimeout(bioSaveTimer);
+    const record = getStoredProfile(key);
     bioSaveTimer = setTimeout(() => {
-        const record = getStoredProfile(key);
-        if (record) setStoredProfile(key, record);
+        if (record && getStoredProfile(key) === record) setStoredProfile(key, record);
     }, 500);
 }
 

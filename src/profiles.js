@@ -4,7 +4,7 @@ import { getContext } from '../../../../extensions.js';
 import {
     log, warn, getSettings, isPlainObject,
     cardText, chatExcerpt, charKey, setStoredProfile, deleteStoredProfile,
-    getStoredProfile, getMainCharacter, resolveMemberByMessageName, substituteParamsSafe,
+    getStoredProfile, getMainCharacter, resolveMemberByMessageName, substituteParamsSafe, captureChatScope,
 } from './state.js';
 import { generateWithRetry, withInternalGeneration } from './gen.js';
 import { activityStart, activityEntry, activityFail, activityEnd, activitySteps } from './progress.js';
@@ -179,6 +179,9 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
     if (!char) throw new Error('No character provided');
     const settings = getSettings();
     const key = charKey(char);
+    const isCurrentChat = captureChatScope();
+    const previous = getStoredProfile(key);
+    const previousFields = JSON.stringify(previous?.fields);
     if (busyKeys.has(key)) return null;
     busyKeys.add(key);
     try {
@@ -204,6 +207,11 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
         if (!parsed) throw new Error('The model did not return a usable profile object');
         const now = (context.chat ?? []).length;
         const record = { fields: parsed.fields, createdAt: now, updatedAt: now, source };
+        if (!isCurrentChat() || getStoredProfile(key) !== previous
+            || JSON.stringify(previous?.fields) !== previousFields) {
+            activityEnd({ ok: true, summary: 'Profile result discarded — chat or profile changed' });
+            return null;
+        }
         setStoredProfile(key, record);
         log(`profile ${source} written for "${key}"`);
         notifyProfileUpdated({ key, silent: !notify, changedFields: Object.keys(parsed.fields) });
@@ -232,6 +240,8 @@ export async function updateProfile(char, { notify = true } = {}) {
     const key = charKey(char);
     const existing = getStoredProfile(key);
     if (!existing) return bootstrapProfile(char, { notify });
+    const isCurrentChat = captureChatScope();
+    const previousFields = JSON.stringify(existing.fields);
     const settings = getSettings();
     if (busyKeys.has(key)) return null;
     busyKeys.add(key);
@@ -262,6 +272,11 @@ export async function updateProfile(char, { notify = true } = {}) {
             source: 'update',
             lastDiff: { at: (context.chat ?? []).length, source: 'update', fields: diff },
         };
+        if (!isCurrentChat() || getStoredProfile(key) !== existing
+            || JSON.stringify(existing.fields) !== previousFields) {
+            activityEnd({ ok: true, summary: 'Profile result discarded — chat or profile changed' });
+            return null;
+        }
         setStoredProfile(key, record);
         log(`profile updated for "${key}" (${Object.keys(diff).length} field change(s))`);
         notifyProfileUpdated({ key, silent: !notify, changedFields: Object.keys(diff) });

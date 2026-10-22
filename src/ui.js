@@ -60,8 +60,13 @@ function buildDrawerHtml() {
                 </div>
 
                 <label class="checkbox">
-                    <input id="smarttavern_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}>
+                    <input id="smarttavern_drawer_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}>
                     <span>Enable SmartTavern (pipeline injection)</span>
+                </label>
+
+                <label class="checkbox">
+                    <input id="smarttavern_drawer_disableFloatingUI" type="checkbox" ${settings.disableFloatingUI ? 'checked' : ''}>
+                    <span>Disable floating UI</span>
                 </label>
 
                 <a id="smarttavern_open_panel" class="menu_button">
@@ -77,7 +82,12 @@ function buildDrawerHtml() {
 }
 
 function wireDrawer() {
-    const enabledEl = /** @type {HTMLInputElement} */ ($('#smarttavern_enabled').get(0));
+    $('#smarttavern_drawer_disableFloatingUI').on('change', function () {
+        getSettings().disableFloatingUI = this.checked;
+        saveSettings();
+        document.dispatchEvent(new CustomEvent('smarttavern:floating-changed'));
+    });
+    const enabledEl = /** @type {HTMLInputElement} */ ($('#smarttavern_drawer_enabled').get(0));
     if (enabledEl) {
         enabledEl.addEventListener('change', () => {
             getSettings().enabled = enabledEl.checked;
@@ -92,6 +102,7 @@ function wireDrawer() {
 
 function applyDrawerFloatingVisibility() {
     $('#smarttavern_open_panel').toggle(!Boolean(getSettings().disableFloatingUI));
+    $('#smarttavern_drawer_disableFloatingUI').prop('checked', Boolean(getSettings().disableFloatingUI));
 }
 
 // --------------------------------------------------------------------------------------------

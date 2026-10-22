@@ -5,7 +5,7 @@ import { getContext } from '../../../extensions.js';
 import { loadSettings, getSettings, log, warn } from './src/state.js';
 import {
     smarttavernInterceptor, sweepEphemeral, resetBootstrapFailures,
-    runRefinementPipeline, hasFreshReply,
+    runRefinementPipeline, hasFreshReply, cancelFreshReply,
 } from './src/pipeline.js';
 import { maybeAutoUpdate } from './src/profiles.js';
 import { initUI } from './src/ui.js';
@@ -34,10 +34,15 @@ async function initSmartTavern() {
     context.eventSource.on(events.GENERATION_ENDED, () => sweepEphemeral());
     context.eventSource.on(events.MESSAGE_DELETED, () => sweepEphemeral());
     context.eventSource.on(events.CHAT_CHANGED, () => {
+        cancelFreshReply();
         sweepEphemeral();
         resetBootstrapFailures();
         // An in-flight refinement may still be veiling a message from the previous chat;
         // its DOM is gone, so this only clears bookkeeping and any stray overlay.
+        dismissAllVeils();
+    });
+    context.eventSource.on(events.GENERATION_STOPPED, () => {
+        cancelFreshReply();
         dismissAllVeils();
     });
 
@@ -91,9 +96,9 @@ async function onCharacterMessageRendered(messageId, type) {
         // never messages that are merely re-rendered (chat loads, scrollback).
         // `hasFreshReply` is true only after the interceptor marked a real generation.
         if (type === 'first_message' || !hasFreshReply()) return;
-        await runRefinementPipeline(messageId);
+        const result = await runRefinementPipeline(messageId);
         // Auto-update only after refinement finishes, so the updater reads the refined reply.
-        maybeAutoUpdate(context.chat?.[messageId]);
+        if (result) maybeAutoUpdate(context.chat?.[messageId]);
     } catch (error) {
         warn('refinement hook failed', error);
     }

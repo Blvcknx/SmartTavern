@@ -12,7 +12,10 @@ export function chipIcon(state) {
     if (state === 'running') return 'fa-solid fa-circle-notch fa-spin';
     if (state === 'done') return 'fa-solid fa-check';
     if (state === 'failed') return 'fa-solid fa-xmark';
-    return 'fa-regular fa-circle';
+    // SillyTavern ships only the solid FA font (no fa-regular face), so a
+    // `fa-regular fa-circle` silently renders as a solid dot. The pending state
+    // uses a CSS-drawn hollow ring instead (see .smarttavern_chip_ring).
+    return 'smarttavern_chip_ring';
 }
 
 /** Renders a chip row for `names`; `states` may be shorter (remaining chips are pending). */

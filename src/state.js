@@ -377,6 +377,17 @@ export function getStoredProfile(key) {
     return getChatStore().profiles[key] ?? null;
 }
 
+/** Capture chat ownership before awaiting a model; context objects are live snapshots. */
+export function captureChatScope() {
+    const { chat, chatMetadata, chatId, characterId, groupId } = getContext();
+    return () => {
+        const current = getContext();
+        return current.chat === chat && current.chatMetadata === chatMetadata
+            && current.chatId === chatId && current.characterId === characterId
+            && current.groupId === groupId;
+    };
+}
+
 export function setStoredProfile(key, record) {
     const store = getChatStore();
     store.profiles[key] = record;
