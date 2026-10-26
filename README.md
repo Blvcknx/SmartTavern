@@ -126,13 +126,11 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 
 ### Refinement guardrails
 
-Every pass is checked locally before its reply or raw output can be saved or supplied to later passes. No additional LLM call is used. The checks reject empty replies, punctuation-only placeholders such as `<revised_reply>...</revised_reply>`, common "unchanged" placeholders, and unbalanced or repeated reply/audit tags. An explicit `<audit>PASS</audit>` without a reply wrapper still keeps the current draft.
+Every completed refinement pass is checked only for an empty reply payload. An explicit `<audit>PASS</audit>` without a reply wrapper keeps the current draft. There are no length, similarity, placeholder, repetition, or tag-format filters for refinement. Other internal calls retain their generation sanity checks.
 
-Candidates are compared with **both the last accepted draft and the initial draft**, catching cumulative drift across passes. For references of at least 40 normalized characters, a reply is rejected if it is more than **40% shorter** or more than **twice as long**. For references of at least 120 characters, at least **35% of their character trigrams** must remain. Trigram overlap counts repeated fragments and works without word separators; case, whitespace and punctuation changes do not affect overlap. Length checks normalize case and whitespace. Very short drafts are exempt from relative comparisons to avoid noisy warnings.
+An empty result or exhausted generation error pauses refinement with **Retry pass**, **Skip Pass**, and **Review** buttons. Review opens the returned output in a scrollable window with **Accept**, **Retry**, and **Skip Pass**. Accept uses the reviewed result and continues; when it contains no reply, Accept keeps the current draft. Retry repeats the same prompt using the last accepted draft. Skip discards the failed output and continues to the next pass. Only accepted outputs become swipes or `{{step:Name}}` values. The same workflow applies to dry runs without changing chat.
 
-A rejected result pauses refinement and shows the reasons with **Retry pass** and **Skip pass** buttons. Retry repeats the same prompt with the last accepted draft; skip keeps that draft and continues to the next pass. Exhausted generation errors also offer this choice. Rejected outputs never become swipes or `{{step:Name}}` values. Checks also apply to refinement dry runs. The activity log records rejection reasons; skipped rejected passes retain their reasons in Results.
-
-**Skip pass** is also available while a request is running, in the veil and the expanded activity log. **That's enough** ends the whole refinement run. Global Stop and chat changes cancel a pending retry prompt. These conservative text checks detect obvious omissions and rewrites, but cannot verify factual or narrative correctness; an intentional large rewrite can also be rejected.
+**Skip pass** is also available while a request is running, in the veil and the expanded activity log. **That's enough** ends the whole refinement run. Global Stop and chat changes cancel pending rejection and review windows.
 
 ### Step prompt macros
 

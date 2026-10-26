@@ -9,7 +9,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     const savedChat = [{ is_user: true, name: 'User', mes: 'Hello' }];
     const listeners = new Map();
     const context = {
-        POPUP_TYPE: { CONFIRM: 1 }, POPUP_RESULT: { AFFIRMATIVE: 1, CANCELLED: 0 },
+        POPUP_TYPE: { CONFIRM: 1 }, POPUP_RESULT: { AFFIRMATIVE: 1, CANCELLED: 0, CUSTOM1: 1001 },
         Popup: class {
             constructor(content, _type, _input, options) { this.content = content; this.options = options; }
             show() { return new Promise(resolve => { this.resolve = resolve; Promise.resolve(onPopup(this)).then(result => { if (result !== undefined) resolve(result); }); }); }
@@ -61,35 +61,27 @@ const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profil
 
 const proseDraft = 'Alice stood beside the open window, listening to the rain. She turned toward the door and quietly asked whether he would stay for dinner. The room smelled of fresh bread and wood smoke, and a small lamp glowed on the table.';
 
-test('refinement guard detects placeholders, malformed tags, shortening, rewrites and growth', async () => {
-    const { checks, pipeline } = await harness();
-    for (const raw of ['<revised_reply>...</revised_reply>', '<revised_reply>…</revised_reply>', '<revised_reply></revised_reply>', '<revised_reply>[unchanged]</revised_reply>', '<revised_reply>Missing closing tag', '<audit>FAIL</audit>']) {
-        assert.ok(checks.refinementIssues(raw, pipeline.extractRefinedDraft(raw, proseDraft), proseDraft, proseDraft).length, raw);
+test('refinement checks only require non-empty output or an explicit audit PASS', async () => {
+    const { checks } = await harness();
+    for (const raw of ['', '   ', '<revised_reply> </revised_reply>', '<final_reply></final_reply>', '<audit>FAIL</audit>']) {
+        assert.ok(checks.refinementIssues(raw).length, raw);
     }
-    const short = proseDraft.slice(0, 80);
-    assert.ok(checks.refinementIssues(short, short, proseDraft, proseDraft).some(issue => issue.includes('shorter')));
-    const unrelated = 'Jupiter exploded across the electronic navigation display. Captain Zorax ordered every combat vessel into hyperspace, then activated the quantum shielding generator. Metallic drones swarmed above alien volcanoes.';
-    assert.ok(checks.refinementIssues(unrelated, unrelated, proseDraft, proseDraft).some(issue => issue.includes('fragments')));
-    assert.ok(checks.refinementIssues(proseDraft.repeat(3), proseDraft.repeat(3), proseDraft, proseDraft).some(issue => issue.includes('twice')));
-    const edit = proseDraft.replace('quietly', 'softly');
-    assert.equal(checks.refinementIssues(edit, edit, proseDraft, proseDraft).length, 0);
-    assert.equal(checks.refinementIssues('<audit>PASS</audit>', proseDraft, proseDraft, proseDraft).length, 0);
-    // A moderate cut from the previous pass can still be a large cumulative cut.
-    const previous = proseDraft.slice(0, 160), cumulative = proseDraft.slice(0, 110);
-    assert.ok(checks.refinementIssues(cumulative, cumulative, previous, proseDraft).some(issue => issue.includes('original draft') && issue.includes('shorter')));
+    for (const raw of ['...', '[unchanged]', '<revised_reply>Missing closing tag', proseDraft.slice(0, 20), proseDraft.repeat(3), 'Completely different scene.', '<audit>PASS</audit>']) {
+        assert.equal(checks.refinementIssues(raw).length, 0, raw);
+    }
 });
 
 test('a rejected refinement retries the same pass without changing the draft or its swipes', async () => {
     let popups = 0;
     const revised = proseDraft.replace('quietly', 'softly');
     const h = await harness({ savePassesAsSwipes: true, refinementSteps: [step('Edit', '{{draft}}')] },
-        async (_messages, index) => ({ content: index === 1 ? '<revised_reply>...</revised_reply>' : revised }),
+        async (_messages, index) => ({ content: index === 1 ? '<revised_reply></revised_reply>' : revised }),
         { onPopup(popup) {
             popups++;
             assert.equal(message.mes, proseDraft);
             assert.deepEqual(message.swipes, [proseDraft]);
             assert.equal(popup.options.okButton, 'Retry pass');
-            assert.ok(popup.content.children[1].textContent.includes('placeholder'));
+            assert.ok(popup.content.children[1].textContent.includes('empty'));
             return 1;
         } });
     const message = { name: 'Alice', mes: proseDraft, swipes: [proseDraft], swipe_id: 0 };
@@ -106,7 +98,7 @@ test('a rejected refinement retries the same pass without changing the draft or 
 
 test('declining retry skips the rejected pass and the next pass receives the accepted draft', async () => {
     const h = await harness({ refinementSteps: [step('Bad', '{{draft}}'), step('Next', '{{draft}} {{step:Bad}}')] },
-        async (_messages, index) => ({ content: index === 1 ? '<revised_reply>...</revised_reply>' : '<audit>PASS</audit>' }));
+        async (_messages, index) => ({ content: index === 1 ? '<revised_reply></revised_reply>' : '<audit>PASS</audit>' }));
     h.savedChat.push({ name: 'Alice', mes: proseDraft });
     h.pipeline.markFreshGeneration();
     const result = await h.pipeline.runRefinementPipeline(1);
@@ -114,6 +106,143 @@ test('declining retry skips the rejected pass and the next pass receives the acc
     assert.equal(result.stepStats[0].skipped, true);
     assert.equal(result.stepOutputs.Bad, undefined);
     assert.equal(h.requests[1].messages.at(-1).content.trim(), proseDraft);
+});
+
+for (const decision of ['accept', 'retry', 'skip']) {
+    test(`reviewing a failed pass supports ${decision} without applying it prematurely`, async () => {
+        const failed = '<audit>FAIL: <img src=x onerror=alert(1)></audit>';
+        const revised = proseDraft.replace('quietly', 'softly');
+        let popups = 0;
+        const h = await harness({ savePassesAsSwipes: true, refinementSteps: [step('Edit', '{{draft}}')] },
+            async (_messages, index) => ({ content: index === 1 ? failed : revised }),
+            { onPopup(popup) {
+                popups++;
+                assert.equal(message.mes, proseDraft);
+                assert.deepEqual(message.swipes, [proseDraft]);
+                if (popups === 1) {
+                    assert.equal(popup.options.customButtons[0].text, 'Review');
+                    return 1001;
+                }
+                assert.equal(popup.options.okButton, 'Accept');
+                assert.equal(popup.options.cancelButton, 'Skip Pass');
+                assert.equal(popup.options.customButtons[0].text, 'Retry');
+                assert.equal(popup.content.children[2].textContent, failed);
+                return { accept: 1, retry: 1001, skip: 0 }[decision];
+            } });
+        const message = { name: 'Alice', mes: proseDraft, swipes: [proseDraft], swipe_id: 0 };
+        h.savedChat.push(message);
+        h.pipeline.markFreshGeneration();
+        const result = await h.pipeline.runRefinementPipeline(1);
+        assert.equal(popups, 2);
+        assert.equal(h.requests.length, decision === 'retry' ? 2 : 1);
+        assert.equal(message.mes, decision === 'retry' ? revised : proseDraft);
+        if (decision === 'skip') assert.equal(result.stepStats[0].skipped, true);
+        else assert.equal(result.stepOutputs.Edit, decision === 'retry' ? revised : failed);
+    });
+}
+
+for (const action of ['stop', 'chat', 'skip', 'enough']) {
+    test(`a pending review window is dismissed by ${action}`, async () => {
+        const opened = deferred();
+        let popups = 0;
+        const h = await harness({ refinementSteps: [step('Bad', '{{draft}}')] },
+            async () => ({ content: '<revised_reply></revised_reply>' }),
+            { onPopup() {
+                if (++popups === 1) return 1001;
+                opened.resolve();
+                return undefined;
+            } });
+        h.savedChat.push({ name: 'Alice', mes: proseDraft });
+        h.pipeline.markFreshGeneration();
+        const run = h.pipeline.runRefinementPipeline(1);
+        await opened.promise;
+        if (action === 'skip') h.pipeline.skipRefinementStep();
+        else if (action === 'enough') h.pipeline.stopRefinement();
+        else h.context.eventSource.emit(action);
+        const result = await run;
+        assert.equal(h.savedChat[1].mes, proseDraft);
+        assert.equal(h.pipeline.isRefinementBusy(), false);
+        if (action === 'skip') assert.equal(result.stepStats[0].skipped, true);
+        else if (action === 'enough') assert.equal(result.stopped, true);
+        else assert.equal(result, null);
+    });
+}
+
+test('empty provider output is reviewed without automatic fallback or retries', async () => {
+    let popups = 0;
+    const h = await harness({ genRetries: 2, refinementSteps: [step('Edit', '{{draft}}')] },
+        async () => ({ content: '' }), { onPopup(popup) {
+            if (++popups === 1) return 1001;
+            assert.equal(popup.content.children[2].textContent, '(No output returned)');
+            return 1;
+        } });
+    h.savedChat.push({ name: 'Alice', mes: proseDraft });
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(h.requests.length, 1);
+    assert.equal(popups, 2);
+    assert.equal(result.workingDraft, proseDraft);
+});
+
+test('refinement accepts repeated non-empty output without generic degeneration filters', async () => {
+    const output = '!'.repeat(500);
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: output }),
+        { onPopup() { assert.fail('Non-empty output must not be rejected'); } });
+    h.savedChat.push({ name: 'Alice', mes: proseDraft });
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(result.workingDraft, output);
+    assert.equal(h.requests.length, 1);
+});
+
+test('a retried pass waits for the full streamed reply before checking partial output', async () => {
+    const streaming = deferred(), finish = deferred();
+    const revised = proseDraft.replace('quietly', 'softly');
+    let popups = 0;
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] },
+        async (_messages, index) => {
+            if (index === 1) return { content: '<revised_reply></revised_reply>' };
+            return async function* () {
+                yield { text: '<revised_reply>', state: { reasoning: 'Checking the scene.' } };
+                streaming.resolve();
+                await finish.promise;
+                yield { text: `<revised_reply>${revised}</revised_reply>` };
+            };
+        }, { onPopup() { popups++; return 1; } });
+    const message = { name: 'Alice', mes: proseDraft };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    let completed = false;
+    const run = h.pipeline.runRefinementPipeline(1).then(result => { completed = true; return result; });
+    await streaming.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(completed, false);
+    assert.equal(popups, 1);
+    assert.equal(h.requests.length, 2);
+    assert.equal(message.mes, proseDraft);
+    finish.resolve();
+    const result = await run;
+    assert.equal(popups, 1);
+    assert.equal(message.mes, revised);
+    assert.equal(result.stepStats[0].attempts, 2);
+});
+
+test('a streamed profiled request can be cancelled while waiting for more tokens', async () => {
+    const streaming = deferred(), finish = deferred();
+    const h = await harness({}, async () => (async function* () {
+        yield { text: 'Partial' };
+        streaming.resolve();
+        await finish.promise;
+        yield { text: 'Completed response' };
+    })());
+    const controller = new AbortController();
+    const run = h.gen.generateWithRetry({ profileId: 'model', signal: controller.signal });
+    await streaming.promise;
+    controller.abort(new DOMException('Stopped', 'AbortError'));
+    await assert.rejects(run, { name: 'AbortError' });
+    finish.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.requests.length, 1);
 });
 
 test('exhausted generation errors offer a manual retry of the same refinement pass', async () => {
@@ -136,7 +265,7 @@ test('exhausted generation errors offer a manual retry of the same refinement pa
 });
 
 test('dry runs validate replies without mutating chat, and multilingual punctuation edits pass', async () => {
-    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: '<revised_reply>...</revised_reply>' }));
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: '<revised_reply></revised_reply>' }));
     const message = { name: 'Alice', mes: proseDraft };
     h.savedChat.push(message);
     const result = await h.pipeline.runRefinementPipeline(1, { dryRun: true });
@@ -176,7 +305,7 @@ for (const veiled of [true, false]) {
 for (const action of ['stop', 'chat', 'skip', 'enough']) {
     test(`a pending rejection popup is dismissed by ${action}`, async () => {
         const opened = deferred();
-        const h = await harness({ refinementSteps: [step('Bad', '{{draft}}')] }, async () => ({ content: '<revised_reply>...</revised_reply>' }),
+        const h = await harness({ refinementSteps: [step('Bad', '{{draft}}')] }, async () => ({ content: '<revised_reply></revised_reply>' }),
             { onPopup() { opened.resolve(); return undefined; } });
         h.savedChat.push({ name: 'Alice', mes: proseDraft });
         h.pipeline.markFreshGeneration();

@@ -133,9 +133,10 @@ export function getConnectionProfile(id) {
  * @param {number} [options.maxTokens]
  * @param {object|null} [options.jsonSchema] `{ name, description?, strict?, value }`; `value` is the JSON schema
  * @param {AbortSignal|null} [options.signal] Cancels queued calls, retries and supported transports
+ * @param {boolean} [options.checkOutput=true] Disable generic sanity filters when the caller reviews output itself
  * @returns {Promise<{content: string, reasoning: string}>}
  */
-export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null } = {}) {
+export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true } = {}) {
     throwIfAborted(signal);
     const context = getContext();
     const profile = profileId ? getConnectionProfile(profileId) : null;
@@ -152,7 +153,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
                 // A technically successful request can still return garbage (sampling
                 // collapse, reasoning corruption). Treat that like a failure so the
                 // active connection gets a chance before any retry logic kicks in.
-                const degenerate = resultDegenerateReason(result);
+                const degenerate = checkOutput ? resultDegenerateReason(result) : null;
                 if (!degenerate) return result;
                 warn(`Profiled request returned ${degenerate}; falling back to the active connection.`);
             } catch (error) {
@@ -203,7 +204,7 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
         payloadPrompt = text;
     }
 
-    const result = await service.sendRequest(profile.id, payloadPrompt, maxTokens, {
+    let result = await service.sendRequest(profile.id, payloadPrompt, maxTokens, {
         stream: false,
         signal,
         extractData: true,
@@ -211,6 +212,22 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
         includeInstruct: true,
     }, overridePayload);
 
+    // If the service returns a stream factory despite the non-streaming request,
+    // awaiting sendRequest only waits for the headers. Consume its cumulative
+    // snapshots through completion
+    // before running any output checks (including on a manually retried pass).
+    if (typeof result === 'function') result = result();
+    if (result && typeof result[Symbol.asyncIterator] === 'function') {
+        let content = '';
+        let reasoning = '';
+        for await (const chunk of result) {
+            throwIfAborted(signal);
+            content = String(chunk?.text ?? chunk?.content ?? content);
+            reasoning = String(chunk?.state?.reasoning ?? chunk?.reasoning ?? reasoning);
+        }
+        result = { content, reasoning };
+    }
+    throwIfAborted(signal);
     return {
         content: String(result?.content ?? ''),
         reasoning: String(result?.reasoning ?? ''),
@@ -315,7 +332,7 @@ export async function generateWithRetry(options = {}) {
             await sleep(baseDelay * attempt, options.signal);
             continue;
         }
-        const reason = resultDegenerateReason(result)
+        const reason = (options.checkOutput === false ? null : resultDegenerateReason(result))
             ?? (typeof options.validate === 'function' && !options.validate(result) ? 'failed the result check' : null);
         if (!reason) return result;
         warn(`internal generation attempt ${attempt}/${attempts} was unusable (${reason})`);

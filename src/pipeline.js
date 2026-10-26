@@ -62,24 +62,39 @@ export function skipRefinementStep() {
     return true;
 }
 
-async function retryRefinementPass(label, reasons, signal) {
+async function reviewRefinementPass(label, reasons, output, signal, reviewing = false) {
     throwIfAborted(signal);
     const context = getContext();
     const content = document.createElement('div');
     const heading = document.createElement('h3');
-    heading.textContent = `Refinement pass rejected · ${label}`;
+    heading.textContent = `${reviewing ? 'Review failed pass' : 'Refinement pass rejected'} · ${label}`;
     const body = document.createElement('p');
-    body.textContent = `${reasons.join(' ')} The last accepted draft has been kept. Retry this pass or skip it and continue?`;
+    body.textContent = `${reasons.join(' ')} The last accepted draft has been kept.${reviewing && !output ? ' Accept will keep that draft because no output was returned.' : ''}`;
     content.append(heading, body);
+    if (reviewing) {
+        const draft = document.createElement('pre');
+        draft.className = 'smarttavern_review_draft';
+        draft.textContent = output || '(No output returned)';
+        content.append(draft);
+    }
     const popup = new context.Popup(content, context.POPUP_TYPE.CONFIRM, '', {
-        okButton: 'Retry pass', cancelButton: 'Skip pass',
+        okButton: reviewing ? 'Accept' : 'Retry pass', cancelButton: 'Skip Pass',
+        customButtons: [{ text: reviewing ? 'Retry' : 'Review', result: context.POPUP_RESULT.CUSTOM1 }],
+        defaultResult: reviewing ? context.POPUP_RESULT.CUSTOM1 : context.POPUP_RESULT.AFFIRMATIVE,
+        wide: reviewing, leftAlign: reviewing,
     });
     const cancel = () => { void popup.complete(context.POPUP_RESULT.CANCELLED); };
     signal.addEventListener('abort', cancel, { once: true });
     try {
         const result = await popup.show();
         throwIfAborted(signal);
-        return result === context.POPUP_RESULT.AFFIRMATIVE;
+        if (result === context.POPUP_RESULT.CUSTOM1) {
+            if (reviewing) return 'retry';
+            signal.removeEventListener('abort', cancel);
+            return await reviewRefinementPass(label, reasons, output, signal, true);
+        }
+        if (result === context.POPUP_RESULT.AFFIRMATIVE) return reviewing ? 'accept' : 'retry';
+        return 'skip';
     } finally {
         signal.removeEventListener('abort', cancel);
     }
@@ -690,6 +705,8 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 let attempts = 0;
                 while (true) {
                     attempts++;
+                    output = '';
+                    extracted = currentDraft;
                     let issues;
                     try {
                         const result = await withInternalGeneration(() => generateWithRetry({
@@ -698,12 +715,13 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                             systemPrompt: REFINEMENT_SYSTEM,
                             prompt: text,
                             maxTokens: settings.stepMaxTokens,
+                            checkOutput: false,
                         }));
                         throwIfAborted(passControl.signal);
                         if (!isCurrentDraft()) return null;
                         output = String(result?.content ?? '').trim();
                         extracted = extractRefinedDraft(output, workingDraft);
-                        issues = refinementIssues(output, extracted, currentDraft, originalDraft);
+                        issues = refinementIssues(output);
                     } catch (error) {
                         if (isAbortError(error)) throw error;
                         issues = [`Generation failed: ${error?.message ?? error}`];
@@ -716,9 +734,10 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                     setVeilStep(messageId, index, 'failed');
                     activityStatus(`Pass rejected · ${label} · awaiting retry or skip`);
                     setVeilStatus(messageId, `Pass rejected · ${label} · awaiting retry or skip`);
-                    const retry = await retryRefinementPass(label, issues, passControl.signal);
+                    const decision = await reviewRefinementPass(label, issues, output, passControl.signal);
                     if (!isCurrentDraft()) return null;
-                    if (!retry) { passControl.skipped = true; passControl.cancel(); }
+                    if (decision === 'accept') break;
+                    if (decision === 'skip') { passControl.skipped = true; passControl.cancel(); }
                     throwIfAborted(passControl.signal);
                     activityStepState(index, 'running');
                     setVeilStep(messageId, index, 'running');

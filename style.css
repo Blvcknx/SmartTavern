@@ -114,6 +114,14 @@
     margin: 10px 0 2px 0;
 }
 
+.smarttavern_review_draft {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    text-align: left;
+    max-height: 55vh;
+    overflow-y: auto;
+}
+
 .smarttavern_popup_pre {
     white-space: pre-wrap;
     word-break: break-word;
@@ -636,7 +644,22 @@
     border-color: var(--SmartThemeQuoteColor);
 }
 
-.smarttavern_veil .smarttavern_veil_enough {
+.smarttavern_veil .smarttavern_veil_controls,
+#smarttavern_activity_body .smarttavern_act_refinement_controls:not([hidden]) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+#smarttavern_activity_body .smarttavern_act_refinement_controls:not([hidden]) {
+    padding: 7px 10px;
+}
+
+.smarttavern_veil .smarttavern_veil_controls .menu_button,
+#smarttavern_activity_body .smarttavern_act_refinement_controls .menu_button {
+    flex: 0 1 auto;
     width: auto;
     margin: 0;
     padding: 5px 12px;

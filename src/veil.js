@@ -41,10 +41,12 @@ export function applyVeil(messageId, { names = [], allowPeek = true, onEnough = 
                 <div class="smarttavern_veil_peek" title="Hold to peek at the current draft">
                     <i class="fa-solid fa-eye"></i><span>Hold to peek</span>
                 </div>` : ''}
-                ${onEnough ? `<button type="button" class="smarttavern_veil_enough menu_button"
-                    title="Discard the unfinished pass and keep the last completed result">That's enough</button>` : ''}
+                ${onSkip || onEnough ? '<div class="smarttavern_veil_controls">' : ''}
                 ${onSkip ? `<button type="button" class="smarttavern_veil_skip menu_button"
                     title="Discard this pass and continue with the next pass">Skip pass</button>` : ''}
+                ${onEnough ? `<button type="button" class="smarttavern_veil_enough menu_button"
+                    title="Discard the unfinished pass and keep the last completed result">That's enough</button>` : ''}
+                ${onSkip || onEnough ? '</div>' : ''}
             </div>
         </div>`);
 
