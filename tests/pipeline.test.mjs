@@ -4,11 +4,17 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { SourceTextModule, createContext } from 'node:vm';
 
-async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false } = {}) {
+async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0 } = {}) {
     const requests = [];
     const savedChat = [{ is_user: true, name: 'User', mes: 'Hello' }];
     const listeners = new Map();
     const context = {
+        POPUP_TYPE: { CONFIRM: 1 }, POPUP_RESULT: { AFFIRMATIVE: 1, CANCELLED: 0 },
+        Popup: class {
+            constructor(content, _type, _input, options) { this.content = content; this.options = options; }
+            show() { return new Promise(resolve => { this.resolve = resolve; Promise.resolve(onPopup(this)).then(result => { if (result !== undefined) resolve(result); }); }); }
+            complete(result) { this.resolve?.(result); }
+        },
         event_types: { GENERATION_STOPPED: 'stop', CHAT_CHANGED: 'chat' },
         eventSource: {
             on(type, fn) { if (!listeners.has(type)) listeners.set(type, new Set()); listeners.get(type).add(fn); },
@@ -27,17 +33,17 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         generateRaw: async options => { requests.push(options); return 'ACTIVE OUTPUT'; },
     };
     const sandbox = createContext({ context, AbortController, DOMException, setTimeout, clearTimeout, console: { log() {}, warn() {} }, toastr: { warning() {}, info() {}, success() {} },
-        document: { dispatchEvent() {} }, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
+        document: { dispatchEvent() {}, createElement() { return { children: [], append(...children) { this.children.push(...children); } }; } }, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
     });
     const modules = new Map();
     const sources = {
         extensions: 'export const getContext = () => context;',
         'system-messages': "export const system_message_types = { NARRATOR: 'narrator' };",
         'instruct-mode': `export const formatInstructModeChat = (name, text, user, system) => '<' + (system ? 'system' : user ? 'user' : 'assistant') + '>' + text + '</turn>\\n'; export const formatInstructModePrompt = () => '<assistant>';`,
-        progress: 'export const activityStart = () => {}; export const activityStatus = () => {}; export const activityEntry = () => {}; export const activityFail = () => {}; export const activityEnd = () => {}; export const activitySteps = () => {}; export const activityStepState = () => {};',
+        progress: 'export const activityStart = () => {}; export const activityStatus = () => {}; export const activityEntry = () => {}; export const activityFail = () => {}; export const activityEnd = () => {}; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
         veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = () => {}; export const revealVeil = () => {};`,
     };
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles']) {
+    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks']) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -48,10 +54,145 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     await pipeline.evaluate();
     const state = modules.get('state').namespace;
     state.loadSettings();
-    return { pipeline: pipeline.namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
+    return { pipeline: pipeline.namespace, checks: modules.get('refinement-checks').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
+
+const proseDraft = 'Alice stood beside the open window, listening to the rain. She turned toward the door and quietly asked whether he would stay for dinner. The room smelled of fresh bread and wood smoke, and a small lamp glowed on the table.';
+
+test('refinement guard detects placeholders, malformed tags, shortening, rewrites and growth', async () => {
+    const { checks, pipeline } = await harness();
+    for (const raw of ['<revised_reply>...</revised_reply>', '<revised_reply>…</revised_reply>', '<revised_reply></revised_reply>', '<revised_reply>[unchanged]</revised_reply>', '<revised_reply>Missing closing tag', '<audit>FAIL</audit>']) {
+        assert.ok(checks.refinementIssues(raw, pipeline.extractRefinedDraft(raw, proseDraft), proseDraft, proseDraft).length, raw);
+    }
+    const short = proseDraft.slice(0, 80);
+    assert.ok(checks.refinementIssues(short, short, proseDraft, proseDraft).some(issue => issue.includes('shorter')));
+    const unrelated = 'Jupiter exploded across the electronic navigation display. Captain Zorax ordered every combat vessel into hyperspace, then activated the quantum shielding generator. Metallic drones swarmed above alien volcanoes.';
+    assert.ok(checks.refinementIssues(unrelated, unrelated, proseDraft, proseDraft).some(issue => issue.includes('fragments')));
+    assert.ok(checks.refinementIssues(proseDraft.repeat(3), proseDraft.repeat(3), proseDraft, proseDraft).some(issue => issue.includes('twice')));
+    const edit = proseDraft.replace('quietly', 'softly');
+    assert.equal(checks.refinementIssues(edit, edit, proseDraft, proseDraft).length, 0);
+    assert.equal(checks.refinementIssues('<audit>PASS</audit>', proseDraft, proseDraft, proseDraft).length, 0);
+    // A moderate cut from the previous pass can still be a large cumulative cut.
+    const previous = proseDraft.slice(0, 160), cumulative = proseDraft.slice(0, 110);
+    assert.ok(checks.refinementIssues(cumulative, cumulative, previous, proseDraft).some(issue => issue.includes('original draft') && issue.includes('shorter')));
+});
+
+test('a rejected refinement retries the same pass without changing the draft or its swipes', async () => {
+    let popups = 0;
+    const revised = proseDraft.replace('quietly', 'softly');
+    const h = await harness({ savePassesAsSwipes: true, refinementSteps: [step('Edit', '{{draft}}')] },
+        async (_messages, index) => ({ content: index === 1 ? '<revised_reply>...</revised_reply>' : revised }),
+        { onPopup(popup) {
+            popups++;
+            assert.equal(message.mes, proseDraft);
+            assert.deepEqual(message.swipes, [proseDraft]);
+            assert.equal(popup.options.okButton, 'Retry pass');
+            assert.ok(popup.content.children[1].textContent.includes('placeholder'));
+            return 1;
+        } });
+    const message = { name: 'Alice', mes: proseDraft, swipes: [proseDraft], swipe_id: 0 };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(popups, 1);
+    assert.equal(h.requests.length, 2);
+    assert.deepEqual(h.requests[0].messages, h.requests[1].messages);
+    assert.equal(message.mes, revised);
+    assert.equal(message.swipes.length, 2);
+    assert.equal(result.stepStats[0].attempts, 2);
+});
+
+test('declining retry skips the rejected pass and the next pass receives the accepted draft', async () => {
+    const h = await harness({ refinementSteps: [step('Bad', '{{draft}}'), step('Next', '{{draft}} {{step:Bad}}')] },
+        async (_messages, index) => ({ content: index === 1 ? '<revised_reply>...</revised_reply>' : '<audit>PASS</audit>' }));
+    h.savedChat.push({ name: 'Alice', mes: proseDraft });
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(result.workingDraft, proseDraft);
+    assert.equal(result.stepStats[0].skipped, true);
+    assert.equal(result.stepOutputs.Bad, undefined);
+    assert.equal(h.requests[1].messages.at(-1).content.trim(), proseDraft);
+});
+
+test('exhausted generation errors offer a manual retry of the same refinement pass', async () => {
+    let popups = 0;
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async (_messages, index) => {
+        if (index === 1) throw new Error('Provider unavailable');
+        return { content: '<audit>PASS</audit>' };
+    }, { onPopup(popup) {
+        popups++;
+        assert.ok(popup.content.children[1].textContent.includes('Generation failed'));
+        return 1;
+    } });
+    h.context.generateRaw = async () => { throw new Error('Fallback unavailable'); };
+    h.savedChat.push({ name: 'Alice', mes: proseDraft });
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(popups, 1);
+    assert.equal(result.workingDraft, proseDraft);
+    assert.equal(result.stepStats[0].attempts, 2);
+});
+
+test('dry runs validate replies without mutating chat, and multilingual punctuation edits pass', async () => {
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: '<revised_reply>...</revised_reply>' }));
+    const message = { name: 'Alice', mes: proseDraft };
+    h.savedChat.push(message);
+    const result = await h.pipeline.runRefinementPipeline(1, { dryRun: true });
+    assert.equal(result.stepStats[0].skipped, true);
+    assert.equal(message.mes, proseDraft);
+    assert.equal(message.extra, undefined);
+    const chinese = '她站在窗边听着细雨，转过头来轻声问他是否愿意留下来一起吃晚饭。房间里飘着面包的香气，桌上的小灯散发着温柔的光芒。'.repeat(4);
+    const edited = chinese.replaceAll('，', '。');
+    assert.equal(h.checks.refinementIssues(edited, edited, chinese, chinese).length, 0);
+    const cased = proseDraft.toUpperCase().replaceAll(' ', '\n\n');
+    assert.equal(h.checks.refinementIssues(cased, cased, proseDraft, proseDraft).length, 0);
+});
+
+for (const veiled of [true, false]) {
+    test(`skipping an in-flight pass continues and discards late output (veiled: ${veiled})`, async () => {
+        const started = deferred(), response = deferred();
+        const h = await harness({ refinementSteps: [step('Slow', '{{draft}}'), step('Next', '{{draft}}')] },
+            async (_messages, index) => { if (index === 1) { started.resolve(); return response.promise; } return { content: '<audit>PASS</audit>' }; }, { veiled });
+        const message = { name: 'Alice', mes: proseDraft };
+        h.savedChat.push(message);
+        h.pipeline.markFreshGeneration();
+        const run = h.pipeline.runRefinementPipeline(1);
+        await started.promise;
+        assert.equal(h.pipeline.skipRefinementStep(), true);
+        const result = await run;
+        assert.equal(result.stepStats[0].skipped, true);
+        assert.equal(result.stopped, false);
+        assert.equal(h.requests.length, 2);
+        assert.equal(h.requests[0].signal.aborted, true);
+        response.resolve({ content: 'Late garbage' });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(message.mes, proseDraft);
+        assert.equal(h.pipeline.skipRefinementStep(), false);
+    });
+}
+
+for (const action of ['stop', 'chat', 'skip', 'enough']) {
+    test(`a pending rejection popup is dismissed by ${action}`, async () => {
+        const opened = deferred();
+        const h = await harness({ refinementSteps: [step('Bad', '{{draft}}')] }, async () => ({ content: '<revised_reply>...</revised_reply>' }),
+            { onPopup() { opened.resolve(); return undefined; } });
+        h.savedChat.push({ name: 'Alice', mes: proseDraft });
+        h.pipeline.markFreshGeneration();
+        const run = h.pipeline.runRefinementPipeline(1);
+        await opened.promise;
+        if (action === 'skip') h.pipeline.skipRefinementStep();
+        else if (action === 'enough') h.pipeline.stopRefinement();
+        else h.context.eventSource.emit(action);
+        const result = await run;
+        assert.equal(h.savedChat[1].mes, proseDraft);
+        assert.equal(h.pipeline.isRefinementBusy(), false);
+        if (action === 'skip') assert.equal(result.stepStats[0].skipped, true);
+        else if (action === 'enough') assert.equal(result.stopped, true);
+        else assert.equal(result, null);
+    });
+}
 
 function deferred() {
     let resolve;

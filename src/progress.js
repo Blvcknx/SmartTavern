@@ -51,6 +51,7 @@ function build() {
                     <i class="fa-solid fa-xmark smarttavern_act_close" title="Hide"></i>
                 </div>
                 <div class="smarttavern_act_steps"></div>
+                <div class="smarttavern_act_refinement_controls" hidden></div>
                 <div class="smarttavern_act_current"></div>
                 <div class="smarttavern_act_log"></div>
             </div>
@@ -209,6 +210,15 @@ export function activitySteps({ names = [], states = [] } = {}) {
 /** Flips one pass chip on the HUD's step row. */
 export function activityStepState(index, state) {
     setChipState($steps, index, state);
+}
+
+/** Available in both visible and veiled refinement modes. */
+export function activityRefinementControls({ onSkip = null, onEnough = null } = {}) {
+    build();
+    const controls = $root.find('.smarttavern_act_refinement_controls');
+    controls.empty().prop('hidden', !onSkip && !onEnough);
+    if (onSkip) $('<button type="button" class="menu_button">Skip pass</button>').on('click', onSkip).appendTo(controls);
+    if (onEnough) $('<button type="button" class="menu_button">That\'s enough</button>').on('click', onEnough).appendTo(controls);
 }
 
 /** Appends a completed entry (call output or informational note) to the log. */

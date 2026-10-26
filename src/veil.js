@@ -22,7 +22,7 @@ function findMessageEl(messageId) {
  * @returns {boolean} false when the message element is not in the DOM (veil skipped —
  * the pipeline continues unobstructed and simply reveals nothing).
  */
-export function applyVeil(messageId, { names = [], allowPeek = true, onEnough = null } = {}) {
+export function applyVeil(messageId, { names = [], allowPeek = true, onEnough = null, onSkip = null } = {}) {
     const id = Number(messageId);
     dismissVeil(id); // never stack a second veil on the same message
     const $mes = findMessageEl(id);
@@ -43,6 +43,8 @@ export function applyVeil(messageId, { names = [], allowPeek = true, onEnough = 
                 </div>` : ''}
                 ${onEnough ? `<button type="button" class="smarttavern_veil_enough menu_button"
                     title="Discard the unfinished pass and keep the last completed result">That's enough</button>` : ''}
+                ${onSkip ? `<button type="button" class="smarttavern_veil_skip menu_button"
+                    title="Discard this pass and continue with the next pass">Skip pass</button>` : ''}
             </div>
         </div>`);
 
@@ -66,6 +68,11 @@ export function applyVeil(messageId, { names = [], allowPeek = true, onEnough = 
         event.preventDefault();
         event.stopPropagation();
         onEnough?.();
+    });
+    $overlay.find('.smarttavern_veil_skip').on('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onSkip?.();
     });
     return true;
 }

@@ -1137,7 +1137,7 @@ function renderRunResult(body, result, pipeline) {
     }
     for (const stat of (result.stepStats ?? [])) {
         appendSection(body, stepStatsTitle(stat.name || 'Step', stat), stat.cancelled || stat.skipped
-            ? '(skipped — refinement stopped)' : result.stepOutputs?.[stat.name] || '(no output — failed or empty, see browser console)');
+            ? `(skipped — kept the last accepted draft)${stat.issues?.length ? '\n' + stat.issues.join('\n') : ''}` : result.stepOutputs?.[stat.name] || '(no output — failed or empty, see browser console)');
     }
     if (result.injectionText) {
         appendSection(

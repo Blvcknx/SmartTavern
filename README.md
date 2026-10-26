@@ -1,6 +1,6 @@
 # SmartTavern
 
-A single, self-contained SillyTavern UI extension that replicates SkyrimNet-style "living world" logic:
+A single, self-contained SillyTavern UI extension that aims to deepen the roleplay and introduce the agentic-based workflow into your roleplay.
 
 1. **Living per-chat character profiles** — a dynamic, LLM-maintained bio with a user-defined schema, stored **per chat** and fully independent of the parent character card.
 2. **Dual reasoning pipelines** — two user-editable step lists, each entry an isolated LLM call, that run together without interfering:
@@ -8,6 +8,8 @@ A single, self-contained SillyTavern UI extension that replicates SkyrimNet-styl
    - **Refinement** (after the reply): passes audit and surgically edit the freshly generated reply in order — optionally hidden behind a veil until the final pass lands.
 
 No server plugin, no build step — install via the default extension installer.
+
+The generation WILL take longer, since multiple agents will be reasoning and adding context or refining the actual reply. But you can surgically prompt an agent to focus on specific parts YOU don't like or YOU want to be attended more. From simple repetition and prose check, up to additional descriptions/realistic dialogue or whatever is annoying you personally.
 
 ---
 ## Screenshot
@@ -100,6 +102,7 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Refinement display | **Veiled** (default): the fresh reply is blurred in chat until the final pass lands — pass progress shows as chips on the message and a hold-to-peek button can partially unblur it. **Off**: every pass lands visibly. The veil only ever appears on a freshly generated reply — never on chat loads or a new chat's greeting. |
 | Allow hold-to-peek | Shows the hold-to-peek button on the veil (on by default) |
 | That's enough (veil button) | Stops refinement immediately and keeps the last completed pass, or the original draft if no pass has finished. The unfinished pass is discarded. |
+| Skip pass (veil / activity log button) | Cancels only the currently running refinement pass and continues to the next pass using the last accepted draft. Late responses from the skipped request are discarded. |
 | Save refinement passes as swipes | Appends changed revisions to the message swipes. Veiled runs keep only draft + final so the swipes cannot spoil the result. |
 | Auto-update profiles | Background maintenance on `MESSAGE_RECEIVED` |
 | Bootstrap profile on first message | First generation for a character = complete rewrite of the card into the schema |
@@ -120,6 +123,16 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Profile updater connection profile | Saved Connection Manager profile used by bootstrap/update/rebuild |
 | Disable floating UI | Master switch for the floating panel, avatar context menu and wand-menu button |
 | Run expansion / Run refinement (Results tab) | Dry run each pipeline: expansion runs its steps without injecting; refinement previews what the passes would change about the last character reply, saving nothing |
+
+### Refinement guardrails
+
+Every pass is checked locally before its reply or raw output can be saved or supplied to later passes. No additional LLM call is used. The checks reject empty replies, punctuation-only placeholders such as `<revised_reply>...</revised_reply>`, common "unchanged" placeholders, and unbalanced or repeated reply/audit tags. An explicit `<audit>PASS</audit>` without a reply wrapper still keeps the current draft.
+
+Candidates are compared with **both the last accepted draft and the initial draft**, catching cumulative drift across passes. For references of at least 40 normalized characters, a reply is rejected if it is more than **40% shorter** or more than **twice as long**. For references of at least 120 characters, at least **35% of their character trigrams** must remain. Trigram overlap counts repeated fragments and works without word separators; case, whitespace and punctuation changes do not affect overlap. Length checks normalize case and whitespace. Very short drafts are exempt from relative comparisons to avoid noisy warnings.
+
+A rejected result pauses refinement and shows the reasons with **Retry pass** and **Skip pass** buttons. Retry repeats the same prompt with the last accepted draft; skip keeps that draft and continues to the next pass. Exhausted generation errors also offer this choice. Rejected outputs never become swipes or `{{step:Name}}` values. Checks also apply to refinement dry runs. The activity log records rejection reasons; skipped rejected passes retain their reasons in Results.
+
+**Skip pass** is also available while a request is running, in the veil and the expanded activity log. **That's enough** ends the whole refinement run. Global Stop and chat changes cancel a pending retry prompt. These conservative text checks detect obvious omissions and rewrites, but cannot verify factual or narrative correctness; an intentional large rewrite can also be rejected.
 
 ### Step prompt macros
 
