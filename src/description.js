@@ -79,6 +79,16 @@ function descriptionNeedles(char) {
     add(raw);
     // baseChatReplace resolves non-card macros inside the description...
     add(substituteParamsSafe(raw));
+    // Group chats join member cards with a PER-MEMBER {{char}} substitution
+    // (baseChatReplace(value, null, memberName) after <FIELDNAME> expansion — see
+    // getGroupCharacterCardsLazy), which the global pass above cannot reproduce — it
+    // substitutes the group name. Add the member-name variant so the needle matches
+    // the joined block. Non-APPEND group modes keep member descriptions out of the
+    // prompt entirely; there the override has nothing to swap and stays inactive.
+    if (getContext().groupId) {
+        const memberText = raw.replace(/<FIELDNAME>/gi, 'Description');
+        add(substituteParamsSafe(memberText, { name2Override: char.name, replaceCharacterCard: false }));
+    }
     // ...and collapses newlines when the user enables that power-user setting.
     for (const value of [...variants]) add(value.replace(/\n+/g, '\n'));
     return variants;

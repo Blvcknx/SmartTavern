@@ -427,10 +427,10 @@ function buildPanelHtml() {
                         <input id="smarttavern_profileUpdateLookback" class="text_margin_input" type="number" min="1" max="200" step="1" value="${settings.profileUpdateLookback}">
                     </label>
                     <label>Step max tokens
-                        <input id="smarttavern_stepMaxTokens" class="text_margin_input" type="number" min="16" max="8192" step="16" value="${settings.stepMaxTokens}">
+                        <input id="smarttavern_stepMaxTokens" class="text_margin_input" type="number" min="16" max="100000" step="16" value="${settings.stepMaxTokens}">
                     </label>
                     <label>Updater max tokens
-                        <input id="smarttavern_updaterMaxTokens" class="text_margin_input" type="number" min="16" max="8192" step="16" value="${settings.updaterMaxTokens}">
+                        <input id="smarttavern_updaterMaxTokens" class="text_margin_input" type="number" min="16" max="100000" step="16" value="${settings.updaterMaxTokens}">
                     </label>
                     <label title="Extra attempts when an internal LLM call fails, comes back empty, or collapses into a repetition loop (reasoning corruption). Applies to pipeline steps and profile updates alike.">LLM retries per call
                         <input id="smarttavern_genRetries" class="text_margin_input" type="number" min="0" max="5" step="1" value="${settings.genRetries}">

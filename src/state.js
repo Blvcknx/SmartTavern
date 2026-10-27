@@ -7,8 +7,9 @@ export const SETTINGS_KEY = 'smarttavern';
 export const STORE_KEY = 'smarttavern';
 export const STORE_VERSION = 1;
 
-// Hard cap for a single message inside chat excerpts, to keep internal prompts bounded.
-export const MAX_EXCERPT_MESSAGE_CHARS = 800;
+// Soft cap for a single message inside chat excerpts; high enough that chat history
+// reaches internal prompts essentially uncut.
+export const MAX_EXCERPT_MESSAGE_CHARS = 100000;
 
 export const DEFAULT_FIELDS = Object.freeze([
     { name: 'Brief Summary', description: 'One short paragraph distilling who the character is right now.' },
@@ -175,8 +176,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
         'Use these assessments to guide the upcoming reply: account for the current physical state, motivations, and relevant constraints. Treat assessments as working interpretations; the latest explicit conversation evidence takes precedence. Continue the scene as {{char}} in response to {{user}}. Keep these notes out of the visible reply; do not summarize or repeat them.',
     ].join('\n'),
     profileUpdateProfileId: '',
-    updaterMaxTokens: 5000,
-    stepMaxTokens: 5000,
+    updaterMaxTokens: 100000,
+    stepMaxTokens: 100000,
     stepExecution: 'dependencies',
     // Internal LLM calls (pipeline steps, profile bootstrap/update) are retried when
     // they fail, come back empty, or collapse into a repetition loop. `genRetries`
@@ -319,6 +320,14 @@ function normalizeSettings(settings) {
     const genRetryDelayMs = clampInt(settings.genRetryDelayMs, 0, 30000, 500);
     if (settings.genRetryDelayMs !== genRetryDelayMs) {
         settings.genRetryDelayMs = genRetryDelayMs;
+        changed = true;
+    }
+    // Raise persisted token caps (formerly 5000) so long outputs — revised replies,
+    // expansion step payloads — are no longer cropped mid-generation.
+    if (settings.tokenCapsVersion !== 1) {
+        settings.updaterMaxTokens = 100000;
+        settings.stepMaxTokens = 100000;
+        settings.tokenCapsVersion = 1;
         changed = true;
     }
     if (changed) saveSettings();
@@ -540,10 +549,14 @@ export function clampInt(value, min, max, fallback) {
     return Math.min(max, Math.max(min, Math.round(num)));
 }
 
-/** Runs ST macro substitution over text, degrading to the input on failure. */
-export function substituteParamsSafe(text) {
+/**
+ * Runs ST macro substitution over text, degrading to the input on failure.
+ * `env` mirrors baseChatReplace's substitution environment (e.g. a per-member
+ * `name2Override` for group-chat card joins).
+ */
+export function substituteParamsSafe(text, env = undefined) {
     try {
-        return getContext().substituteParams(String(text ?? ''));
+        return getContext().substituteParams(String(text ?? ''), env);
     } catch {
         return text;
     }

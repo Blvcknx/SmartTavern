@@ -48,6 +48,61 @@ export function withInternalGeneration(fn) {
     }
 }
 
+// Interceptor scope: marks calls made while the foreground generation is parked on
+// SmartTavern's own generate_interceptor. Their shared token-budget mutation
+// (generateRaw's TempResponseLength) cannot collide with a concurrently assembling
+// foreground request — the foreground is blocked on us — so they skip the
+// foreground-idle wait below.
+let interceptorDepth = 0;
+
+export async function withInterceptorScope(fn) {
+    interceptorDepth++;
+    try {
+        return await fn();
+    } finally {
+        interceptorDepth--;
+    }
+}
+
+// Active-connection calls borrow generateRaw, which temporarily rewrites shared
+// token-budget state (TempResponseLength saves/restores oai_settings.openai_max_tokens
+// or amount_gen around the request). A foreground generation that starts assembling
+// its own request while that override is live could ship it inside the user's payload
+// (or make our call capture their token limit). Calls made outside the interceptor
+// therefore wait for the foreground generation to finish before dispatching. A tiny
+// residual window remains — the override lives only milliseconds — but the practical
+// overlaps (auto-continue firing mid-refinement, panel commands during generation)
+// are serialized away.
+let foregroundBusy = false;
+let foregroundTrackerReady = false;
+const FOREGROUND_WAIT_MS = 250;
+const FOREGROUND_WAIT_CAP_MS = 60 * 1000;
+
+function initForegroundTracker() {
+    if (foregroundTrackerReady) return;
+    foregroundTrackerReady = true;
+    const context = getContext();
+    const eventSource = context.eventSource;
+    if (!eventSource) return;
+    const events = context.event_types ?? context.eventTypes ?? {};
+    if (events.GENERATION_STARTED) {
+        eventSource.on(events.GENERATION_STARTED, () => { foregroundBusy = true; });
+    }
+    for (const type of [events.GENERATION_ENDED, events.GENERATION_STOPPED, events.CHAT_CHANGED].filter(Boolean)) {
+        eventSource.on(type, () => { foregroundBusy = false; });
+    }
+}
+
+/** Resolves once no foreground generation is running (or the safety cap is hit). */
+async function waitForegroundIdle(signal) {
+    initForegroundTracker();
+    if (!foregroundBusy || interceptorDepth > 0) return;
+    const deadline = Date.now() + FOREGROUND_WAIT_CAP_MS;
+    while (foregroundBusy && interceptorDepth === 0 && Date.now() < deadline) {
+        await sleep(FOREGROUND_WAIT_MS, signal);
+    }
+}
+
 export function isAbortError(error) {
     return error?.name === 'AbortError' || (error?.cause && isAbortError(error.cause));
 }
@@ -165,8 +220,9 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         }
     }
 
-    const request = activeQueue.then(() => {
+    const request = activeQueue.then(async () => {
         throwIfAborted(signal);
+        await waitForegroundIdle(signal);
         return generateViaActive(context, { systemPrompt, prompt, maxTokens, jsonSchema });
     });
     activeQueue = request.catch(() => {});

@@ -19,11 +19,11 @@ import {
     clampInt, substituteParamsSafe, STEP_ROLES, captureChatScope,
 } from './state.js';
 import { system_message_types } from '../../../../system-messages.js';
-import { generateWithRetry, withInternalGeneration, isInternalGeneration, createGenerationControl, isAbortError, throwIfAborted } from './gen.js';
+import { generateWithRetry, withInternalGeneration, isInternalGeneration, createGenerationControl, isAbortError, throwIfAborted, withInterceptorScope } from './gen.js';
 import { bootstrapProfile, serializeProfile } from './profiles.js';
 import { activityStart, activityStatus, activityEntry, activityFail, activityEnd, activitySteps, activityStepState, activityRefinementControls } from './progress.js';
-import { refinementIssues } from './refinement-checks.js';
-import { applyVeil, setVeilStep, setVeilStatus, revealVeil } from './veil.js';
+import { refinementIssues, hasRefinedPayload } from './refinement-checks.js';
+import { applyVeil, setVeilStep, setVeilStatus, revealVeil, dismissVeil, armPreVeil } from './veil.js';
 import { stagePromptTail, clearPromptTail } from './tail.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
@@ -494,6 +494,12 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
 // Refinement pipeline (post-generation multi-pass reply editing)
 // --------------------------------------------------------------------------------------------
 
+/** Enabled refinement passes (non-empty prompt), shared by veil arming and the pipeline. */
+function enabledRefinementSteps(settings) {
+    return (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])
+        .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
+}
+
 /** Strips audit blocks, stray refinement tags and a surrounding code fence. */
 function stripRefinedNoise(text) {
     let out = String(text ?? '').trim();
@@ -620,8 +626,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         && settings.enabled && settings.refinementEnabled
         && (dryRun || generationEpoch === epoch);
 
-    const steps = (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])
-        .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
+    const steps = enabledRefinementSteps(settings);
     const control = createGenerationControl();
     control.accepted = false;
     if (!dryRun) activeRefinement = control;
@@ -746,6 +751,17 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 }
                 control.pass = null;
                 activityRefinementControls();
+                // A pass that returned no revised payload (bare prose, or only an
+                // audit) is a skip, not a revision: keep the last accepted draft
+                // rather than adopting untagged output as the reply.
+                if (output && !hasRefinedPayload(output)) {
+                    stepOutputs[step.name] = '';
+                    stepStats[index] = { name: label, chars: 0, elapsedMs: Date.now() - startedAt, skipped: true, attempts };
+                    activityStepState(index, 'skipped');
+                    setVeilStep(messageId, index, 'skipped');
+                    activityEntry({ title: `Pass "${label}" skipped · no revised reply returned`, tone: 'info', text: output });
+                    continue;
+                }
                 stepOutputs[step.name] = output;
                 stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, failed: false, attempts };
                 activityStepState(index, 'done');
@@ -841,6 +857,10 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         // Failure reveals instantly; completion animates. message.mes always holds the
         // best draft saved so far, so both paths show real content.
         if (veiled && isCurrentChat()) revealVeil(messageId, { failed });
+        // Take down any pre-veil (see armPreVeil) this run did not adopt: early exits
+        // (busy, already refined, no fresh reply, empty draft) must never leave the
+        // message blurred. No-op when no veil is active for the id.
+        else if (!dryRun) dismissVeil(messageId);
         activityEnd({ ok: !failed, summary });
         refinementBusy = false;
     }
@@ -862,13 +882,25 @@ export async function smarttavernInterceptor(chat, _contextSize, _abort, type) {
         if (settings.refinementEnabled) {
             markFreshGeneration();
             // A fresh generation clears the refined-flag so the new draft gets refined
-            // again; merely viewing an existing message (swipes) never runs this.
-            clearRefinedFlag(chat);
+            // again; merely viewing an existing message (swipes) never runs this. ST
+            // pops the swiped message from the interceptor's core-chat copy, so the
+            // flag must be cleared on the live chat: its last character message is
+            // where swipe and continue drafts land (a normal reply is a brand-new
+            // message that never carried the flag).
+            clearRefinedFlag();
+            // Veiled mode blurs the reply the moment its DOM node appears — the render
+            // event that starts refinement fires only once the (possibly streamed)
+            // reply is complete, which would leave a streamed draft fully readable.
+            if (settings.refinementDisplay === 'veiled' && enabledRefinementSteps(settings).length) {
+                armPreVeil({ isValid: () => hasFreshReply() });
+            }
         }
         // Expansion is a separate, independent pipeline: it runs BEFORE the reply and
         // injects its outputs into the prompt; refinement runs after rendering.
         if (settings.expansionEnabled) {
-            await runPipeline({ chat, inject: true, type });
+            // The foreground generation is parked on this interceptor while the pipeline
+            // runs, so its internal calls are exempt from gen.js's foreground-idle wait.
+            await withInterceptorScope(() => runPipeline({ chat, inject: true, type }));
         }
     } catch (error) {
         // Fail open: the generation proceeds without the SmartTavern block.
@@ -876,10 +908,15 @@ export async function smarttavernInterceptor(chat, _contextSize, _abort, type) {
     }
 }
 
-/** Clears the refined marker on the last character message (core-chat entries are the same message objects). */
-function clearRefinedFlag(chatArr) {
-    if (!Array.isArray(chatArr)) return;
-    const target = findLastCharacterMessage(chatArr);
+/**
+ * Clears the refined marker on the live chat's last character message — the message a
+ * swipe or continue draft lands in. The interceptor's array is a shallow core-chat
+ * copy that EXCLUDES the swiped message (Generate pops it for 'swipe'), so clearing
+ * on it would leave the real target flagged and every later swipe draft would skip
+ * refinement.
+ */
+function clearRefinedFlag() {
+    const target = findLastCharacterMessage(getContext().chat ?? []);
     if (target && isPlainObject(target.extra)) delete target.extra.smarttavernRefined;
 }
 

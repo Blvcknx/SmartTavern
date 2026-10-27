@@ -96,9 +96,11 @@ async function onCharacterMessageRendered(messageId, type) {
         // never messages that are merely re-rendered (chat loads, scrollback).
         // `hasFreshReply` is true only after the interceptor marked a real generation.
         if (type === 'first_message' || !hasFreshReply()) return;
-        const result = await runRefinementPipeline(messageId);
-        // Auto-update only after refinement finishes, so the updater reads the refined reply.
-        if (result) maybeAutoUpdate(context.chat?.[messageId]);
+        await runRefinementPipeline(messageId);
+        // Auto-update always follows the refinement attempt: a null result (busy,
+        // cancelled or skipped refinement) must not skip the character's profile
+        // maintenance, and the updater reads whatever draft survived.
+        maybeAutoUpdate(context.chat?.[messageId]);
     } catch (error) {
         warn('refinement hook failed', error);
     }

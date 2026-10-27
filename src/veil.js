@@ -19,10 +19,12 @@ function findMessageEl(messageId) {
 
 /**
  * Blurs the message text and mounts the progress overlay.
+ * @param {number|string} messageId
+ * @param {{ names?: string[], allowPeek?: boolean, onEnough?: (() => void)|null, onSkip?: (() => void)|null, title?: string }} [options]
  * @returns {boolean} false when the message element is not in the DOM (veil skipped —
  * the pipeline continues unobstructed and simply reveals nothing).
  */
-export function applyVeil(messageId, { names = [], allowPeek = true, onEnough = null, onSkip = null } = {}) {
+export function applyVeil(messageId, { names = [], allowPeek = true, onEnough = null, onSkip = null, title = 'Refining reply…' } = {}) {
     const id = Number(messageId);
     dismissVeil(id); // never stack a second veil on the same message
     const $mes = findMessageEl(id);
@@ -34,7 +36,7 @@ export function applyVeil(messageId, { names = [], allowPeek = true, onEnough = 
             <div class="smarttavern_veil_card">
                 <div class="smarttavern_veil_head">
                     <i class="fa-solid fa-circle-notch fa-spin"></i>
-                    <span class="smarttavern_veil_title">Refining reply…</span>
+                    <span class="smarttavern_veil_title">${String(title)}</span>
                 </div>
                 <div class="smarttavern_veil_chips">${chipsHtml(names)}</div>
                 ${allowPeek ? `
@@ -124,5 +126,46 @@ export function dismissVeil(messageId) {
 }
 
 export function dismissAllVeils() {
+    disarmPreVeil();
     for (const id of [...activeVeils.keys()]) dismissVeil(id);
+}
+
+// Pre-veil: CHARACTER_MESSAGE_RENDERED fires only once the reply is complete — a
+// streamed draft would be fully readable by then. The observer blurs the reply the
+// moment its message node enters the chat DOM (the callback is a microtask, so it
+// runs before the browser paints a single token). The refinement pipeline replaces
+// this bare veil with the full tracking card once the reply finishes rendering.
+let preVeilObserver = null;
+
+/**
+ * Arms a one-shot observer that veils the next character-message node inserted into
+ * the chat. `isValid` is re-checked at insertion time; when it fails (the fresh-reply
+ * mark was consumed or cancelled) nothing is veiled.
+ * @param {{ isValid?: () => boolean }} [options]
+ */
+export function armPreVeil({ isValid = () => true } = {}) {
+    disarmPreVeil();
+    if (typeof MutationObserver !== 'function') return;
+    const chatEl = document.getElementById('chat');
+    if (!chatEl) return;
+    const observer = new MutationObserver(mutations => {
+        for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+                if (!(node instanceof HTMLElement) || !node.classList.contains('mes')) continue;
+                if (node.classList.contains('is_user') || node.classList.contains('is_system')) continue;
+                // The first character-message node is the incoming reply draft.
+                disarmPreVeil();
+                if (!isValid()) return;
+                applyVeil(Number(node.getAttribute('mesid')), { names: [], allowPeek: false, title: 'Drafting reply…' });
+                return;
+            }
+        }
+    });
+    preVeilObserver = observer;
+    observer.observe(chatEl, { childList: true });
+}
+
+export function disarmPreVeil() {
+    preVeilObserver?.disconnect();
+    preVeilObserver = null;
 }

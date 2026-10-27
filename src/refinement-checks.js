@@ -6,3 +6,8 @@ export function refinementIssues(rawOutput) {
     const payload = wrapped ? wrapped[2] : raw.replace(/<audit>[\s\S]*?<\/audit>/gi, '');
     return payload.trim() ? [] : ['The reply is empty.'];
 }
+
+/** True when the output wraps an actual revised reply in <revised_reply>/<final_reply> tags. */
+export function hasRefinedPayload(rawOutput) {
+    return /<(revised_reply|final_reply)>[\s\S]*?<\/\1>/i.test(String(rawOutput ?? '').trim());
+}
