@@ -6,6 +6,7 @@ import {
     initPanel, openPanel, togglePanel, refreshStatus, refreshProfileSelects,
     showProfilePopup, showRunResults, runUpdateCommand, runRebuildCommand, runResetCommand,
 } from './panel.js';
+import { runStoryCraft, runStoryBeat, runStoryChapter, showStoryDirective } from './story-ui.js';
 import { initProgress } from './progress.js';
 
 export function initUI() {
@@ -119,6 +120,10 @@ function registerSlashCommands() {
         { name: 'smarttavern-rebuild', help: 'Fully rewrite the profile from the character card', run: (arg) => runRebuildCommand(arg) },
         { name: 'smarttavern-reset', help: 'Delete the stored profile for a character', run: (arg) => runResetCommand(arg) },
         { name: 'smarttavern-run', help: 'Dry-run every enabled pipeline (expansion steps + refinement passes) and show raw outputs', run: (_arg) => showRunResults() },
+        { name: 'smarttavern-craft', help: 'Craft a Story Director bible for this chat (<seed>)', run: (arg) => runStoryCraft(arg) },
+        { name: 'smarttavern-beat', help: 'Compile the next story beat (<steering note>)', run: (arg) => runStoryBeat(arg) },
+        { name: 'smarttavern-chapter', help: 'Close the current chapter and write the opening beat of the next', run: () => runStoryChapter() },
+        { name: 'smarttavern-story', help: 'Show the story directive the reply model will receive', run: () => showStoryDirective() },
         { name: 'smarttavern-hud', help: 'Toggle the SmartTavern floating panel', run: (_arg) => togglePanel() },
     ];
 

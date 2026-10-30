@@ -8,6 +8,7 @@ import {
     runRefinementPipeline, hasFreshReply, cancelFreshReply,
 } from './src/pipeline.js';
 import { maybeAutoUpdate } from './src/profiles.js';
+import { onStoryCharacterReply, resetStoryGenerationState } from './src/story.js';
 import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
 import { initPromptTail } from './src/tail.js';
@@ -37,6 +38,7 @@ async function initSmartTavern() {
         cancelFreshReply();
         sweepEphemeral();
         resetBootstrapFailures();
+        resetStoryGenerationState();
         // An in-flight refinement may still be veiling a message from the previous chat;
         // its DOM is gone, so this only clears bookkeeping and any stray overlay.
         dismissAllVeils();
@@ -76,6 +78,8 @@ function onMessageReceived(messageId) {
         const message = Number.isInteger(messageId) ? arr[messageId] : arr[arr.length - 1];
         if (!message) return;
         if (message.is_user || message.is_system || message.smarttavern_ephemeral) return;
+        // Story Director: optimistic beat delivery (refinement off) or the idle clock tick.
+        onStoryCharacterReply(Number.isInteger(messageId) ? messageId : arr.length - 1);
         const settings = getSettings();
         // When refinement is active the auto-update runs after refinement completes
         // (see onCharacterMessageRendered) so it reads the refined reply.

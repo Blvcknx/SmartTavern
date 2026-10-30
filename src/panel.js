@@ -16,8 +16,9 @@ import { listConnectionProfiles } from './gen.js';
 import { runPipeline, runRefinementDryRun, getLastRunResults } from './pipeline.js';
 import { rebuildProfile, updateProfile, resetProfile, serializeProfile } from './profiles.js';
 import { chipsHtml } from './chips.js';
+import { renderStoryTab, wireStoryTab } from './story-ui.js';
 
-const TABS = ['profile', 'steps', 'schema', 'results', 'settings'];
+const TABS = ['profile', 'story', 'steps', 'schema', 'results', 'settings'];
 
 // --------------------------------------------------------------------------------------------
 // Helpers
@@ -102,6 +103,7 @@ export function initPanel() {
         profileTabCharKey = null;
         refreshStatus();
         if (isPanelOpen() && activeTab === 'profile') renderProfileTab();
+        if (isPanelOpen() && activeTab === 'story') renderStoryTab();
     });
 
     // Fired after programmatic profile writes (quick update from the avatar menu, panel buttons).
@@ -244,6 +246,7 @@ function switchTab(tab) {
 
 function renderActiveTab() {
     if (activeTab === 'profile') renderProfileTab();
+    else if (activeTab === 'story') renderStoryTab();
     else if (activeTab === 'steps') renderStepEditor();
     else if (activeTab === 'schema') renderFieldEditor();
     else if (activeTab === 'results') renderResultsTab();
@@ -251,7 +254,7 @@ function renderActiveTab() {
 }
 
 function autoGrowAll() {
-    $panel().find('.smarttavern_step_prompt, .smarttavern_bio_value').each(function () {
+    $panel().find('.smarttavern_step_prompt, .smarttavern_bio_value, .smarttavern_story_textarea').each(function () {
         this.style.height = 'auto';
         this.style.height = `${this.scrollHeight}px`;
     });
@@ -272,6 +275,7 @@ function buildPanelHtml() {
         </div>
         <div class="smarttavern_panel_tabs">
             <a class="smarttavern_tab_button" data-tab="profile" title="Living bio of the current character"><i class="fa-solid fa-user-pen"></i><span>Profile</span></a>
+            <a class="smarttavern_tab_button" data-tab="story" title="Story Director — scenario, chapters and per-turn beats"><i class="fa-solid fa-clapperboard"></i><span>Story</span></a>
             <a class="smarttavern_tab_button" data-tab="steps" title="Pipeline steps"><i class="fa-solid fa-diagram-project"></i><span>Steps</span></a>
             <a class="smarttavern_tab_button" data-tab="schema" title="Profile schema fields"><i class="fa-solid fa-list-check"></i><span>Schema</span></a>
             <a class="smarttavern_tab_button" data-tab="results" title="Latest pipeline run"><i class="fa-solid fa-square-poll-horizontal"></i><span>Results</span></a>
@@ -299,6 +303,10 @@ function buildPanelHtml() {
                     <a id="smarttavern_profile_rebuild" class="menu_button smarttavern_busy_guard" title="Full rewrite from the character card"><i class="fa-solid fa-wand-magic-sparkles"></i><span>Rebuild</span></a>
                     <a id="smarttavern_profile_reset" class="menu_button smarttavern_busy_guard" title="Delete the stored profile"><i class="fa-solid fa-trash"></i><span>Reset</span></a>
                 </div>
+            </div>
+
+            <div class="smarttavern_tab_panel" data-tab="story">
+                <div id="smarttavern_story_root"></div>
             </div>
 
             <div class="smarttavern_tab_panel" data-tab="steps">
@@ -389,6 +397,16 @@ function buildPanelHtml() {
                     </label>
                 </div>
                 <div class="smarttavern_hint" id="smarttavern_mode_hint"></div>
+
+                <div class="smarttavern_steps_section_title"><i class="fa-solid fa-clapperboard"></i><span>Story Director</span></div>
+                <label class="checkbox" title="When a story exists in this chat, a short scene directive (compiled from the story bible) is appended last in the reply prompt">
+                    <input id="smarttavern_storyEnabled" type="checkbox" ${settings.storyEnabled !== false ? 'checked' : ''}>
+                    <span>Enable the Story Director directive</span>
+                </label>
+                <label class="checkbox" title="Adds a built-in refinement pass that checks the fresh reply against the required beat event and weaves it in when missing">
+                    <input id="smarttavern_storyEnforce" type="checkbox" ${settings.storyEnforce !== false ? 'checked' : ''}>
+                    <span>Enforce the required beat on the reply</span>
+                </label>
                 <label class="checkbox">
                     <input id="smarttavern_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}>
                     <span>Enable SmartTavern (pipeline injection)</span>
@@ -441,6 +459,12 @@ function buildPanelHtml() {
                     <label title="Only applies when the position is set to Custom depth">Injection depth (custom position only)
                         <input id="smarttavern_injectDepth" class="text_margin_input" type="number" min="0" max="50" step="1" value="${settings.injectDepth}">
                     </label>
+                    <label title="Idle character replies after a delivered beat before the world escalates on its own">Story idle turns (escalation)
+                        <input id="smarttavern_storyIdleTurns" class="text_margin_input" type="number" min="1" max="20" step="1" value="${settings.storyIdleTurns}">
+                    </label>
+                    <label title="Hard word cap of the compiled scene directive; the fact ledger is trimmed first when exceeded">Story directive word cap
+                        <input id="smarttavern_storyDirectiveMaxWords" class="text_margin_input" type="number" min="60" max="400" step="10" value="${settings.storyDirectiveMaxWords}">
+                    </label>
                 </div>
 
                 <div class="smarttavern_expansion_only">
@@ -481,6 +505,11 @@ function buildPanelHtml() {
                     <span class="smarttavern_missing_profile" id="smarttavern_updater_missing_profile" title="The pinned connection profile no longer exists — requests fall back to the active connection"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
                 </label>
 
+                <label title="Connection Manager profile used for the Story Director (architect / director) calls; empty uses the active connection">Story Director connection profile
+                    <select id="smarttavern_storyProfileId" class="smarttavern_profile_select"></select>
+                    <span class="smarttavern_missing_profile" id="smarttavern_story_missing_profile" title="The pinned connection profile no longer exists — requests fall back to the active connection"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
+                </label>
+
                 <hr>
 
                 <div class="smarttavern_row_actions">
@@ -506,10 +535,11 @@ function buildPanel() {
     applyModeVisibility();
     wireDataButtons();
     wireProfileTab();
+    wireStoryTab($panel());
     initDrag();
 
     // Grow textareas with their content (step prompts, hand-edited bio fields).
-    $panel().on('input', '.smarttavern_step_prompt, .smarttavern_bio_value', function () {
+    $panel().on('input', '.smarttavern_step_prompt, .smarttavern_bio_value, .smarttavern_story_textarea', function () {
         this.style.height = 'auto';
         this.style.height = `${this.scrollHeight}px`;
     });
@@ -528,6 +558,10 @@ const PANEL_CONTROLS = [
     ['smarttavern_replaceDescription', 'replaceDescription', 'checkbox'],
     ['smarttavern_savePassesAsSwipes', 'savePassesAsSwipes', 'checkbox'],
     ['smarttavern_veilAllowPeek', 'veilAllowPeek', 'checkbox'],
+    ['smarttavern_storyEnabled', 'storyEnabled', 'checkbox'],
+    ['smarttavern_storyEnforce', 'storyEnforce', 'checkbox'],
+    ['smarttavern_storyIdleTurns', 'storyIdleTurns', 'number'],
+    ['smarttavern_storyDirectiveMaxWords', 'storyDirectiveMaxWords', 'number'],
     ['smarttavern_updateInterval', 'updateInterval', 'number'],
     ['smarttavern_chatLookback', 'chatLookback', 'number'],
     ['smarttavern_profileUpdateLookback', 'profileUpdateLookback', 'number'],
@@ -571,6 +605,12 @@ function wireGeneralControls() {
     const select = $panel().find('#smarttavern_profileUpdateProfileId').get(0);
     select?.addEventListener('change', () => {
         getSettings().profileUpdateProfileId = String(select.value ?? '');
+        saveSettings();
+    });
+
+    const storySelect = $panel().find('#smarttavern_storyProfileId').get(0);
+    storySelect?.addEventListener('change', () => {
+        getSettings().storyProfileId = String(storySelect.value ?? '');
         saveSettings();
     });
 
@@ -961,6 +1001,9 @@ export function refreshProfileSelects() {
     const updater = $panel().find('#smarttavern_profileUpdateProfileId').get(0);
     if (updater) refresh(updater, settings.profileUpdateProfileId ?? '');
     updateBadge($panel().find('#smarttavern_updater_missing_profile'), settings.profileUpdateProfileId ?? '');
+    const storySelect = $panel().find('#smarttavern_storyProfileId').get(0);
+    if (storySelect) refresh(storySelect, settings.storyProfileId ?? '');
+    updateBadge($panel().find('#smarttavern_story_missing_profile'), settings.storyProfileId ?? '');
     // Both step lists render through the same card builder; each select carries its own
     // step object so index-based lookups cannot cross wires between the two pipelines.
     $panel().find('.smarttavern_step_profile').each(function () {
@@ -1138,6 +1181,9 @@ function renderRunResult(body, result, pipeline) {
     for (const stat of (result.stepStats ?? [])) {
         appendSection(body, stepStatsTitle(stat.name || 'Step', stat), stat.cancelled || stat.skipped
             ? `(skipped — kept the last accepted draft)${stat.issues?.length ? '\n' + stat.issues.join('\n') : ''}` : result.stepOutputs?.[stat.name] || '(no output — failed or empty, see browser console)');
+    }
+    if (result.storyDirective) {
+        appendSection(body, 'Story directive (what the reply model was told)', result.storyDirective);
     }
     if (result.injectionText) {
         appendSection(

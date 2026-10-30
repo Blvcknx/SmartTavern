@@ -25,6 +25,10 @@ import { activityStart, activityStatus, activityEntry, activityFail, activityEnd
 import { refinementIssues, hasRefinedPayload } from './refinement-checks.js';
 import { applyVeil, setVeilStep, setVeilStatus, revealVeil, dismissVeil, armPreVeil } from './veil.js';
 import { stagePromptTail, clearPromptTail } from './tail.js';
+import {
+    prepareStoryDirective, storyMacroContext, storyEnforcementActive, hasStory,
+    markStoryBeatDelivered, recordDirectiveInjection, resetStoryGenerationState,
+} from './story.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
 
@@ -33,6 +37,25 @@ const MACRO_RE = /\{\{\s*([^{}]+?)\s*\}\}/g;
 const STEP_SYSTEM = 'You are a state-assessment engine for an interactive fiction platform. Follow the task instructions precisely and output only the requested prose with no preamble, headings or meta commentary.';
 
 const REFINEMENT_SYSTEM = 'You are a surgical prose editor and continuity auditor for an interactive fiction platform. Make only the targeted adjustments requested by the user prompt while preserving the original scene events, pacing, and structure. Output only the final revised reply (or the requested XML tags) with no meta-commentary or preamble.';
+
+// Built-in story enforcement pass, prepended to the refinement list while a directive
+// MUST block is active. Same tag contract as user passes: <audit>PASS</audit> keeps the
+// draft, otherwise <audit>reasoning</audit> + <revised_reply>full reply</revised_reply>.
+const DIRECTIVE_ENFORCEMENT_NAME = 'Directive Enforcement';
+const DIRECTIVE_ENFORCEMENT_PROMPT = [
+    'You are checking the DRAFT reply of {{char}} against a REQUIRED EVENT.',
+    'REQUIRED EVENT: {{must}}',
+    '',
+    'Recent chat:',
+    '{{chat}}',
+    '',
+    'DRAFT:',
+    '{{draft}}',
+    '',
+    '"Contained" means the event visibly happens on the page, not merely alluded to.',
+    'If contained: output <audit>PASS</audit> only.',
+    'If not: reason briefly in <audit>...</audit>, then output the full reply in <revised_reply>...</revised_reply> with the event woven in by minimal edits, in the first half, matching voice and format. Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
+].join('\n');
 
 // Characters whose bootstrap already failed this session — no retry spam per generation.
 const failedBootstraps = new Set();
@@ -142,6 +165,7 @@ function recordLastRun(result, pipeline, source) {
         stepOutputs: result.stepOutputs,
         stepStats: result.stepStats ?? [],
         injectionText: result.injectionText ?? '',
+        storyDirective: result.storyDirective ?? '',
         source,
         at: Date.now(),
     };
@@ -188,7 +212,7 @@ export function sweepEphemeral(chatArr = null) {
  * passes; `draftMessageId` excludes the message being refined from chat excerpts so
  * the draft is never duplicated inside {{chat}}.
  */
-export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, step = null, stepsList = null, currentDraft = null, originalDraft = null, draftMessageId = null }) {
+export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, step = null, stepsList = null, currentDraft = null, originalDraft = null, draftMessageId = null, story = null }) {
     const fieldLookup = new Map((settings.fields ?? []).map(f => [String(f?.name ?? '').trim().toLowerCase(), String(f?.name ?? '')]));
     const list = Array.isArray(stepsList) ? stepsList : (Array.isArray(settings.steps) ? settings.steps : []);
     const stepLookup = new Map(list.map(s => [String(s?.name ?? '').trim().toLowerCase(), String(s?.name ?? '')]));
@@ -222,6 +246,13 @@ export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, 
             const value = canonical ? stepOutputs?.[canonical] : undefined;
             return typeof value === 'string' ? value : '';
         }
+        // Story Director macros. story-core's compiled directive contains no secrets,
+        // cast secrets or future chapters — neither may any of these.
+        if (m === 'story') return story?.text ?? '';
+        if (m === 'must') return story?.must ?? '';
+        if (m === 'beat') return story?.beat ?? '';
+        if (m === 'chapter') return story?.chapter ?? '';
+        if (m === 'ledger') return story?.ledger ?? '';
         return null;
     };
 }
@@ -249,13 +280,13 @@ function stepBlocks(stepsList, stepOutputs) {
     return parts;
 }
 
-export function assembleInjection({ settings, char, profile, chat, stepOutputs }) {
-    return assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs })
+export function assembleInjection({ settings, char, profile, chat, stepOutputs, story = null }) {
+    return assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs, story })
         .map(block => block.text).join('\n\n');
 }
 
-export function assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs }) {
-    const resolve = makeMacroResolver({ char, profile, chat, stepOutputs, settings });
+export function assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs, story = null }) {
+    const resolve = makeMacroResolver({ char, profile, chat, stepOutputs, settings, story });
     const parts = [];
     const roleFor = step => STEP_ROLES.includes(step?.role) ? step.role : 'assistant';
     const add = (text, role) => { if (text) parts.push({ text, role }); };
@@ -396,12 +427,18 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
     const context = getContext();
     const isCurrentChat = captureChatScope();
     const settings = getSettings();
-    if (!settings.enabled || !settings.expansionEnabled) return null;
+    if (!settings.enabled) return null;
     if (type === 'quiet' || type === 'impersonate') return null;
     if (isInternalGeneration()) return null;
 
     const arr = Array.isArray(chat) ? chat : (context.chat ?? []);
     if (!arr.length) return null;
+
+    // Story directive — its own gate, independent of expansion. Compiled here (and,
+    // for swipe/regenerate, re-armed first) so it can feed the {{story}} macros below.
+    // Any compile error fails open to null (no directive, never a blocked generation).
+    const directive = prepareStoryDirective({ type, mutate: inject });
+    if (!settings.expansionEnabled && !directive) return null;
 
     if (inject) {
         clearPromptTail();
@@ -439,16 +476,35 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             tone: 'info',
         });
 
-        const { stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings, signal: control.signal });
+        const expand = settings.expansionEnabled !== false;
+        let stepOutputs = Object.create(null);
+        let stepStats = [];
+        if (expand) {
+            ({ stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings, signal: control.signal }));
+        } else {
+            activitySteps({ names: [] }); // story-only run: no expansion chips to show
+        }
         throwIfAborted(control.signal);
         if (!isCurrentChat()) return null;
-        const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings, stepsList: settings.steps });
-        const injectionText = stepBlocks(settings.steps, stepOutputs).length
-            ? (settings.injectAnchor === 'prompt-end'
-                ? substituteParamsSafe(expandMacros(settings.tailPrompt ?? '', resolve)).trim()
-                : assembleInjection({ settings, char, profile, chat: arr, stepOutputs }))
-            : '';
-        if (!inject) return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'expansion', 'dry run');
+        const storyContext = directive ? storyMacroContext(directive) : null;
+        const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings, stepsList: settings.steps, story: storyContext });
+        const hasStepBlocks = stepBlocks(settings.steps, stepOutputs).length > 0;
+        // A tail template that embeds {{story}} carries the directive itself; otherwise
+        // the directive is appended below as the FINAL tail section, after the expansion
+        // outputs, so it sits closest to generation.
+        const usesStoryMacro = /\{\{\s*story\s*\}\}/i.test(String(settings.tailPrompt ?? ''));
+        let injectionText = '';
+        if (settings.injectAnchor === 'prompt-end') {
+            if ((expand && hasStepBlocks) || (directive && usesStoryMacro)) {
+                injectionText = substituteParamsSafe(expandMacros(settings.tailPrompt ?? '', resolve)).trim();
+            }
+            if (directive?.text && !injectionText.includes(directive.text)) {
+                injectionText = injectionText ? `${injectionText}\n\n${directive.text}` : directive.text;
+            }
+        } else if (expand && hasStepBlocks) {
+            injectionText = assembleInjection({ settings, char, profile, chat: arr, stepOutputs, story: storyContext });
+        }
+        if (!inject) return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '' }, 'expansion', 'dry run');
 
         if (settings.injectAnchor === 'prompt-end') {
             if (injectionText) {
@@ -457,15 +513,20 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
                 // Preserve the actual final history message: continue-generation
                 // processing must not mistake our reservation for its target.
                 injectEphemeral(arr, reservation, settings, role, Math.max(0, arr.length - 1));
+                if (directive?.text) recordDirectiveInjection(directive);
                 summary = 'Reply prompt tail prepared';
                 activityEntry({ title: `Prompt tail prepared · ${role} · ${injectionText.length} chars`, tone: 'info', text: injectionText });
             } else summary = 'Nothing to inject';
-            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'expansion', 'generation');
+            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '' }, 'expansion', 'generation');
         }
-        const blocks = assembleInjectionBlocks({ settings, char, profile, chat: arr, stepOutputs });
+        const blocks = assembleInjectionBlocks({ settings, char, profile, chat: arr, stepOutputs, story: storyContext });
+        const directiveRole = STEP_ROLES.includes(settings.tailRole) ? settings.tailRole : 'assistant';
+        if (directive?.text && !blocks.some(block => block.text.includes(directive.text))) {
+            blocks.push({ text: directive.text, role: directiveRole });
+        }
         if (!blocks.length) {
             summary = 'Nothing to inject';
-            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'expansion', 'generation');
+            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '' }, 'expansion', 'generation');
         }
 
         let index = resolveInjectIndex(arr, settings);
@@ -473,7 +534,8 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             injectEphemeral(arr, block.text, settings, block.role, index++);
             activityEntry({ title: `Injecting ${block.text.length} chars as ${block.role}`, tone: 'info', text: block.text });
         }
-        return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText }, 'expansion', 'generation');
+        if (directive?.text) recordDirectiveInjection(directive);
+        return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '' }, 'expansion', 'generation');
     } catch (error) {
         if (isAbortError(error)) {
             control.cancel();
@@ -494,10 +556,29 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
 // Refinement pipeline (post-generation multi-pass reply editing)
 // --------------------------------------------------------------------------------------------
 
-/** Enabled refinement passes (non-empty prompt), shared by veil arming and the pipeline. */
-function enabledRefinementSteps(settings) {
-    return (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])
-        .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
+/**
+ * The refinement pass list that actually runs: the enabled user passes plus the
+ * built-in Directive Enforcement pass prepended while a story MUST block is active
+ * (pending beat or idle escalation; see story.storyEnforcementActive). Single source
+ * of truth for everything that enumerates passes: runRefinementPipeline, the
+ * interceptor's pre-veil check, chips and veil names.
+ */
+export function effectiveRefinementSteps(settings) {
+    const steps = (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])
+        .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim())
+        .map(s => ({ ...s }));
+    if (storyEnforcementActive(settings)) {
+        steps.unshift({
+            name: DIRECTIVE_ENFORCEMENT_NAME,
+            builtin: true,
+            enabled: true,
+            role: 'assistant',
+            profileId: settings.storyProfileId || '',
+            lookback: 3,
+            prompt: DIRECTIVE_ENFORCEMENT_PROMPT,
+        });
+    }
+    return steps;
 }
 
 /** Strips audit blocks, stray refinement tags and a surrounding code fence. */
@@ -626,7 +707,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         && settings.enabled && settings.refinementEnabled
         && (dryRun || generationEpoch === epoch);
 
-    const steps = enabledRefinementSteps(settings);
+    const steps = effectiveRefinementSteps(settings);
     const control = createGenerationControl();
     control.accepted = false;
     if (!dryRun) activeRefinement = control;
@@ -680,6 +761,10 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         });
 
         // Refinement is inherently sequential: every pass refines the previous draft.
+        // The story macro context carries the {{must}} of the directive injected into
+        // THIS generation (the built-in enforcement pass) plus {{story}}/{{beat}}/
+        // {{chapter}}/{{ledger}} for user passes.
+        const storyCtx = storyMacroContext();
         for (let index = 0; index < steps.length; index++) {
             if (!isCurrentDraft()) return null;
             const step = steps[index];
@@ -702,7 +787,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
             try {
                 const resolve = makeMacroResolver({
                     char, profile, chat: arr, stepOutputs, settings,
-                    stepsList: steps, step, currentDraft, originalDraft, draftMessageId: messageId,
+                    stepsList: steps, step, currentDraft, originalDraft, draftMessageId: messageId, story: storyCtx,
                 });
                 const text = substituteParamsSafe(expandMacros(step.prompt, resolve));
                 let output;
@@ -751,6 +836,12 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 }
                 control.pass = null;
                 activityRefinementControls();
+                // Directive Enforcement: a clean pass (PASS audit, or a revision that
+                // wove the event in) means the required event is on the page — deliver
+                // the beat. Skipped/failed passes leave it pending for re-injection.
+                if (step.builtin && !dryRun && markStoryBeatDelivered(messageId)) {
+                    activityEntry({ title: 'Story beat delivered', tone: 'info', text: 'The required event is on the page; its fact joined the story ledger.' });
+                }
                 // A pass that returned no revised payload (bare prose, or only an
                 // audit) is a skip, not a revision: keep the last accepted draft
                 // rather than adopting untagged output as the reply.
@@ -876,10 +967,10 @@ export async function smarttavernInterceptor(chat, _contextSize, _abort, type) {
         const settings = getSettings();
         if (type === 'quiet' || type === 'impersonate') return;
         if (!settings.enabled) return;
-        // A real generation is starting: mark the reply that is about to be rendered as
-        // fresh, so refinement (and the veil) may only ever touch it — never an existing
-        // message that is merely re-rendered (chat loads, a new chat's greeting).
         if (settings.refinementEnabled) {
+            // A real generation is starting: mark the reply that is about to be rendered as
+            // fresh, so refinement (and the veil) may only ever touch it — never an existing
+            // message that is merely re-rendered (chat loads, a new chat's greeting).
             markFreshGeneration();
             // A fresh generation clears the refined-flag so the new draft gets refined
             // again; merely viewing an existing message (swipes) never runs this. ST
@@ -888,19 +979,23 @@ export async function smarttavernInterceptor(chat, _contextSize, _abort, type) {
             // where swipe and continue drafts land (a normal reply is a brand-new
             // message that never carried the flag).
             clearRefinedFlag();
-            // Veiled mode blurs the reply the moment its DOM node appears — the render
-            // event that starts refinement fires only once the (possibly streamed)
-            // reply is complete, which would leave a streamed draft fully readable.
-            if (settings.refinementDisplay === 'veiled' && enabledRefinementSteps(settings).length) {
-                armPreVeil({ isValid: () => hasFreshReply() });
-            }
         }
-        // Expansion is a separate, independent pipeline: it runs BEFORE the reply and
-        // injects its outputs into the prompt; refinement runs after rendering.
-        if (settings.expansionEnabled) {
+        // A new generation invalidates the previous one's story bookkeeping before the
+        // directive is compiled (swipe/regenerate re-arm the beat as pending inside).
+        resetStoryGenerationState();
+        // The story directive is its own gate: with an active story the pipeline runs
+        // (and injects) even when expansion is disabled.
+        if (settings.expansionEnabled || (settings.storyEnabled !== false && hasStory())) {
             // The foreground generation is parked on this interceptor while the pipeline
             // runs, so its internal calls are exempt from gen.js's foreground-idle wait.
             await withInterceptorScope(() => runPipeline({ chat, inject: true, type }));
+        }
+        // Armed after the pipeline so the directive it just recorded is visible to
+        // effectiveRefinementSteps (the enforcement pass joins the veil chips). Still
+        // before any reply token renders — the reply only starts after this returns.
+        if (settings.refinementEnabled && settings.refinementDisplay === 'veiled'
+            && effectiveRefinementSteps(settings).length) {
+            armPreVeil({ isValid: () => hasFreshReply() });
         }
     } catch (error) {
         // Fail open: the generation proceeds without the SmartTavern block.

@@ -41,7 +41,10 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         'system-messages': "export const system_message_types = { NARRATOR: 'narrator' };",
         'instruct-mode': `export const formatInstructModeChat = (name, text, user, system) => '<' + (system ? 'system' : user ? 'user' : 'assistant') + '>' + text + '</turn>\\n'; export const formatInstructModePrompt = () => '<assistant>';`,
         progress: 'export const activityStart = () => {}; export const activityStatus = () => {}; export const activityEntry = () => {}; export const activityFail = () => {}; export const activityEnd = () => {}; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
-        veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = () => {}; export const revealVeil = () => {};`,
+        veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = () => {}; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const armPreVeil = () => {};`,
+        // Story Director stub: no chat in these tests carries a story, so the whole
+        // feature must stay inert. The no-ops mirror story.js's no-story behavior.
+        story: 'export const prepareStoryDirective = () => null; export const storyMacroContext = () => null; export const storyEnforcementActive = () => false; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};',
     };
     for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks']) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');

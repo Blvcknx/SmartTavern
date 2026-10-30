@@ -839,3 +839,49 @@
         animation: none;
     }
 }
+
+/* ------------------------------------------------------------------
+   Story Director tab: status line, directive preview, editable fields.
+   ------------------------------------------------------------------ */
+
+#smarttavern_panel .smarttavern_story_status {
+    border: 1px solid var(--SmartThemeBorderColor, transparent);
+    border-radius: 8px;
+    padding: 4px 8px;
+    margin: 6px 0;
+    font-size: 0.85em;
+    opacity: 0.85;
+}
+
+#smarttavern_panel .smarttavern_story_directive {
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+    border-radius: 8px;
+    padding: 8px;
+    margin: 4px 0;
+    max-height: 220px;
+    overflow-y: auto;
+    font-size: 0.85em;
+}
+
+#smarttavern_panel .smarttavern_story_textarea {
+    width: 100%;
+    resize: vertical;
+    min-height: 44px;
+    max-height: 40vh;
+}
+
+/* Cast rows are grids of name/role/wants/secret; the labels are rendered only on
+   the first row, so the columns line up without repeating them. */
+#smarttavern_panel .smarttavern_story_cast_row {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 4px 8px;
+    margin: 4px 0;
+}
+
+#smarttavern_panel .smarttavern_story_cast_row textarea,
+#smarttavern_panel .smarttavern_story_cast_row input {
+    width: 100%;
+}

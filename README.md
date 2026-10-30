@@ -144,6 +144,8 @@ An empty result or exhausted generation error pauses refinement with **Retry pas
 | `{{step:Step Name}}` | An earlier step's output (case-insensitive) |
 | `{{steps}}` | Earlier completed outputs in a step prompt; all generated outputs in the reply-tail template, in configured order |
 | `{{draft}}` / `{{original_draft}}` | Refinement passes only: the current working draft / the original reply before any pass touched it |
+| `{{story}}` | The compiled scene directive text (Story Director; never contains secrets or future chapters) |
+| `{{must}}` / `{{beat}}` / `{{chapter}}` / `{{ledger}}` | The required event / the current beat text / the current chapter line / the fact ledger |
 
 These macros also work in the reply-tail template. Include `{{steps}}` or selected `{{step:Name}}` references to supply the generated assessments. `{{step:Name}}` and `{{steps}}` resolve against the list of the pipeline the prompt belongs to — a refinement pass never sees expansion outputs, and vice versa. Unknown macros are left intact for SillyTavern's own substitution pass. The Results tab shows the assembled reply context (expansion) and the final refined reply (refinement) so you can inspect exactly what each pipeline produced.
 
@@ -152,6 +154,16 @@ These macros also work in the reply-tail template. Include `{{steps}}` or select
 Each step **and** the profile updater can pin any saved **Connection Manager profile** (`Extensions → Connection Manager` → create profiles there first). The default `Active connection` option uses whatever API/model is currently connected. Quality over latency: there is deliberately no caching or fast path — every generation runs all enabled steps.
 
 Use independent blocks for assessments that can use the same profile and conversation (for example, physical condition and scene constraints). Reference an earlier block only where its result is needed. The default mental-condition prompt explicitly references physical condition, so those two still run in order. Removing that reference and updating its task instructions makes them independent. The final reply model receives the blocks in configured order regardless of completion order.
+
+### Story Director
+
+For chats that keep dying because nobody is pushing the story: the **Story** tab crafts a scenario once, then keeps the world moving without you being the GM.
+
+- **Craft story** — one architect call turns the character (card + living profile + recent chat + your seed) into a bible: premise, tone, secrets, a cast with private agendas, and a chapter arc with observable exit conditions.
+- **Next beat** — one director call compiles the next concrete, observable event (max ~45 words) plus two harder escalations and a ≤15-word fact. It also judges whether the chapter's exit condition looks met and says so in a toast.
+- **Next chapter** — closes the current chapter (its outcome joins the ledger) and writes the next chapter's opening beat. On the last chapter it appends a 3-chapter sequel arc instead of dead-ending.
+
+The reply model **never sees the bible**: secrets, cast agendas and future chapters exist only in the Director's prompts. Each generation gets a short (~140-word) scene directive appended as the **final** section of the prompt: the story frame, at most five ledger facts, and either the event this reply MUST show (→ beat, or an escalation once you idle for `storyIdleTurns` character replies) or a "keep developing" line once the beat is delivered. With refinement on, a built-in **Directive Enforcement** pass checks the fresh reply against the required event and weaves it in with minimal edits when missing; a pass that shows the event marks the beat delivered and its fact joins the ledger. Swiping or regenerating the message a beat was delivered in re-arms it as pending automatically. Everything (beat text, escalations, premise, chapters, cast) is editable in the tab and autosaves; the read-only **Directive preview** shows exactly what the reply model will receive next. Any story error fails open — the generation proceeds without a directive.
 
 ## Slash commands
 
@@ -162,6 +174,10 @@ Use independent blocks for assessments that can use the same profile and convers
 | `/smarttavern-rebuild [char]` | `/st-rebuild` | Full rewrite from the card (bootstrap prompt) |
 | `/smarttavern-reset [char]` | `/st-reset` | Delete the stored profile |
 | `/smarttavern-run` | `/st-run` | Dry run of every enabled pipeline (expansion, then refinement); shows raw outputs |
+| `/smarttavern-craft <seed>` | `/st-craft` | Craft a Story Director bible for this chat |
+| `/smarttavern-beat <note>` | `/st-beat` | Compile the next story beat (optional steering note) |
+| `/smarttavern-chapter` | `/st-chapter` | Close the current chapter and write the opening beat of the next |
+| `/smarttavern-story` | `/st-story` | Show the directive the reply model will receive |
 | `/smarttavern-hud` | `/st-hud` | Toggle the floating panel |
 
 **smarttavern_dump**: open the browser console and run
@@ -171,6 +187,7 @@ Use independent blocks for assessments that can use the same profile and convers
 
 - Global config: `extensionSettings.smarttavern` (in `settings.json`).
 - Profiles: `chatMetadata.smarttavern = { version, profiles: { [avatar]: { fields, createdAt, updatedAt, source, lastDiff? } } }` — saved with the chat, invisible to the character card. `lastDiff` records the field-level before/after of the most recent background update (cleared by manual edits).
+- Story: `chatMetadata.smarttavern.story = { v, bible, chapterIndex, beat, ledger, turnsSinceDelivery, seed, createdAt }` — one story per chat, saved with it.
 - No secrets are stored; connection profiles reference the Connection Manager's own records.
 - Every generation makes up to `1 (bootstrap) + expansion steps + refinement passes` extra LLM calls — mind your provider quota/billing. Prompt-tail assembly makes no model call.
 

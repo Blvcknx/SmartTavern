@@ -149,6 +149,20 @@ export const DEFAULT_SETTINGS = Object.freeze({
     refinementDisplay: 'veiled',
     veilAllowPeek: true,
     savePassesAsSwipes: true,
+    // Story Director: a manually triggered director that crafts a scenario (bible),
+    // compiles one concrete event per turn (beat) and injects it as the final tail
+    // section. The reply model never sees the bible — only the compiled directive.
+    storyEnabled: true,
+    // A built-in first refinement pass (Directive Enforcement) checks that the
+    // required event is on the page and weaves it in when missing.
+    storyEnforce: true,
+    // Idle turns after delivery before the world escalates on its own (deterministic
+    // idle clock: rung advances every further storyIdleTurns turns).
+    storyIdleTurns: 3,
+    // Hard word cap of the compiled directive (ledger lines are shed first).
+    storyDirectiveMaxWords: 140,
+    // Connection Manager profile for the Director/architect calls.
+    storyProfileId: '',
     updateInterval: 12,
     chatLookback: 24,
     profileUpdateLookback: 24,
@@ -322,6 +336,28 @@ function normalizeSettings(settings) {
         settings.genRetryDelayMs = genRetryDelayMs;
         changed = true;
     }
+    if (typeof settings.storyEnabled !== 'boolean') {
+        settings.storyEnabled = true;
+        changed = true;
+    }
+    if (typeof settings.storyEnforce !== 'boolean') {
+        settings.storyEnforce = true;
+        changed = true;
+    }
+    const storyIdleTurns = clampInt(settings.storyIdleTurns, 1, 20, 3);
+    if (settings.storyIdleTurns !== storyIdleTurns) {
+        settings.storyIdleTurns = storyIdleTurns;
+        changed = true;
+    }
+    const storyDirectiveMaxWords = clampInt(settings.storyDirectiveMaxWords, 60, 400, 140);
+    if (settings.storyDirectiveMaxWords !== storyDirectiveMaxWords) {
+        settings.storyDirectiveMaxWords = storyDirectiveMaxWords;
+        changed = true;
+    }
+    if (typeof settings.storyProfileId !== 'string') {
+        settings.storyProfileId = '';
+        changed = true;
+    }
     // Raise persisted token caps (formerly 5000) so long outputs — revised replies,
     // expansion step payloads — are no longer cropped mid-generation.
     if (settings.tokenCapsVersion !== 1) {
@@ -422,6 +458,38 @@ export function clearAllProfiles() {
 
 export function allStoredProfiles() {
     return Object.entries(getChatStore().profiles);
+}
+
+// --------------------------------------------------------------------------------------------
+// Story Director store (chat metadata). The whole feature is inert without one.
+// Shape: { v:1, bible, chapterIndex, beat, ledger:[], turnsSinceDelivery, seed, createdAt }
+// --------------------------------------------------------------------------------------------
+
+export function getStory() {
+    return getChatStore().story ?? null;
+}
+
+export function setStory(story) {
+    getChatStore().story = story;
+    saveChatStore();
+    return story;
+}
+
+/** Mutates the stored story in place through `mutator`, then persists it. */
+export function updateStory(mutator) {
+    const story = getStory();
+    if (!story) return null;
+    mutator(story);
+    setStory(story);
+    return story;
+}
+
+export function clearStory() {
+    const store = getChatStore();
+    const existed = Object.hasOwn(store, 'story');
+    delete store.story;
+    if (existed) saveChatStore();
+    return existed;
 }
 
 // --------------------------------------------------------------------------------------------
