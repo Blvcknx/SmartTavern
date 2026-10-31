@@ -4,7 +4,7 @@
 import { getContext } from '../../../../extensions.js';
 import { getSettings, charKey, resolveTargetChar, resolveMemberByMessageName, log, warn } from './state.js';
 import { updateProfile } from './profiles.js';
-import { openPanel } from './panel.js';
+import { openPanel, promptForGuide } from './panel.js';
 
 const LONG_PRESS_MS = 550;
 const LONG_PRESS_SLOP_PX = 10;
@@ -142,6 +142,7 @@ function ensureMenu() {
             <div class="smarttavern_ctx_item" data-action="bio"><div class="fa-solid fa-user-pen extensionsMenuExtensionButton"></div><span>Edit living bio</span></div>
             <div class="smarttavern_ctx_item" data-action="steps"><div class="fa-solid fa-diagram-project extensionsMenuExtensionButton"></div><span>Edit pipeline</span></div>
             <div class="smarttavern_ctx_item" data-action="update"><div class="fa-solid fa-arrows-rotate extensionsMenuExtensionButton"></div><span>Update bio now</span></div>
+            <div class="smarttavern_ctx_item" data-action="guided-update"><div class="fa-solid fa-compass extensionsMenuExtensionButton"></div><span>Guided update…</span></div>
             <div class="smarttavern_ctx_item" data-action="results"><div class="fa-solid fa-square-poll-horizontal extensionsMenuExtensionButton"></div><span>Last result</span></div>
         </div>`);
     $ctxMenu.on('click', '.smarttavern_ctx_item', (event) => {
@@ -193,6 +194,22 @@ function handleMenuAction(action, char) {
                     console.error('[SmartTavern] quick profile update failed', error);
                     toastr.error(`Profile update failed — ${error?.message ?? error}`, 'SmartTavern');
                 });
+            break;
+        case 'guided-update':
+            (async () => {
+                const guide = await promptForGuide(
+                    `Guided update — ${char.name}`,
+                    'Optional extra direction for this update. It refines the generation without overriding the schema, the character card, or established facts. Leave empty for a plain update.',
+                );
+                if (guide === null) return; // popup cancelled
+                try {
+                    const result = await updateProfile(char, { notify: true, guide });
+                    if (!result) toastr.info('Update already in progress for this character.', 'SmartTavern');
+                } catch (error) {
+                    console.error('[SmartTavern] guided profile update failed', error);
+                    toastr.error(`Profile update failed — ${error?.message ?? error}`, 'SmartTavern');
+                }
+            })();
             break;
     }
 }

@@ -34,6 +34,16 @@ const UPDATE_SYSTEM = [
     'Output ONLY the JSON object.',
 ].join(' ');
 
+const FIELD_SYSTEM = [
+    'You are a character profile compiler for an interactive fiction platform.',
+    'You receive a character card, the surrounding living profile and a recent excerpt of an ongoing conversation.',
+    'Regenerate exactly ONE field of the profile as a single JSON object containing ONLY that field.',
+    'Ground everything in the card; where the recent conversation contradicts or extends the card, prefer the conversation.',
+    'Stay consistent with the other profile fields given as context; never invent contradictions with them.',
+    'Write vivid, specific, complete prose (no bullet lists, no meta commentary).',
+    'Output ONLY the JSON object.',
+].join(' ');
+
 // --------------------------------------------------------------------------------------------
 // Schema / parsing
 // --------------------------------------------------------------------------------------------
@@ -141,7 +151,19 @@ function fieldSpecList(fields) {
         .join('\n');
 }
 
-export function buildBootstrapPrompt(char, fields, excerpt) {
+/** Optional user steering shared by every guided generation (field, update, rebuild). */
+function guideBlock(guide) {
+    const text = String(guide ?? '').trim();
+    if (!text) return '';
+    return [
+        'Additional direction from the user:',
+        text,
+        'Treat it as extra guidance for this generation — it must NOT override the field definitions, the character card, or facts established in the conversation.',
+    ].join('\n');
+}
+
+export function buildBootstrapPrompt(char, fields, excerpt, guide = '') {
+    const guideText = guideBlock(guide);
     return substituteParamsSafe([
         'Character card:',
         cardText(char) || '(empty)',
@@ -149,12 +171,14 @@ export function buildBootstrapPrompt(char, fields, excerpt) {
         'Recent conversation excerpt:',
         excerpt || '(none yet)',
         '',
+        ...(guideText ? [guideText, ''] : []),
         'Return a single JSON object with exactly these fields:',
         fieldSpecList(fields),
     ].join('\n'));
 }
 
-export function buildUpdatePrompt(char, profile, fields, excerpt) {
+export function buildUpdatePrompt(char, profile, fields, excerpt, guide = '') {
+    const guideText = guideBlock(guide);
     return substituteParamsSafe([
         `Current profile of ${char.name}:`,
         serializeProfile(profile, fields) || '(empty)',
@@ -162,8 +186,30 @@ export function buildUpdatePrompt(char, profile, fields, excerpt) {
         'Recent conversation excerpt:',
         excerpt || '(none yet)',
         '',
+        ...(guideText ? [guideText, ''] : []),
         'Return the complete updated profile as a single JSON object with exactly these fields:',
         fieldSpecList(fields),
+    ].join('\n'));
+}
+
+/** Focused regeneration of a single schema field; the other fields go along as context. */
+export function buildFieldPrompt(char, name, field, profile, fields, excerpt, guide = '') {
+    const others = fields.filter(f => String(f?.name ?? '').trim() !== name);
+    const rest = serializeProfile(profile, others);
+    const guideText = guideBlock(guide);
+    return substituteParamsSafe([
+        'Character card:',
+        cardText(char) || '(empty)',
+        '',
+        ...(rest
+            ? [`Current profile of ${char.name} — other fields (context only; stay consistent, do not rewrite them):`, rest, '']
+            : []),
+        'Recent conversation excerpt:',
+        excerpt || '(none yet)',
+        '',
+        ...(guideText ? [guideText, ''] : []),
+        'Return a single JSON object containing exactly one field:',
+        `- "${name}": ${field?.description ?? ''}`,
     ].join('\n'));
 }
 
@@ -175,7 +221,7 @@ export function buildUpdatePrompt(char, profile, fields, excerpt) {
  * Full rewrite: compiles the character card (+ recent excerpt) into a fresh profile.
  * Used for the first generation of a character (bootstrap) and for explicit rebuilds.
  */
-export async function bootstrapProfile(char, { source = 'bootstrap', notify = true, signal = null } = {}) {
+export async function bootstrapProfile(char, { source = 'bootstrap', notify = true, signal = null, guide = '' } = {}) {
     if (!char) throw new Error('No character provided');
     throwIfAborted(signal);
     const settings = getSettings();
@@ -198,7 +244,7 @@ export async function bootstrapProfile(char, { source = 'bootstrap', notify = tr
             signal: requestSignal,
             profileId: settings.profileUpdateProfileId,
             systemPrompt: BOOTSTRAP_SYSTEM,
-            prompt: buildBootstrapPrompt(char, fields, excerpt),
+            prompt: buildBootstrapPrompt(char, fields, excerpt, guide),
             maxTokens: settings.updaterMaxTokens,
             jsonSchema: schema,
             // Retry not only on transport errors and degenerate output, but also when
@@ -244,11 +290,11 @@ export function rebuildProfile(char, options = {}) {
  * Low-drift maintenance: sends the current profile + recent excerpt to the updater and
  * merges the result, filling any missing fields from the existing profile.
  */
-export async function updateProfile(char, { notify = true } = {}) {
+export async function updateProfile(char, { notify = true, guide = '' } = {}) {
     if (!char) throw new Error('No character provided');
     const key = charKey(char);
     const existing = getStoredProfile(key);
-    if (!existing) return bootstrapProfile(char, { notify });
+    if (!existing) return bootstrapProfile(char, { notify, guide });
     const isCurrentChat = captureChatScope();
     const previousFields = JSON.stringify(existing.fields);
     const settings = getSettings();
@@ -266,7 +312,7 @@ export async function updateProfile(char, { notify = true } = {}) {
             signal: control.signal,
             profileId: settings.profileUpdateProfileId,
             systemPrompt: UPDATE_SYSTEM,
-            prompt: buildUpdatePrompt(char, existing, fields, excerpt),
+            prompt: buildUpdatePrompt(char, existing, fields, excerpt, guide),
             maxTokens: settings.updaterMaxTokens,
             jsonSchema: schema,
             validate: (res) => normalizeProfileJson(extractJson(String(res?.content ?? '')), fields, existing) !== null,
@@ -301,6 +347,91 @@ export async function updateProfile(char, { notify = true } = {}) {
         }
         activityFail(`Profile update failed — ${error?.message ?? error}`);
         activityEnd({ ok: false, summary: 'Profile update failed' });
+        throw error;
+    } finally {
+        control.dispose();
+        busyKeys.delete(key);
+    }
+}
+
+/**
+ * Focused regeneration of ONE schema field (a profile "section") straight into the stored
+ * record; the other fields are kept as context and never touched. An optional `guide` is
+ * extra user direction for this run — it never overrides the field definition or the card.
+ */
+export async function generateProfileField(char, fieldName, { guide = '', notify = true, signal = null } = {}) {
+    if (!char) throw new Error('No character provided');
+    const name = String(fieldName ?? '').trim();
+    const settings = getSettings();
+    const fields = Array.isArray(settings.fields) ? settings.fields : [];
+    const field = fields.find(f => String(f?.name ?? '').trim() === name);
+    if (!field) throw new Error(`Unknown profile field: ${name}`);
+    throwIfAborted(signal);
+    const key = charKey(char);
+    const existing = getStoredProfile(key);
+    const isCurrentChat = captureChatScope();
+    const previousFields = JSON.stringify(existing?.fields);
+    if (busyKeys.has(key)) return null;
+    busyKeys.add(key);
+    const control = createGenerationControl();
+    const requestSignal = signal ?? control.signal;
+    try {
+        activityStart({ status: `Generating "${name}" · ${char.name}` });
+        activitySteps({ names: [] }); // single call — clear any stale chip row
+        const context = getContext();
+        const schema = buildJsonSchema([field]);
+        const excerpt = chatExcerpt(context.chat, settings.profileUpdateLookback);
+        const result = await withInternalGeneration(() => generateWithRetry({
+            signal: requestSignal,
+            profileId: settings.profileUpdateProfileId,
+            systemPrompt: FIELD_SYSTEM,
+            prompt: buildFieldPrompt(char, name, field, existing, fields, excerpt, guide),
+            maxTokens: settings.updaterMaxTokens,
+            jsonSchema: schema,
+            validate: (res) => {
+                const parsed = normalizeProfileJson(extractJson(String(res?.content ?? '')), [field], null);
+                return typeof parsed?.fields?.[name] === 'string' && parsed.fields[name].trim().length > 0;
+            },
+        }));
+        const rawContent = String(result?.content ?? '');
+        activityEntry({ title: `Field payload (${name}) · ${rawContent.length} chars`, tone: 'info', text: rawContent });
+        const parsed = normalizeProfileJson(extractJson(rawContent), [field], null);
+        const value = typeof parsed?.fields?.[name] === 'string' ? parsed.fields[name].trim() : '';
+        if (!value) throw new Error('The model did not return a usable field object');
+        const now = (context.chat ?? []).length;
+        const before = typeof existing?.fields?.[name] === 'string' ? existing.fields[name].trim() : '';
+        const base = existing ?? { fields: {}, createdAt: now, updatedAt: now, source: 'field' };
+        const changed = before !== value;
+        const record = {
+            ...base,
+            fields: { ...base.fields, [name]: value },
+            updatedAt: now,
+            source: 'field',
+            lastDiff: { at: now, source: guide ? 'guided-field' : 'field', fields: changed ? { [name]: { from: existing?.fields?.[name] ?? '', to: value } } : {} },
+        };
+        if (!isCurrentChat() || getStoredProfile(key) !== existing
+            || JSON.stringify(existing?.fields) !== previousFields) {
+            activityEnd({ ok: true, summary: 'Field result discarded — chat or profile changed' });
+            return null;
+        }
+        setStoredProfile(key, record);
+        log(`profile field "${name}" ${guide ? 'guided-' : ''}generated for "${key}"`);
+        notifyProfileUpdated({ key, silent: !notify, changedFields: changed ? [name] : [] });
+        if (notify) {
+            // Creating a record here suppresses the auto-bootstrap, so tell the user the
+            // other fields are still blank and how to fill them.
+            if (!existing) toastr.info(`"${name}" generated — the other fields are still empty. Rebuild to compile the full profile.`, 'SmartTavern');
+            else toastr.success(`"${name}" generated for ${char.name}.`, 'SmartTavern');
+        }
+        activityEnd({ ok: true, summary: `Field "${name}" · ${char.name}` });
+        return record;
+    } catch (error) {
+        if (isAbortError(error)) {
+            activityEnd({ ok: true, summary: 'Field generation cancelled' });
+            return null;
+        }
+        activityFail(`Field "${name}" generation failed — ${error?.message ?? error}`);
+        activityEnd({ ok: false, summary: 'Field generation failed' });
         throw error;
     } finally {
         control.dispose();

@@ -14,7 +14,7 @@ import {
 } from './state.js';
 import { listConnectionProfiles } from './gen.js';
 import { runPipeline, runRefinementDryRun, getLastRunResults } from './pipeline.js';
-import { rebuildProfile, updateProfile, resetProfile, serializeProfile } from './profiles.js';
+import { rebuildProfile, updateProfile, generateProfileField, resetProfile, serializeProfile } from './profiles.js';
 import { chipsHtml } from './chips.js';
 import { renderStoryTab, wireStoryTab } from './story-ui.js';
 
@@ -41,6 +41,16 @@ export async function confirmPopup(header, text) {
     const context = getContext();
     const result = await context.Popup.show.confirm(header, text);
     return result === context.POPUP_RESULT.AFFIRMATIVE;
+}
+
+/**
+ * Multi-line steering note for guided generation (single field, whole update, rebuild).
+ * Returns the entered text (possibly empty), or null when the popup was cancelled.
+ */
+export async function promptForGuide(header, text, defaultValue = '') {
+    const context = getContext();
+    const value = await context.Popup.show.input(header, text, defaultValue, { rows: 5, wide: true });
+    return typeof value === 'string' ? value : null;
 }
 
 export function appendSection(container, title, text) {
@@ -254,7 +264,7 @@ function renderActiveTab() {
 }
 
 function autoGrowAll() {
-    $panel().find('.smarttavern_step_prompt, .smarttavern_bio_value, .smarttavern_story_textarea').each(function () {
+    $panel().find('.smarttavern_step_prompt, .smarttavern_bio_value, .smarttavern_guide_value, .smarttavern_story_textarea').each(function () {
         this.style.height = 'auto';
         this.style.height = `${this.scrollHeight}px`;
     });
@@ -297,6 +307,13 @@ function buildPanelHtml() {
                 </div>
                 <div class="smarttavern_hint">
                     Edit any field above — changes save automatically. Future LLM updates merge around your edits.
+                    Use the wand on a field's header to regenerate that field alone, or the compass to add extra
+                    direction for it.
+                </div>
+                <div class="smarttavern_guide_wrap">
+                    <label for="smarttavern_profile_guide">Guidance (optional)</label>
+                    <textarea id="smarttavern_profile_guide" class="smarttavern_guide_value" rows="2"
+                        placeholder="Extra direction for the next Update / Rebuild — it refines the generation without overriding the schema or the card. Cleared once used."></textarea>
                 </div>
                 <div class="smarttavern_row_actions">
                     <a id="smarttavern_profile_update" class="menu_button smarttavern_busy_guard" title="Low-drift update from the recent conversation"><i class="fa-solid fa-arrows-rotate"></i><span>Update now</span></a>
@@ -538,8 +555,8 @@ function buildPanel() {
     wireStoryTab($panel());
     initDrag();
 
-    // Grow textareas with their content (step prompts, hand-edited bio fields).
-    $panel().on('input', '.smarttavern_step_prompt, .smarttavern_bio_value, .smarttavern_story_textarea', function () {
+    // Grow textareas with their content (step prompts, hand-edited bio fields, guidance note).
+    $panel().on('input', '.smarttavern_step_prompt, .smarttavern_bio_value, .smarttavern_guide_value, .smarttavern_story_textarea', function () {
         this.style.height = 'auto';
         this.style.height = `${this.scrollHeight}px`;
     });
@@ -717,7 +734,15 @@ function renderProfileTab() {
         if (!name) continue;
         $fields.append(`
             <div class="smarttavern_bio_field">
-                <label title="${escapeHtml(field.description ?? '')}">${escapeHtml(name)}</label>
+                <div class="smarttavern_bio_field_head">
+                    <label title="${escapeHtml(field.description ?? '')}">${escapeHtml(name)}</label>
+                    <span class="smarttavern_bio_field_actions">
+                        <a class="menu_button menu_button_icon smarttavern_field_generate smarttavern_busy_guard" data-field="${escapeHtml(name)}"
+                            title="Regenerate only this field from the card and recent chat"><i class="fa-solid fa-wand-magic-sparkles"></i></a>
+                        <a class="menu_button menu_button_icon smarttavern_field_guided smarttavern_busy_guard" data-field="${escapeHtml(name)}"
+                            title="Regenerate this field with extra direction from you"><i class="fa-solid fa-compass"></i></a>
+                    </span>
+                </div>
                 <textarea class="smarttavern_bio_value" data-field="${escapeHtml(name)}" rows="3"
                     placeholder="${escapeHtml(field.description ?? '')}" ${record ? '' : 'disabled'}>${escapeHtml(record?.fields?.[name] ?? '')}</textarea>
             </div>`);
@@ -727,7 +752,10 @@ function renderProfileTab() {
     }
 
     $panel().find('#smarttavern_profile_hint').toggle(!record);
-    $panel().find('#smarttavern_profile_update, #smarttavern_profile_rebuild').toggleClass('disabled', !char);
+    $panel()
+        .find('#smarttavern_profile_update, #smarttavern_profile_rebuild, .smarttavern_field_generate, .smarttavern_field_guided')
+        .toggleClass('disabled', !char);
+    $panel().find('#smarttavern_profile_guide').prop('disabled', !char);
 }
 
 function scheduleBioSave(key) {
@@ -736,6 +764,19 @@ function scheduleBioSave(key) {
     bioSaveTimer = setTimeout(() => {
         if (record && getStoredProfile(key) === record) setStoredProfile(key, record);
     }, 500);
+}
+
+/** One-shot guidance note from the profile tab — passed to the next manual Update/Rebuild. */
+function readProfileGuide() {
+    return String($panel().find('#smarttavern_profile_guide').val() ?? '').trim();
+}
+
+function clearProfileGuide() {
+    const el = $panel().find('#smarttavern_profile_guide').get(0);
+    if (el) {
+        el.value = '';
+        el.style.height = 'auto';
+    }
 }
 
 function wireProfileTab() {
@@ -771,12 +812,38 @@ function wireProfileTab() {
         await showContentPopup(`Profile changes · ${currentProfileChar()?.name ?? profileTabCharKey}`, container);
     });
 
+    // Field-scoped generation: plain regeneration, or guided with a steering note popup.
+    $panel().on('click', '.smarttavern_field_generate, .smarttavern_field_guided', async function () {
+        const char = currentProfileChar();
+        if (!char) return;
+        const name = String($(this).data('field') ?? '');
+        if (!name) return;
+        let guide = '';
+        if (this.classList.contains('smarttavern_field_guided')) {
+            const input = await promptForGuide(
+                `Guided generation — ${name}`,
+                `Optional extra direction for regenerating "${name}". It refines the generation without overriding the field's definition, the character card, or established facts. Leave empty for a plain regeneration.`,
+            );
+            if (input === null) return; // popup cancelled
+            guide = input;
+        }
+        try {
+            const result = await generateProfileField(char, name, { guide, notify: true });
+            if (!result) toastr.info('A profile run is already in progress for this character.', 'SmartTavern');
+        } catch (error) {
+            console.error('[SmartTavern] field generation failed', error);
+            toastr.error(`Field generation failed — ${error?.message ?? error}`, 'SmartTavern');
+        }
+    });
+
     $panel().find('#smarttavern_profile_update').on('click', async () => {
         const char = currentProfileChar();
         if (!char) return;
+        const guide = readProfileGuide();
         try {
-            const result = await updateProfile(char, { notify: true });
+            const result = await updateProfile(char, { notify: true, guide });
             if (!result) toastr.info('Update already in progress for this character.', 'SmartTavern');
+            else if (guide) clearProfileGuide();
         } catch (error) {
             console.error('[SmartTavern] profile update failed', error);
             toastr.error(`Profile update failed — ${error?.message ?? error}`, 'SmartTavern');
@@ -786,14 +853,16 @@ function wireProfileTab() {
     $panel().find('#smarttavern_profile_rebuild').on('click', async () => {
         const char = currentProfileChar();
         if (!char) return;
+        const guide = readProfileGuide();
         const confirmed = await confirmPopup(
             `Rebuild the profile for ${char.name}?`,
-            'The stored profile will be fully rewritten from the character card plus the recent conversation.',
+            'The stored profile will be fully rewritten from the character card plus the recent conversation.' + (guide ? ' Your guidance will be applied.' : ''),
         );
         if (!confirmed) return;
         try {
-            const result = await rebuildProfile(char, { notify: true });
+            const result = await rebuildProfile(char, { notify: true, guide });
             if (!result) toastr.info('Rebuild already in progress for this character.', 'SmartTavern');
+            else if (guide) clearProfileGuide();
         } catch (error) {
             console.error('[SmartTavern] profile rebuild failed', error);
             toastr.error(`Profile rebuild failed — ${error?.message ?? error}`, 'SmartTavern');

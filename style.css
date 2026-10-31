@@ -271,11 +271,50 @@
     margin: 6px 0;
 }
 
-#smarttavern_panel .smarttavern_bio_field > label {
+#smarttavern_panel .smarttavern_bio_field_head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px;
+    margin: 8px 0 2px 0;
+}
+
+#smarttavern_panel .smarttavern_bio_field_head > label {
     display: block;
     font-weight: 600;
     font-size: 0.9em;
-    margin: 8px 0 2px;
+    margin: 0;
+    cursor: help;
+}
+
+#smarttavern_panel .smarttavern_bio_field_actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    opacity: 0.8;
+}
+
+#smarttavern_panel .smarttavern_bio_field_actions .menu_button {
+    padding: 2px 6px;
+    font-size: 0.9em;
+}
+
+.smarttavern_guide_wrap {
+    margin: 10px 0 4px 0;
+}
+
+#smarttavern_panel .smarttavern_guide_wrap > label {
+    display: block;
+    font-weight: 600;
+    font-size: 0.9em;
+    margin: 8px 0 2px 0;
+}
+
+.smarttavern_guide_value {
+    width: 100%;
+    resize: vertical;
+    min-height: 44px;
+    max-height: 20vh;
 }
 
 .smarttavern_bio_value {
