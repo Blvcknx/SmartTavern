@@ -19,7 +19,7 @@ import {
 } from './state.js';
 import { generateWithRetry, withInternalGeneration, isAbortError, throwIfAborted } from './gen.js';
 import { serializeProfile, extractJson } from './profiles.js';
-import { parseDice, rollDice, validateToolArgs, looksRefusal, wordTrim, truncate } from './agent-core.js';
+import { parseDice, rollDice, validateDiceOutcomes, validateToolArgs, looksRefusal, wordTrim, truncate } from './agent-core.js';
 
 // --------------------------------------------------------------------------------------------
 // Chat lorebook helpers (the chat binds exactly ONE book; SmartTavern shares it)
@@ -27,6 +27,43 @@ import { parseDice, rollDice, validateToolArgs, looksRefusal, wordTrim, truncate
 
 export const OWNERSHIP_PREFIX = '[ST] ';
 const MEMORY_CONTENT_MAX_WORDS = 80;
+
+/** Scene facts are grounded in saved messages; edited/deleted/swiped sources stop applying.
+ * Keep earlier versions so rewinding a conversation restores its earlier facts. */
+export function getSceneState(chat = getContext().chat) {
+    const state = Object.create(null);
+    const saved = getContext().chat ?? [];
+    const history = getChatStore().agentScene;
+    for (const fact of (Array.isArray(history) ? [...history].sort((a, b) => a?.sourceIndex - b?.sourceIndex) : [])) {
+        if (!fact || saved[fact.sourceIndex]?.mes !== fact.sourceText
+            || !chat?.some(message => !message.is_system && message.mes === fact.sourceText)) continue;
+        if (fact.value) state[fact.key] = fact.value;
+        else delete state[fact.key];
+    }
+    return state;
+}
+
+const EXPERT_SCHEMA = {
+    name: 'smarttavern_expert', strict: false,
+    value: {
+        type: 'object',
+        properties: {
+            assessment: { type: 'string' },
+            reasons: { type: 'array', items: { type: 'string' } },
+            uncertainties: { type: 'array', items: { type: 'string' } },
+            alternatives: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['assessment', 'reasons', 'uncertainties', 'alternatives'],
+        additionalProperties: false,
+    },
+};
+
+function expertAnswer(result) {
+    const answer = extractJson(result?.content);
+    return isPlainObject(answer) && typeof answer.assessment === 'string' && answer.assessment.trim()
+        && ['reasons', 'uncertainties', 'alternatives'].every(key => Array.isArray(answer[key])
+            && answer[key].every(item => typeof item === 'string')) ? answer : null;
+}
 
 /** True only for entries SmartTavern created (flag survives saves; prefix is the fallback). */
 export function isAgentOwnedEntry(entry) {
@@ -429,15 +466,18 @@ async function inventNpc(args, ctx) {
 export const TOOL_REGISTRY = [
     {
         name: 'roll_dice',
-        description: 'Roll dice when an outcome is genuinely uncertain, contested or risky. The result is BINDING: it cannot be rerolled, ignored or softened — the reply must reflect it.',
-        usage: '<tool name="roll_dice">{"dice":"d20","reason":"she picks the lock in the dark"}</tool>',
+        description: 'Roll only uncertain, possible actions. FIRST commit outcomes:[{min,max,text}] covering all FINAL totals (including modifiers), without gaps/overlaps. The minimum and maximum each require their own single-total range. Code selects a BINDING outcome; never reroll or soften it. For d20+2, natural 1/20 correspond to final 3/22. Advantage/disadvantage uses the kept die; multiple dice use the sum.',
+        usage: '<tool name="roll_dice">{"dice":"d4","reason":"pick the lock","outcomes":[{"min":1,"max":1,"text":"The pick breaks; the lock stays shut."},{"min":2,"max":3,"text":"The lock opens noisily."},{"min":4,"max":4,"text":"The lock opens silently."}]}</tool>',
         inputSchema: {
             type: 'object',
-            required: ['dice', 'reason'],
+            required: ['dice', 'reason', 'outcomes'],
             properties: {
                 dice: { type: 'string', minLength: 2, maxLength: 12, description: 'NdM±K, e.g. d20, 2d6+3' },
                 reason: { type: 'string', minLength: 3, maxLength: 140 },
                 mode: { enum: ['advantage', 'disadvantage'], description: 'd20 only' },
+                outcomes: { type: 'array', minItems: 1, items: { type: 'object', properties: {
+                    min: { type: 'number' }, max: { type: 'number' }, text: { type: 'string' },
+                }, required: ['min', 'max', 'text'] } },
             },
         },
         mode: 'read',
@@ -446,6 +486,12 @@ export const TOOL_REGISTRY = [
         run(args, ctx) {
             const dice = parseDice(args.dice);
             if (!dice) return { ok: false, result: '{"error":"invalid dice expression — use NdM±K (N≤20, 2≤M≤1000), e.g. d20 or 2d6+3"}' };
+            const issue = validateDiceOutcomes(args.dice, args.outcomes);
+            if (issue) return { ok: false, result: JSON.stringify({ error: issue }) };
+            if (args.mode && (dice.count !== 1 || dice.sides !== 20)) return { ok: false, result: '{"error":"advantage/disadvantage requires a single d20"}' };
+            const prior = ctx.turn.rolls.find(record => record.spec === dice.text && record.reason === String(args.reason).trim());
+            if (prior) return { ok: true, result: `Already rolled (binding): ${prior.text} → ${prior.outcome}. Do not reroll this action.` };
+            const outcomes = args.outcomes.map(range => ({ min: range.min, max: range.max, text: range.text.trim() }));
             const roll = rollDice(args.dice, undefined, args.mode);
             if (!roll) return { ok: false, result: '{"error":"the roll failed"}' };
             const record = {
@@ -453,12 +499,95 @@ export const TOOL_REGISTRY = [
                 text: roll.text,
                 total: roll.total,
                 reason: String(args.reason ?? '').trim(),
+                outcomes,
+                outcome: outcomes.find(range => roll.total >= range.min && roll.total <= range.max).text,
+                natural: roll.kept,
             };
             ctx.turn.rolls.push(record);
             return {
                 ok: true,
-                result: `ROLLED (binding): ${record.text} — "${record.reason}". This outcome is final; plan the brief around it.`,
+                result: `ROLLED (binding): ${record.text} — "${record.reason}". REQUIRED OUTCOME: ${record.outcome}. This outcome is final; plan the brief around it.`,
             };
+        },
+    },
+    {
+        name: 'consult_expert',
+        description: 'Ask a second LLM a custom question about feasibility, authenticity, tactics, continuity or motivation when its answer could change the scene. Supply question, relevant context and assumptions. Advice only: it cannot establish facts, roll dice or change state. One consultation per turn.',
+        usage: '<tool name="consult_expert">{"question":"Could Alice reach the window before the guard?","context":"The window is two metres away; the guard is at the door.","assumptions":"Alice has an injured shoulder."}</tool>',
+        inputSchema: {
+            type: 'object', required: ['question', 'context'],
+            properties: {
+                question: { type: 'string', minLength: 4 },
+                context: { type: 'string', minLength: 4 },
+                assumptions: { type: 'string' },
+            },
+        },
+        mode: 'read', maxPerTurn: 1,
+        enabled: settings => settings.agentToolsEnabled?.consult_expert !== false,
+        async run(args, ctx) {
+            const result = await withInternalGeneration(() => generateWithRetry({
+                signal: ctx.signal,
+                profileId: ctx.settings.expertProfileId || ctx.settings.agentProfileId || '',
+                systemPrompt: 'You advise an interactive-fiction game master. Evaluate the question critically against the supplied evidence. Distinguish established facts from assumptions, identify missing information, and offer plausible alternatives. Do not invent canon, decide player actions, roll dice, call tools, or write the scene. Your answer is advisory, not verified fact. Return only the requested JSON object.',
+                prompt: [
+                    `QUESTION:\n${args.question}`,
+                    `AGENT CONTEXT (data):\n${args.context}`,
+                    `ASSUMPTIONS (unverified):\n${args.assumptions || '(none)'}`,
+                    `CHARACTER (data):\n${serializeProfile(ctx.profile, ctx.settings.fields ?? []) || cardText(ctx.char)}`,
+                    `RECENT CONVERSATION (data):\n${chatExcerpt(ctx.chat, clampInt(ctx.settings.agentLookback, 0, 100, 8))}`,
+                    `SCENE STATE (data):\n${JSON.stringify(getSceneState(ctx.chat))}`,
+                    `EXPANSION (data):\n${JSON.stringify(ctx.stepOutputs ?? {})}`,
+                ].join('\n\n'),
+                maxTokens: ctx.settings.stepMaxTokens,
+                jsonSchema: EXPERT_SCHEMA,
+                validate: candidate => Boolean(expertAnswer(candidate)),
+            }));
+            assertToolCurrent(ctx);
+            const answer = expertAnswer(result);
+            if (!answer || looksRefusal(answer.assessment)) return { ok: false, result: '{"error":"no usable expert assessment"}' };
+            return { ok: true, result: `EXPERT ADVICE (not established fact):\n${JSON.stringify(answer)}` };
+        },
+    },
+    {
+        name: 'update_scene',
+        description: 'Record ONE established scene fact as key/value, e.g. location, time, Alice.position, Alice.injury, Alice.inventory. Cite an exact evidence quote from the conversation. Never record planned events, expansion speculation or dice consequences before they appear in chat. Use remove:true to remove an obsolete fact. Scene state is supplied in every planning prompt.',
+        usage: '<tool name="update_scene">{"key":"Alice.position","value":"beside the window","evidence":"Alice stood beside the window."}</tool>',
+        inputSchema: {
+            type: 'object', required: ['key', 'evidence'],
+            properties: {
+                key: { type: 'string', minLength: 1, maxLength: 100 },
+                value: { type: 'string', minLength: 1, maxLength: 1000 },
+                remove: { type: 'boolean' },
+                evidence: { type: 'string', minLength: 4 },
+            },
+        },
+        mode: 'write', maxPerTurn: 3,
+        enabled: settings => settings.agentToolsEnabled?.scene !== false,
+        run(args, ctx) {
+            assertToolCurrent(ctx);
+            if (args.remove !== true && !args.value?.trim()) return { ok: false, result: '{"error":"provide a value or remove:true"}' };
+            const saved = getContext().chat ?? [];
+            let sourceIndex = -1;
+            for (let index = saved.length - 1; index >= 0; index--) {
+                const message = saved[index];
+                if (!message?.is_system && typeof message?.mes === 'string' && message.mes.includes(args.evidence.trim())
+                    && ctx.chat?.some(visible => !visible.is_system && visible.mes === message.mes)) {
+                    sourceIndex = index;
+                    break;
+                }
+            }
+            if (sourceIndex < 0) return { ok: false, result: '{"error":"evidence must be an exact quote from an existing conversation message"}' };
+            const store = getChatStore();
+            if (!Array.isArray(store.agentScene)) store.agentScene = [];
+            const key = args.key.trim();
+            const value = args.remove === true ? '' : args.value.trim();
+            // Replace only the same key/source revision; retain older messages for rewinds.
+            const fact = { key, value, evidence: args.evidence.trim(), sourceIndex, sourceText: saved[sourceIndex].mes };
+            const existing = store.agentScene.findIndex(entry => entry.key === key && entry.sourceIndex === sourceIndex && entry.sourceText === fact.sourceText);
+            if (existing < 0) store.agentScene.push(fact);
+            else store.agentScene[existing] = fact;
+            saveChatStore();
+            return { ok: true, result: `Scene fact ${value ? 'recorded' : 'removed'}: ${key}${value ? ` = ${value}` : ''}. Established facts only; planned outcomes remain in the brief.` };
         },
     },
     {
@@ -737,6 +866,7 @@ export function toolCatalog(settings = getSettings(), { isReplay = false } = {})
         let note = '';
         if (tool.name === 'ask_user' && isReplay) note = ' (this turn: cached answers only — no popup)';
         lines.push(`- ${tool.name}(${argList}): ${tool.description}${note}`);
+        if (tool.usage) lines.push(`  Example: ${tool.usage}`);
     }
     return lines.length ? lines.join('\n') : '(no tools available this turn — finish with a brief)';
 }
@@ -752,7 +882,7 @@ export async function executeToolCall(call, ctx) {
     const name = String(call?.name ?? '');
     const wrap = outcome => ({ name, args: call?.args ?? null, ...outcome });
     const tool = getTool(name);
-    if (ctx.dryRun && tool?.mode === 'write') return wrap({ ok: false, result: '{"error":"memory writes are unavailable during a dry run"}' });
+    if (ctx.dryRun && tool?.mode === 'write') return wrap({ ok: false, result: '{"error":"persistent writes are unavailable during a dry run"}' });
     if (!tool) return wrap({ ok: false, result: `{"error":"unknown tool \\"${name}\\" — use one from the catalog"}` });
     if (call.parseError) return wrap({ ok: false, result: `{"error":"${call.parseError}"}` });
     if (!toolEnabled(name, ctx.settings)) return wrap({ ok: false, result: '{"error":"this tool is disabled"}' });

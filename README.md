@@ -177,6 +177,38 @@ completed rolls and answers. Armed mode is triggered by **Think next reply** or
 `/smarttavern-memory` lists agent memories. Memory changes are undoable in the Agent
 tab. Dry runs cannot write memory or consume the armed flag.
 
+The agent receives complete expansion outputs and retains its last thought in full.
+The activity log and transcript show returned reasoning, including the separate
+reasoning channel when provided by the connection. The timeout defaults to **0
+(unlimited)**; set a positive millisecond value in the Agent tab to impose a deadline.
+Existing installations using the former 90-second default migrate to unlimited once;
+custom deadlines are preserved. **Skip thinking** and Stop remain available.
+
+The agent has three GM capabilities:
+
+- **Committed dice outcomes:** `roll_dice` requires `outcomes: [{min, max, text}]`
+  covering every possible final total, including modifiers, without gaps or overlaps.
+  The minimum and maximum each need their own single-total range. Code rolls and
+  selects the binding consequence; that consequence reaches the brief, `{{rolls}}`,
+  and reply enforcement without word trimming. Advantage/disadvantage uses the kept
+  d20; multiple dice use their sum. `/smarttavern-roll` remains an informational roll.
+- **Scene state:** `update_scene` stores one key/value fact with an exact conversation
+  quote as evidence. Use keys such as `location`, `time`, `Alice.position`, or
+  `Alice.inventory`; `remove: true` removes an obsolete fact. These facts persist in
+  chat metadata and appear in planning prompts and the Agent tab. Planned events and
+  unplayed dice consequences must wait until established in chat. Facts from edited,
+  deleted or replaced source messages stop applying; earlier recorded versions can
+  apply again when rewinding. Dry runs cannot persist changes.
+- **Custom consultation:** `consult_expert` sends a question, context and optional
+  assumptions to another LLM call, alongside character, conversation, expansion and
+  scene context. It returns an assessment, reasons, uncertainties and alternatives.
+  Advice does not automatically become canon or a binding event, and the consultant
+  cannot call tools. The Agent tab offers an optional expert connection profile
+  (otherwise it uses the agent profile). At most one consultation runs per turn.
+
+All three capabilities have tool switches in the Agent tab. Scene updates are
+limited to three per turn and share the existing total tool-call budget.
+
 Thinking adds up to the configured number of planning calls, plus character/NPC
 consults and retries. Use Armed mode to control latency. `npm test` runs the complete
 suite. See [the thinking-agent audit](THINKING_AGENT_AUDIT.md) for verification details

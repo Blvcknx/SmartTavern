@@ -198,9 +198,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
     agentMode: 'always',                     // 'off' | 'always' | 'armed' (one-shot)
     agentProfileId: '',                      // Connection Manager profile for the loop
     innerVoiceProfileId: '',                 // consult_character calls ('' = agent profile)
+    expertProfileId: '',                     // consult_expert calls ('' = agent profile)
     agentMaxIterations: 3,
     agentMaxToolCalls: 6,
-    agentTimeoutMs: 90000,                   // pauses while an ask_user popup is open
+    agentTimeoutMs: 0,                       // 0 = unlimited; pauses while an ask_user popup is open
     agentLookback: 8,                        // chat messages the agent sees
     agentBriefMaxWords: 130,
     agentAskUser: true,
@@ -211,6 +212,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
     agentToolsEnabled: {
         roll_dice: true,
         consult_character: true,
+        consult_expert: true,
+        scene: true,
         ask_user: true,
         introduce_npc: true,
         memory: true,
@@ -399,7 +402,7 @@ function normalizeSettings(settings) {
         settings.agentMode = 'always';
         changed = true;
     }
-    for (const key of ['agentProfileId', 'innerVoiceProfileId']) {
+    for (const key of ['agentProfileId', 'innerVoiceProfileId', 'expertProfileId']) {
         if (typeof settings[key] !== 'string') {
             settings[key] = '';
             changed = true;
@@ -408,7 +411,7 @@ function normalizeSettings(settings) {
     for (const [key, min, max, fallback] of [
         ['agentMaxIterations', 1, 8, 3],
         ['agentMaxToolCalls', 1, 24, 6],
-        ['agentTimeoutMs', 5000, 600000, 90000],
+        ['agentTimeoutMs', 0, 600000, 0],
         ['agentLookback', 0, 100, 8],
         ['agentBriefMaxWords', 40, 400, 130],
         ['agentAskPerTurn', 0, 3, 1],
@@ -430,11 +433,17 @@ function normalizeSettings(settings) {
         changed = true;
     }
     if (!isPlainObject(settings.agentToolsEnabled)) settings.agentToolsEnabled = {};
-    for (const tool of ['roll_dice', 'consult_character', 'ask_user', 'introduce_npc', 'memory']) {
+    for (const tool of ['roll_dice', 'consult_character', 'consult_expert', 'scene', 'ask_user', 'introduce_npc', 'memory']) {
         if (typeof settings.agentToolsEnabled[tool] !== 'boolean') {
             settings.agentToolsEnabled[tool] = true;
             changed = true;
         }
+    }
+    // Replace the old default deadline once; preserve custom deadlines and future edits.
+    if (settings.agentTimeoutVersion !== 1) {
+        if (settings.agentTimeoutMs === 90000) settings.agentTimeoutMs = 0;
+        settings.agentTimeoutVersion = 1;
+        changed = true;
     }
     // Raise persisted token caps (formerly 5000) so long outputs — revised replies,
     // expansion step payloads — are no longer cropped mid-generation.

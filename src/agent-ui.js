@@ -9,7 +9,7 @@
 import { getSettings, saveSettings } from './state.js';
 import { isAgentArmed, armAgent, isAgentBusy, getLastBrief, getLastTranscript } from './agent.js';
 import {
-    TOOL_REGISTRY, toolEnabled, memoryLog, undoMemoryLogEntry, listAgentOwnedEntries,
+    TOOL_REGISTRY, toolEnabled, memoryLog, undoMemoryLogEntry, listAgentOwnedEntries, getSceneState,
 } from './agent-tools.js';
 import { profileOptionsHtml } from './panel.js';
 
@@ -30,6 +30,8 @@ function coerceNumber(el, current) {
 const TOOL_LABELS = {
     roll_dice: 'Dice (roll_dice) — binding rolls when outcomes are uncertain',
     consult_character: 'Character consult (consult_character) — inner voice: feel / react / backstory',
+    consult_expert: 'Expert consult (consult_expert) — a custom question to a second LLM',
+    scene: 'Scene state (update_scene) — established positions, injuries, inventory and time',
     ask_user: 'Ask the user (ask_user) — one popup when a decision is truly theirs',
     introduce_npc: 'Introduce NPC (introduce_npc) — invent + persist a recurring side character',
     memory: 'Memory (search / create / update / delete) — durable facts in the chat lorebook',
@@ -73,7 +75,7 @@ export function renderAgentTab() {
     $root.html(`
         <div class="smarttavern_hint">
             Before every reply a thinking agent plans the turn: cheap LLM iterations with local
-            tools (dice, character consult, ask-user, NPC intro, chat-lorebook memory), finished
+            tools (dice, consultations, scene state, ask-user, NPC intro, chat-lorebook memory), finished
             by a short <b>Turn Brief</b> injected into the reply prompt. The reply model never
             sees the agent's reasoning — only the brief.
         </div>
@@ -103,6 +105,9 @@ export function renderAgentTab() {
         </label>
 
         <div class="smarttavern_steps_section_title"><i class="fa-solid fa-toolbox"></i><span>Tools</span></div>
+        <label title="Connection profile for consult_expert; empty uses the agent profile">Expert connection profile
+            <select id="smarttavern_expertProfileId" class="smarttavern_profile_select">${profileOptionsHtml(settings.expertProfileId ?? '')}</select>
+        </label>
         ${Object.entries(TOOL_LABELS).map(([key, label]) => `
         <label class="checkbox" title="${escapeHtml(label)}">
             <input class="smarttavern_agent_tool" data-tool="${escapeHtml(key)}" type="checkbox" ${settings.agentToolsEnabled?.[key] !== false ? 'checked' : ''}>
@@ -124,8 +129,8 @@ export function renderAgentTab() {
             <label title="Total tool calls allowed per turn">Max tool calls
                 <input id="smarttavern_agentMaxToolCalls" class="text_margin_input" type="number" min="1" max="24" step="1" value="${settings.agentMaxToolCalls}">
             </label>
-            <label title="Wall-clock budget; pauses while an ask-user popup is open">Timeout (ms)
-                <input id="smarttavern_agentTimeoutMs" class="text_margin_input" type="number" min="5000" max="600000" step="5000" value="${settings.agentTimeoutMs}">
+            <label title="0 disables the deadline. A positive budget pauses while an ask-user popup is open.">Timeout (ms; 0 = unlimited)
+                <input id="smarttavern_agentTimeoutMs" class="text_margin_input" type="number" min="0" max="600000" step="5000" value="${settings.agentTimeoutMs}">
             </label>
             <label title="Chat messages the agent sees as context">Chat lookback
                 <input id="smarttavern_agentLookback" class="text_margin_input" type="number" min="0" max="100" step="1" value="${settings.agentLookback}">
@@ -143,6 +148,8 @@ export function renderAgentTab() {
 
         <div class="smarttavern_steps_section_title"><i class="fa-solid fa-file-lines"></i><span>Last Turn Brief</span></div>
         <pre id="smarttavern_agent_brief" class="smarttavern_story_directive">${escapeHtml(brief || '(no brief compiled yet — send a message)')}</pre>
+        <div class="smarttavern_steps_section_title"><i class="fa-solid fa-map-pin"></i><span>Scene state</span></div>
+        <pre class="smarttavern_story_directive">${escapeHtml(JSON.stringify(getSceneState(), null, 2))}</pre>
 
         <div class="smarttavern_steps_section_title"><i class="fa-solid fa-list"></i><span>Last thinking transcript</span></div>
         <div id="smarttavern_agent_transcript">${transcriptHtml}</div>
@@ -195,6 +202,11 @@ export function wireAgentTab($rootPanel) {
 
     $panel.on('change', '#smarttavern_innerVoiceProfileId', function () {
         getSettings().innerVoiceProfileId = String(this.value ?? '');
+        saveSettings();
+    });
+
+    $panel.on('change', '#smarttavern_expertProfileId', function () {
+        getSettings().expertProfileId = String(this.value ?? '');
         saveSettings();
     });
 

@@ -223,7 +223,9 @@ export function turnMustList(storyMust = null) {
     const agent = agentTurnRequirements();
     items.push(...agent.must);
     for (const roll of agent.rolls) {
-        items.push(`the outcome of the dice roll (${roll.spec ?? ''}${roll.spec ? ' ' : ''}${roll.text}) is reflected in what happens`);
+        items.push(roll.outcome
+            ? `Binding dice outcome (${roll.text}): ${roll.outcome}`
+            : `the outcome of the dice roll (${roll.spec ?? ''}${roll.spec ? ' ' : ''}${roll.text}) is reflected in what happens`);
     }
     return items.filter(Boolean);
 }

@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { SourceTextModule, createContext } from 'node:vm';
 
-async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0, realAgent = false, directive = null } = {}) {
+async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0, realAgent = false, directive = null, clock = null } = {}) {
     const requests = [];
     const savedChat = [{ is_user: true, name: 'User', mes: 'Hello' }];
     const listeners = new Map();
@@ -22,7 +22,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
             emit(type, ...args) { for (const fn of [...(listeners.get(type) ?? [])]) fn(...args); },
         },
         extensionSettings: { smarttavern: { genRetries: 0, bootstrapOnFirstMessage: false, promptTailVersion: 1, injectAnchor: 'before-last-user', ...settings }, connectionManager: { profiles: [{ id: 'model', mode: 'cc' }] } },
-        chat: savedChat, chatMetadata: {}, characterId: 0, chatId: 'test-chat',
+        chat: savedChat, chatMetadata: {}, characterId: 0, chatId: 'test-chat', activityEntries: [],
         characters: [{ name: 'Alice', avatar: 'alice.png' }], name1: 'User', name2: 'Alice',
         saveSettingsDebounced() {}, substituteParams: text => text,
         saveMetadata() {}, saveMetadataDebounced() {}, saveChat: async () => {}, updateMessageBlock() {},
@@ -33,6 +33,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         generateRaw: async options => { requests.push(options); return 'ACTIVE OUTPUT'; },
     };
     const sandbox = createContext({ context, AbortController, DOMException, setTimeout, clearTimeout, structuredClone, crypto: globalThis.crypto, console: { log() {}, warn() {} }, toastr: { warning() {}, info() {}, success() {} },
+        ...(clock ? { Date: class extends Date { static now() { return clock.now; } } } : {}),
         document: { dispatchEvent() {}, createElement() { return { children: [], append(...children) { this.children.push(...children); } }; } }, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
     });
     const modules = new Map();
@@ -40,7 +41,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         extensions: 'export const getContext = () => context;',
         'system-messages': "export const system_message_types = { NARRATOR: 'narrator' };",
         'instruct-mode': `export const formatInstructModeChat = (name, text, user, system) => '<' + (system ? 'system' : user ? 'user' : 'assistant') + '>' + text + '</turn>\\n'; export const formatInstructModePrompt = () => '<assistant>';`,
-        progress: 'export const activityStart = () => {}; export const activityStatus = () => {}; export const activityEntry = () => {}; export const activityFail = () => {}; export const activityEnd = () => {}; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
+        progress: 'export const activityStart = () => {}; export const activityStatus = () => {}; export const activityEntry = entry => { context.activityEntries.push(entry); }; export const activityFail = () => {}; export const activityEnd = () => {}; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
         veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = () => {}; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const armPreVeil = () => {};`,
         // Story Director stub: no chat in these tests carries a story, so the whole
         // feature must stay inert. The no-ops mirror story.js's no-story behavior.
@@ -86,6 +87,188 @@ const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profil
 
 const agentSettings = { expansionEnabled: false, agentProfileId: 'model', agentMode: 'always' };
 const agentOptions = h => ({ chat: [...h.savedChat], char: h.context.characters[0], settings: h.state.getSettings() });
+const lockOutcomes = [
+    { min: 1, max: 1, text: 'The pick breaks; the lock stays shut.' },
+    { min: 2, max: 19, text: 'The lock opens noisily.' },
+    { min: 20, max: 20, text: 'The lock opens silently.' },
+];
+const lockRoll = `<tool name="roll_dice">${JSON.stringify({ dice: 'd20', reason: 'Pick the lock', outcomes: lockOutcomes })}</tool>`;
+
+test('dice reject incomplete stakes before rolling and select only a committed consequence', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    const ctx = { ...agentOptions(h), toolState: {}, turn: { rolls: [] } };
+    const call = args => h.tools.executeToolCall({ name: 'roll_dice', args }, ctx);
+    assert.equal((await call({ dice: 'd20', reason: 'Pick the lock' })).ok, false);
+    assert.equal((await call({ dice: 'd20', reason: 'Pick the lock', outcomes: lockOutcomes.slice(1) })).ok, false);
+    assert.equal(ctx.turn.rolls.length, 0);
+    const result = await call({ dice: 'd20', reason: 'Pick the lock', outcomes: lockOutcomes });
+    assert.equal(result.ok, true);
+    const record = ctx.turn.rolls[0];
+    const selected = lockOutcomes.find(row => record.total >= row.min && record.total <= row.max);
+    assert.equal(record.outcome, selected.text);
+    assert.ok(result.result.includes(selected.text));
+    assert.equal(record.outcomes.length, 3);
+});
+
+test('binding dice consequences survive Skip and reach enforcement requirements', async () => {
+    const pending = deferred();
+    const h = await harness(agentSettings, async (_messages, index) => {
+        if (index === 1) return { content: lockRoll };
+        pending.resolve();
+        return new Promise(() => {});
+    }, { realAgent: true });
+    const run = h.agent.runAgentLoop(agentOptions(h));
+    await pending.promise;
+    h.context.agentControls.onSkip();
+    const result = await run;
+    const outcome = result.turn.rolls[0].outcome;
+    assert.ok(result.brief.includes(outcome));
+    assert.ok(h.pipeline.turnMustList().some(item => item.includes(outcome)));
+});
+
+test('expert consultation uses its chosen profile, receives context and returns advisory data only', async () => {
+    const answer = { assessment: 'Possible with a delay.', reasons: ['The window is near.'], uncertainties: ['The guard may already be moving.'], alternatives: ['Stay behind cover.'] };
+    const h = await harness({ ...agentSettings, expertProfileId: 'expert' }, async () => ({ content: JSON.stringify(answer) }), { realAgent: true });
+    h.context.extensionSettings.connectionManager.profiles.push({ id: 'expert', mode: 'cc' });
+    const ctx = { ...agentOptions(h), stepOutputs: { Assessment: 'Alice has an injured shoulder.' }, toolState: {}, turn: {} };
+    const call = { name: 'consult_expert', args: { question: 'Could Alice reach the window?', context: 'The window is two metres away.', assumptions: 'The guard starts at the door.' } };
+    const result = await h.tools.executeToolCall(call, ctx);
+    assert.equal(result.ok, true);
+    assert.match(result.result, /EXPERT ADVICE \(not established fact\)/);
+    assert.equal(h.requests[0].id, 'expert');
+    const prompt = h.requests[0].messages.map(message => message.content).join('\n');
+    for (const text of [call.args.question, call.args.context, call.args.assumptions, ctx.stepOutputs.Assessment]) assert.ok(prompt.includes(text));
+    assert.equal(JSON.stringify(ctx.turn), '{}');
+    assert.equal(JSON.stringify(h.tools.getSceneState()), '{}');
+    assert.equal((await h.tools.executeToolCall(call, ctx)).ok, false);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.tools.toolEnabled('consult_expert', { agentToolsEnabled: { consult_expert: false } }), false);
+});
+
+test('expert advice is retained in the next iteration without becoming a binding event', async () => {
+    const advice = 'Consider the distance and the guard movement. '.repeat(40) + 'ADVICE END';
+    const h = await harness(agentSettings, async (_messages, index) => ({ content: index === 1
+        ? '<tool name="consult_expert">{"question":"Can Alice escape?","context":"There is a window nearby."}</tool>'
+        : index === 2 ? JSON.stringify({ assessment: advice, reasons: [], uncertainties: [], alternatives: [] })
+            : '<brief><must>Alice looks toward the window.</must></brief>' }), { realAgent: true });
+    const result = await h.agent.runAgentLoop(agentOptions(h));
+    assert.ok(h.requests[2].messages.some(message => message.content.includes(advice)));
+    assert.ok(!result.brief.includes(advice));
+    assert.equal(h.requests[1].id, 'model');
+});
+
+test('scene state persists established facts, supports removal and restores older facts on rewind', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    h.savedChat[0].mes = 'Alice stands beside the door.';
+    const ctx = { ...agentOptions(h), chat: h.savedChat, toolState: {}, turn: {} };
+    const update = args => h.tools.executeToolCall({ name: 'update_scene', args }, ctx);
+    assert.equal((await update({ key: 'Alice.position', value: 'beside the door', evidence: h.savedChat[0].mes })).ok, true);
+    h.savedChat.push({ is_user: false, mes: 'Alice moves to the window.' });
+    assert.equal((await update({ key: 'Alice.position', value: 'beside the window', evidence: h.savedChat[1].mes })).ok, true);
+    assert.equal(h.tools.getSceneState()['Alice.position'], 'beside the window');
+    // Metadata survives serialization; source edits/swipes make that revision inapplicable.
+    h.context.chatMetadata = JSON.parse(JSON.stringify(h.context.chatMetadata));
+    ctx.isCurrentChat = h.state.captureChatScope();
+    h.savedChat[1].mes = 'Alice stays beside the door.';
+    assert.equal(h.tools.getSceneState()['Alice.position'], 'beside the door');
+    h.savedChat[1].mes = 'Alice moves to the window.';
+    assert.equal(h.tools.getSceneState()['Alice.position'], 'beside the window');
+    h.savedChat.push({ is_user: true, mes: 'Alice leaves the room.' });
+    assert.equal((await update({ key: 'Alice.position', remove: true, evidence: h.savedChat[2].mes })).ok, true);
+    assert.equal(h.tools.getSceneState()['Alice.position'], undefined);
+    h.savedChat.splice(1);
+    assert.equal(h.tools.getSceneState()['Alice.position'], 'beside the door');
+    h.context.chatMetadata = {};
+    assert.equal(JSON.stringify(h.tools.getSceneState()), '{}');
+});
+
+test('scene updates reject invented evidence and cannot persist in dry runs or disabled tools', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    const ctx = { ...agentOptions(h), toolState: {}, turn: {} };
+    const call = { name: 'update_scene', args: { key: 'location', value: 'courtyard', evidence: 'A planned event that has not happened.' } };
+    assert.equal((await h.tools.executeToolCall(call, ctx)).ok, false);
+    call.args.evidence = 'Hello';
+    assert.equal((await h.tools.executeToolCall(call, { ...ctx, dryRun: true })).ok, false);
+    h.state.getSettings().agentToolsEnabled.scene = false;
+    assert.equal((await h.tools.executeToolCall(call, ctx)).ok, false);
+    assert.equal(JSON.stringify(h.tools.getSceneState()), '{}');
+});
+
+test('new scene facts appear in the next planning prompt and persist across agent runs', async () => {
+    const h = await harness(agentSettings, async (_messages, index) => ({ content: index === 1
+        ? '<tool name="update_scene">{"key":"Alice.position","value":"beside the door","evidence":"Alice stands beside the door."}</tool>'
+        : '<brief><must>Alice watches the door.</must></brief>' }), { realAgent: true });
+    h.savedChat[0].mes = 'Alice stands beside the door.';
+    await h.agent.runAgentLoop(agentOptions(h));
+    assert.ok(h.requests[1].messages.some(message => message.content.includes('"Alice.position":"beside the door"')));
+    await h.agent.runAgentLoop(agentOptions(h));
+    assert.ok(h.requests[2].messages.some(message => message.content.includes('"Alice.position":"beside the door"')));
+});
+
+test('agent preserves full expansion context and reasoning in the display and following iteration', async () => {
+    const expansion = 'Detailed assessment of the scene. '.repeat(100) + 'EXPANSION END: the key is under the rug.';
+    const native = 'Considering the position of the key and the locked door. '.repeat(30) + 'NATIVE END';
+    const taggedThought = 'Alice needs to check the rug before trying the lock. '.repeat(30) + 'THOUGHT END';
+    const h = await harness({ ...agentSettings, expansionEnabled: true, steps: [step('Assessment', 'Assess this scene')] },
+        async (_messages, index) => index === 1 ? { content: expansion } : index === 2
+            ? { reasoning: native, content: `<think>${taggedThought}</think>${lockRoll}` }
+            : { content: '<brief><must>Alice looks under the rug.</must></brief>' }, { realAgent: true });
+    const result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    for (const request of h.requests.slice(1)) {
+        const prompt = request.messages.map(message => message.content).join('\n');
+        assert.ok(prompt.includes('[EXPANSION'));
+        assert.ok(prompt.includes(expansion));
+    }
+    const fullThought = `${native}\n\n${taggedThought}`;
+    assert.ok(h.requests[2].messages.some(message => message.content.includes(fullThought)));
+    assert.equal(result.agentTranscript.find(entry => entry.title === 'Agent thought · iteration 1').text, fullThought);
+    assert.equal(h.context.activityEntries.find(entry => entry.title === 'Agent thought · iteration 1').text, fullThought);
+});
+
+test('agent displays native reasoning when no think tag is returned', async () => {
+    const h = await harness(agentSettings, async () => ({ reasoning: 'The door is open, so Alice can enter.', content: '<brief><must>Alice enters.</must></brief>' }), { realAgent: true });
+    const result = await h.agent.runAgentLoop(agentOptions(h));
+    assert.equal(result.transcript[0].text, 'The door is open, so Alice can enter.');
+});
+
+test('agent waits beyond the old default deadline and can finish another iteration', async () => {
+    const clock = { now: 1000 };
+    const h = await harness(agentSettings, async (_messages, index) => {
+        clock.now += 120000;
+        return { content: index === 1 ? '<think>The key may be hidden under the rug.</think>' : '<brief><must>Alice checks the rug.</must></brief>' };
+    }, { realAgent: true, clock });
+    assert.equal(h.state.getSettings().agentTimeoutMs, 0);
+    const result = await h.agent.runAgentLoop(agentOptions(h));
+    assert.equal(h.requests.length, 2);
+    assert.match(result.brief, /Alice checks the rug/);
+    assert.ok(result.transcript.every(entry => !entry.title.includes('timeout')));
+});
+
+test('agent migrates the old default deadline once and preserves custom timeouts', async () => {
+    for (const [saved, expected] of [[90000, 0], [45000, 45000], [0, 0]]) {
+        const h = await harness({ ...agentSettings, agentTimeoutMs: saved });
+        assert.equal(h.state.getSettings().agentTimeoutMs, expected);
+        h.state.getSettings().agentTimeoutMs = 90000;
+        h.state.loadSettings();
+        assert.equal(h.state.getSettings().agentTimeoutMs, 90000);
+    }
+});
+
+test('a configured agent deadline still cancels a pending response', async () => {
+    const clock = { now: 1000 };
+    const opened = deferred();
+    const h = await harness({ ...agentSettings, agentTimeoutMs: 5000 }, async () => {
+        clock.now += 6000;
+        opened.resolve();
+        return new Promise(() => {});
+    }, { realAgent: true, clock });
+    const run = h.agent.runAgentLoop(agentOptions(h));
+    await opened.promise;
+    const result = await run;
+    assert.ok(h.requests[0].signal.aborted);
+    assert.ok(result.transcript.some(entry => entry.title.includes('Agent timeout')));
+    assert.equal(h.agent.isAgentBusy(), false);
+});
 
 test('real agent runs without expansion and injects only the brief into the chat copy', async () => {
     const h = await harness(agentSettings, async () => ({ content: '<think>PRIVATE THOUGHT</think><brief><must>Alice opens the door.</must></brief>' }), { realAgent: true });
@@ -102,7 +285,7 @@ test('real agent runs without expansion and injects only the brief into the chat
 });
 
 test('real agent enforces the total tool budget within one response', async () => {
-    const calls = Array.from({ length: 3 }, () => '<tool name="roll_dice">{"dice":"d20","reason":"Pick the lock"}</tool>').join('\n');
+    const calls = Array.from({ length: 3 }, () => lockRoll).join('\n');
     const h = await harness({ ...agentSettings, agentMaxToolCalls: 1 }, async (_messages, index) => ({ content: index === 1 ? calls : '<brief><must>Alice checks the lock.</must></brief>' }), { realAgent: true });
     const result = await h.agent.runAgentLoop(agentOptions(h));
     assert.equal(result.turn.toolCalls, 1);
@@ -182,7 +365,7 @@ test('memory confirmation closes on stop and cannot commit afterward', async () 
 test('skip thinking preserves completed binding rolls while discarding the pending model output', async () => {
     const opened = deferred(), late = deferred();
     const h = await harness(agentSettings, async (_messages, index) => {
-        if (index === 1) return { content: '<tool name="roll_dice">{"dice":"d20","reason":"Pick the lock"}</tool>' };
+        if (index === 1) return { content: lockRoll };
         opened.resolve();
         return late.promise;
     }, { realAgent: true });
@@ -199,7 +382,7 @@ test('skip thinking preserves completed binding rolls while discarding the pendi
 
 test('tool-and-brief output is retained as fallback when the final iteration cannot finish', async () => {
     const h = await harness({ ...agentSettings, agentMaxIterations: 2 }, async (_messages, index) => ({ content: index === 1
-        ? '<tool name="roll_dice">{"dice":"d20","reason":"Pick the lock"}</tool><brief><must>Alice checks the lock.</must></brief>'
+        ? `${lockRoll}<brief><must>Alice checks the lock.</must></brief>`
         : 'no protocol' }), { realAgent: true });
     const result = await h.agent.runAgentLoop(agentOptions(h));
     assert.match(result.brief, /Alice checks the lock/);
