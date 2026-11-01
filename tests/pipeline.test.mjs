@@ -182,12 +182,25 @@ test('scene state persists established facts, supports removal and restores olde
     assert.equal(JSON.stringify(h.tools.getSceneState()), '{}');
 });
 
-test('scene updates reject invented evidence and cannot persist in dry runs or disabled tools', async () => {
+test('scene updates accept paraphrased or omitted evidence and retain revision tracking', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    h.savedChat[0].mes = 'Alice stands beside the door.';
+    const ctx = { ...agentOptions(h), chat: h.savedChat, toolState: {}, turn: {} };
+    const update = args => h.tools.executeToolCall({ name: 'update_scene', args }, ctx);
+    assert.equal((await update({ key: 'Alice.position', value: 'beside the door', evidence: 'Alice is by the entrance.' })).ok, true);
+    h.savedChat.push({ is_user: false, mes: 'Alice moves to the window.' });
+    assert.equal((await update({ key: 'Alice.position', value: 'beside the window' })).ok, true);
+    assert.equal(h.tools.getSceneState()['Alice.position'], 'beside the window');
+    h.savedChat.splice(1);
+    assert.equal(h.tools.getSceneState()['Alice.position'], 'beside the door');
+    assert.equal((await update({ key: 'Alice.position', remove: true })).ok, true);
+    assert.equal(h.tools.getSceneState()['Alice.position'], undefined);
+});
+
+test('scene updates cannot persist in dry runs or disabled tools', async () => {
     const h = await harness(agentSettings, undefined, { realAgent: true });
     const ctx = { ...agentOptions(h), toolState: {}, turn: {} };
-    const call = { name: 'update_scene', args: { key: 'location', value: 'courtyard', evidence: 'A planned event that has not happened.' } };
-    assert.equal((await h.tools.executeToolCall(call, ctx)).ok, false);
-    call.args.evidence = 'Hello';
+    const call = { name: 'update_scene', args: { key: 'location', value: 'courtyard' } };
     assert.equal((await h.tools.executeToolCall(call, { ...ctx, dryRun: true })).ok, false);
     h.state.getSettings().agentToolsEnabled.scene = false;
     assert.equal((await h.tools.executeToolCall(call, ctx)).ok, false);

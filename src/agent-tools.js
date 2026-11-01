@@ -550,15 +550,15 @@ export const TOOL_REGISTRY = [
     },
     {
         name: 'update_scene',
-        description: 'Record ONE established scene fact as key/value, e.g. location, time, Alice.position, Alice.injury, Alice.inventory. Cite an exact evidence quote from the conversation. Never record planned events, expansion speculation or dice consequences before they appear in chat. Use remove:true to remove an obsolete fact. Scene state is supplied in every planning prompt.',
+        description: 'Record ONE established scene fact as key/value, e.g. location, time, Alice.position, Alice.injury, Alice.inventory. Optional evidence may be a quote or a short explanation; exact quotation is not required. Never record planned events, expansion speculation or dice consequences before they appear in chat. Use remove:true to remove an obsolete fact. Scene state is supplied in every planning prompt.',
         usage: '<tool name="update_scene">{"key":"Alice.position","value":"beside the window","evidence":"Alice stood beside the window."}</tool>',
         inputSchema: {
-            type: 'object', required: ['key', 'evidence'],
+            type: 'object', required: ['key'],
             properties: {
                 key: { type: 'string', minLength: 1, maxLength: 100 },
                 value: { type: 'string', minLength: 1, maxLength: 1000 },
                 remove: { type: 'boolean' },
-                evidence: { type: 'string', minLength: 4 },
+                evidence: { type: 'string', description: 'Optional supporting quote or explanation; paraphrases are accepted.' },
             },
         },
         mode: 'write', maxPerTurn: 3,
@@ -567,22 +567,30 @@ export const TOOL_REGISTRY = [
             assertToolCurrent(ctx);
             if (args.remove !== true && !args.value?.trim()) return { ok: false, result: '{"error":"provide a value or remove:true"}' };
             const saved = getContext().chat ?? [];
+            const evidence = args.evidence?.trim() ?? '';
             let sourceIndex = -1;
+            let latestIndex = -1;
             for (let index = saved.length - 1; index >= 0; index--) {
                 const message = saved[index];
-                if (!message?.is_system && typeof message?.mes === 'string' && message.mes.includes(args.evidence.trim())
+                if (!message?.is_system && typeof message?.mes === 'string'
                     && ctx.chat?.some(visible => !visible.is_system && visible.mes === message.mes)) {
-                    sourceIndex = index;
-                    break;
+                    if (latestIndex < 0) latestIndex = index;
+                    if (evidence && message.mes.includes(evidence)) {
+                        sourceIndex = index;
+                        break;
+                    }
                 }
             }
-            if (sourceIndex < 0) return { ok: false, result: '{"error":"evidence must be an exact quote from an existing conversation message"}' };
+            // Prefer a quoted source when available; otherwise anchor to the current
+            // conversation revision so paraphrases and omitted evidence support rewinds.
+            if (sourceIndex < 0) sourceIndex = latestIndex;
+            if (sourceIndex < 0) return { ok: false, result: '{"error":"no conversation message available to attach the scene update to"}' };
             const store = getChatStore();
             if (!Array.isArray(store.agentScene)) store.agentScene = [];
             const key = args.key.trim();
             const value = args.remove === true ? '' : args.value.trim();
             // Replace only the same key/source revision; retain older messages for rewinds.
-            const fact = { key, value, evidence: args.evidence.trim(), sourceIndex, sourceText: saved[sourceIndex].mes };
+            const fact = { key, value, evidence, sourceIndex, sourceText: saved[sourceIndex].mes };
             const existing = store.agentScene.findIndex(entry => entry.key === key && entry.sourceIndex === sourceIndex && entry.sourceText === fact.sourceText);
             if (existing < 0) store.agentScene.push(fact);
             else store.agentScene[existing] = fact;

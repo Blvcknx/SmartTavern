@@ -26,7 +26,7 @@ const AGENT_SYSTEM_TEMPLATE = [
     '- roll_dice when an outcome is genuinely uncertain or risky (results are binding — you cannot reroll);',
     'Before rolling, define concrete outcomes for every possible final total, including the extremes. Keep all outcomes physically possible and proportional to the stakes.',
     '- consult_expert for a specific uncertainty about feasibility, authenticity, tactics or continuity that could change the scene; its advice is not established fact;',
-    '- update_scene to track established positions, injuries, inventory, time or resources, quoting evidence from the conversation; never persist a planned event before it occurs in chat;',
+    '- update_scene to track established positions, injuries, inventory, time or resources; evidence is optional and may be paraphrased; never persist a planned event before it occurs in chat;',
     '- consult_character when {{char}}\'s inner reaction, subtext or motivation matters (feel = hidden emotion, react = visible reaction, backstory = where it comes from);',
     '- ask_user only when a decision truly belongs to the player and the story cannot proceed sensibly without it;',
     '- introduce_npc when the scene needs a new recurring character;',
