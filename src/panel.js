@@ -17,8 +17,9 @@ import { runPipeline, runRefinementDryRun, getLastRunResults } from './pipeline.
 import { rebuildProfile, updateProfile, generateProfileField, resetProfile, serializeProfile } from './profiles.js';
 import { chipsHtml } from './chips.js';
 import { renderStoryTab, wireStoryTab } from './story-ui.js';
+import { renderAgentTab, wireAgentTab } from './agent-ui.js';
 
-const TABS = ['profile', 'story', 'steps', 'schema', 'results', 'settings'];
+const TABS = ['profile', 'story', 'agent', 'steps', 'schema', 'results', 'settings'];
 
 // --------------------------------------------------------------------------------------------
 // Helpers
@@ -114,6 +115,7 @@ export function initPanel() {
         refreshStatus();
         if (isPanelOpen() && activeTab === 'profile') renderProfileTab();
         if (isPanelOpen() && activeTab === 'story') renderStoryTab();
+        if (isPanelOpen() && activeTab === 'agent') renderAgentTab();
     });
 
     // Fired after programmatic profile writes (quick update from the avatar menu, panel buttons).
@@ -257,6 +259,7 @@ function switchTab(tab) {
 function renderActiveTab() {
     if (activeTab === 'profile') renderProfileTab();
     else if (activeTab === 'story') renderStoryTab();
+    else if (activeTab === 'agent') renderAgentTab();
     else if (activeTab === 'steps') renderStepEditor();
     else if (activeTab === 'schema') renderFieldEditor();
     else if (activeTab === 'results') renderResultsTab();
@@ -286,6 +289,7 @@ function buildPanelHtml() {
         <div class="smarttavern_panel_tabs">
             <a class="smarttavern_tab_button" data-tab="profile" title="Living bio of the current character"><i class="fa-solid fa-user-pen"></i><span>Profile</span></a>
             <a class="smarttavern_tab_button" data-tab="story" title="Story Director — scenario, chapters and per-turn beats"><i class="fa-solid fa-clapperboard"></i><span>Story</span></a>
+            <a class="smarttavern_tab_button" data-tab="agent" title="Thinking Agent — tools, Turn Brief, memory"><i class="fa-solid fa-compass"></i><span>Agent</span></a>
             <a class="smarttavern_tab_button" data-tab="steps" title="Pipeline steps"><i class="fa-solid fa-diagram-project"></i><span>Steps</span></a>
             <a class="smarttavern_tab_button" data-tab="schema" title="Profile schema fields"><i class="fa-solid fa-list-check"></i><span>Schema</span></a>
             <a class="smarttavern_tab_button" data-tab="results" title="Latest pipeline run"><i class="fa-solid fa-square-poll-horizontal"></i><span>Results</span></a>
@@ -324,6 +328,10 @@ function buildPanelHtml() {
 
             <div class="smarttavern_tab_panel" data-tab="story">
                 <div id="smarttavern_story_root"></div>
+            </div>
+
+            <div class="smarttavern_tab_panel" data-tab="agent">
+                <div id="smarttavern_agent_root"></div>
             </div>
 
             <div class="smarttavern_tab_panel" data-tab="steps">
@@ -420,9 +428,9 @@ function buildPanelHtml() {
                     <input id="smarttavern_storyEnabled" type="checkbox" ${settings.storyEnabled !== false ? 'checked' : ''}>
                     <span>Enable the Story Director directive</span>
                 </label>
-                <label class="checkbox" title="Adds a built-in refinement pass that checks the fresh reply against the required beat event and weaves it in when missing">
-                    <input id="smarttavern_storyEnforce" type="checkbox" ${settings.storyEnforce !== false ? 'checked' : ''}>
-                    <span>Enforce the required beat on the reply</span>
+                <label class="checkbox" title="Adds a built-in refinement pass that checks the fresh reply against every required event (story beat, agent musts, binding dice) and weaves the missing ones in">
+                    <input id="smarttavern_turnEnforce" type="checkbox" ${settings.turnEnforce !== false ? 'checked' : ''}>
+                    <span>Enforce required events on the reply (story beats, agent musts, dice)</span>
                 </label>
                 <label class="checkbox">
                     <input id="smarttavern_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}>
@@ -553,6 +561,7 @@ function buildPanel() {
     wireDataButtons();
     wireProfileTab();
     wireStoryTab($panel());
+    wireAgentTab($panel());
     initDrag();
 
     // Grow textareas with their content (step prompts, hand-edited bio fields, guidance note).
@@ -576,7 +585,7 @@ const PANEL_CONTROLS = [
     ['smarttavern_savePassesAsSwipes', 'savePassesAsSwipes', 'checkbox'],
     ['smarttavern_veilAllowPeek', 'veilAllowPeek', 'checkbox'],
     ['smarttavern_storyEnabled', 'storyEnabled', 'checkbox'],
-    ['smarttavern_storyEnforce', 'storyEnforce', 'checkbox'],
+    ['smarttavern_turnEnforce', 'turnEnforce', 'checkbox'],
     ['smarttavern_storyIdleTurns', 'storyIdleTurns', 'number'],
     ['smarttavern_storyDirectiveMaxWords', 'storyDirectiveMaxWords', 'number'],
     ['smarttavern_updateInterval', 'updateInterval', 'number'],
@@ -1033,7 +1042,7 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
     });
 }
 
-function profileOptionsHtml(selectedId = '', profiles = listConnectionProfiles()) {
+export function profileOptionsHtml(selectedId = '', profiles = listConnectionProfiles()) {
     // A stored id that no longer resolves falls back to the active connection in gen.js;
     // render it that way instead of leaving the select with no selected option.
     if (selectedId && !profiles.some(p => p.id === selectedId)) selectedId = '';
@@ -1073,6 +1082,12 @@ export function refreshProfileSelects() {
     const storySelect = $panel().find('#smarttavern_storyProfileId').get(0);
     if (storySelect) refresh(storySelect, settings.storyProfileId ?? '');
     updateBadge($panel().find('#smarttavern_story_missing_profile'), settings.storyProfileId ?? '');
+    const agentSelect = $panel().find('#smarttavern_agentProfileId').get(0);
+    if (agentSelect) refresh(agentSelect, settings.agentProfileId ?? '');
+    updateBadge($panel().find('#smarttavern_agent_missing_profile'), settings.agentProfileId ?? '');
+    const voiceSelect = $panel().find('#smarttavern_innerVoiceProfileId').get(0);
+    if (voiceSelect) refresh(voiceSelect, settings.innerVoiceProfileId ?? '');
+    updateBadge($panel().find('#smarttavern_voice_missing_profile'), settings.innerVoiceProfileId ?? '');
     // Both step lists render through the same card builder; each select carries its own
     // step object so index-based lookups cannot cross wires between the two pipelines.
     $panel().find('.smarttavern_step_profile').each(function () {
@@ -1253,6 +1268,17 @@ function renderRunResult(body, result, pipeline) {
     }
     if (result.storyDirective) {
         appendSection(body, 'Story directive (what the reply model was told)', result.storyDirective);
+    }
+    if (result.agentRan) {
+        appendSection(body, 'Turn Brief (thinking agent — injected before the directive)', result.brief || '(nothing at stake — no brief this turn)');
+    } else if (result.brief) {
+        appendSection(body, 'Turn Brief', result.brief);
+    }
+    if (Array.isArray(result.agentTranscript) && result.agentTranscript.length) {
+        const text = result.agentTranscript
+            .map(entry => `— ${entry.title ?? 'Agent'}${entry.text ? ` —\n${entry.text}` : ''}`)
+            .join('\n\n');
+        appendSection(body, 'Thinking agent transcript', text);
     }
     if (result.injectionText) {
         appendSection(

@@ -13,7 +13,7 @@
 // history is a different array and is never mutated.
 import { getContext } from '../../../../extensions.js';
 import {
-    log, warn, getSettings,
+    log, warn, getSettings, getStory,
     cardText, chatExcerpt, charKey, getChatStore, getStoredProfile,
     resolveTargetChar, resolveMemberByMessageName, getMainCharacter, isPlainObject,
     clampInt, substituteParamsSafe, STEP_ROLES, captureChatScope,
@@ -26,9 +26,14 @@ import { refinementIssues, hasRefinedPayload } from './refinement-checks.js';
 import { applyVeil, setVeilStep, setVeilStatus, revealVeil, dismissVeil, armPreVeil } from './veil.js';
 import { stagePromptTail, clearPromptTail } from './tail.js';
 import {
-    prepareStoryDirective, storyMacroContext, storyEnforcementActive, hasStory,
+    prepareStoryDirective, storyMacroContext, hasStory,
     markStoryBeatDelivered, recordDirectiveInjection, resetStoryGenerationState,
+    recordedDirective, compileStoryDirective,
 } from './story.js';
+import {
+    agentActiveForTurn, runAgentLoop, resetAgentTurn, agentTurnRequirements,
+} from './agent.js';
+import { rollsMacroText } from './agent-core.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
 
@@ -38,13 +43,15 @@ const STEP_SYSTEM = 'You are a state-assessment engine for an interactive fictio
 
 const REFINEMENT_SYSTEM = 'You are a surgical prose editor and continuity auditor for an interactive fiction platform. Make only the targeted adjustments requested by the user prompt while preserving the original scene events, pacing, and structure. Output only the final revised reply (or the requested XML tags) with no meta-commentary or preamble.';
 
-// Built-in story enforcement pass, prepended to the refinement list while a directive
-// MUST block is active. Same tag contract as user passes: <audit>PASS</audit> keeps the
-// draft, otherwise <audit>reasoning</audit> + <revised_reply>full reply</revised_reply>.
+// Built-in enforcement pass, prepended to the refinement list while REQUIRED EVENTS are
+// pending: the story beat's must, the thinking agent's musts and one line per binding
+// dice roll. Same tag contract as user passes: <audit>PASS</audit> keeps the draft,
+// otherwise <audit>reasoning</audit> + <revised_reply>full reply</revised_reply>.
 const DIRECTIVE_ENFORCEMENT_NAME = 'Directive Enforcement';
 const DIRECTIVE_ENFORCEMENT_PROMPT = [
-    'You are checking the DRAFT reply of {{char}} against a REQUIRED EVENT.',
-    'REQUIRED EVENT: {{must}}',
+    'You are checking the DRAFT reply of {{char}} against a list of REQUIRED EVENTS.',
+    'REQUIRED EVENTS (each must visibly happen on the page, not merely be alluded to):',
+    '{{must}}',
     '',
     'Recent chat:',
     '{{chat}}',
@@ -52,9 +59,8 @@ const DIRECTIVE_ENFORCEMENT_PROMPT = [
     'DRAFT:',
     '{{draft}}',
     '',
-    '"Contained" means the event visibly happens on the page, not merely alluded to.',
-    'If contained: output <audit>PASS</audit> only.',
-    'If not: reason briefly in <audit>...</audit>, then output the full reply in <revised_reply>...</revised_reply> with the event woven in by minimal edits, in the first half, matching voice and format. Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
+    'If every event is contained: output <audit>PASS</audit> only.',
+    'If any is missing: reason briefly in <audit>...</audit>, then output the full reply in <revised_reply>...</revised_reply> with the missing event(s) woven in by minimal edits, in the first half, matching voice and format. Dice results are binding: the reply must reflect their outcome (a low roll fails, a high roll succeeds). Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
 ].join('\n');
 
 // Characters whose bootstrap already failed this session — no retry spam per generation.
@@ -166,6 +172,9 @@ function recordLastRun(result, pipeline, source) {
         stepStats: result.stepStats ?? [],
         injectionText: result.injectionText ?? '',
         storyDirective: result.storyDirective ?? '',
+        agentRan: Boolean(result.agentRan),
+        brief: result.brief ?? '',
+        agentTranscript: result.agentTranscript ?? null,
         source,
         at: Date.now(),
     };
@@ -202,6 +211,52 @@ export function sweepEphemeral(chatArr = null) {
 // --------------------------------------------------------------------------------------------
 
 /**
+ * The REQUIRED EVENTS list for the built-in enforcement pass (and the {{must}}
+ * macro): the story beat's must plus the thinking agent's musts plus one line per
+ * binding dice roll. Single source of truth — refinement passes and the panel read
+ * the same list.
+ */
+export function turnMustList(storyMust = null) {
+    const items = [];
+    const story = String(storyMust ?? '').trim();
+    if (story) items.push(story);
+    const agent = agentTurnRequirements();
+    items.push(...agent.must);
+    for (const roll of agent.rolls) {
+        items.push(`the outcome of the dice roll (${roll.spec ?? ''}${roll.spec ? ' ' : ''}${roll.text}) is reflected in what happens`);
+    }
+    return items.filter(Boolean);
+}
+
+export function turnMustText(storyMust = null) {
+    return turnMustList(storyMust).map(item => `- ${item}`).join('\n');
+}
+
+/**
+ * True when the built-in Directive Enforcement pass belongs to the refinement list:
+ * enforcement is on, refinement runs, and at least one required event exists — the
+ * story beat's must, an agent must, or a binding dice roll. Before the pipeline runs
+ * (pre-veil arming, dry runs) the live story is compiled speculatively — the same pure
+ * function, so the prediction matches what will be injected.
+ */
+export function turnEnforcementActive(settings = getSettings()) {
+    if (!settings || settings.enabled === false || settings.refinementEnabled === false) return false;
+    if (settings.turnEnforce === false) return false;
+    const directive = recordedDirective();
+    let storyMust = directive?.must ?? '';
+    if (!directive) {
+        try {
+            storyMust = compileStoryDirective(getStory(), settings)?.must ?? '';
+        } catch {
+            storyMust = '';
+        }
+    }
+    if (storyMust) return true;
+    const agent = agentTurnRequirements();
+    return agent.must.length > 0 || agent.rolls.length > 0;
+}
+
+/**
  * Builds the resolver for SmartTavern macros. Unknown macros return null so they are left
  * intact for SillyTavern's own substitution pass.
  *
@@ -212,7 +267,7 @@ export function sweepEphemeral(chatArr = null) {
  * passes; `draftMessageId` excludes the message being refined from chat excerpts so
  * the draft is never duplicated inside {{chat}}.
  */
-export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, step = null, stepsList = null, currentDraft = null, originalDraft = null, draftMessageId = null, story = null }) {
+export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, step = null, stepsList = null, currentDraft = null, originalDraft = null, draftMessageId = null, story = null, agent = null }) {
     const fieldLookup = new Map((settings.fields ?? []).map(f => [String(f?.name ?? '').trim().toLowerCase(), String(f?.name ?? '')]));
     const list = Array.isArray(stepsList) ? stepsList : (Array.isArray(settings.steps) ? settings.steps : []);
     const stepLookup = new Map(list.map(s => [String(s?.name ?? '').trim().toLowerCase(), String(s?.name ?? '')]));
@@ -249,10 +304,14 @@ export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, 
         // Story Director macros. story-core's compiled directive contains no secrets,
         // cast secrets or future chapters — neither may any of these.
         if (m === 'story') return story?.text ?? '';
-        if (m === 'must') return story?.must ?? '';
+        // {{must}} is the full REQUIRED EVENTS list (story beat + agent musts + rolls).
+        if (m === 'must') return turnMustText(story?.must ?? null) || String(story?.must ?? '');
         if (m === 'beat') return story?.beat ?? '';
         if (m === 'chapter') return story?.chapter ?? '';
         if (m === 'ledger') return story?.ledger ?? '';
+        // Thinking agent macros: the compiled Turn Brief and the dice line(s).
+        if (m === 'brief') return agent?.brief ?? '';
+        if (m === 'rolls') return agent?.rollsText ?? '';
         return null;
     };
 }
@@ -435,10 +494,14 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
     if (!arr.length) return null;
 
     // Story directive — its own gate, independent of expansion. Compiled here (and,
-    // for swipe/regenerate, re-armed first) so it can feed the {{story}} macros below.
+    // for swipe/regenerate, re-armed first) so it can feed the {{story}} macros below
+    // AND the thinking agent (which must see exactly what the reply model is told).
     // Any compile error fails open to null (no directive, never a blocked generation).
     const directive = prepareStoryDirective({ type, mutate: inject });
-    if (!settings.expansionEnabled && !directive) return null;
+    // The thinking agent is its own gate too: it runs (and injects its brief) even
+    // when expansion is disabled and no story exists.
+    const agentWanted = agentActiveForTurn(settings);
+    if (!settings.expansionEnabled && !directive && !agentWanted) return null;
 
     if (inject) {
         clearPromptTail();
@@ -482,29 +545,70 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         if (expand) {
             ({ stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings, signal: control.signal }));
         } else {
-            activitySteps({ names: [] }); // story-only run: no expansion chips to show
+            activitySteps({ names: [] }); // no expansion chips to show
         }
         throwIfAborted(control.signal);
         if (!isCurrentChat()) return null;
+
+        // Thinking agent: runs AFTER the expansion steps (it may read their outputs as
+        // context) and BEFORE the directive placement (the brief sits in front of it).
+        // Any failure fails open to an empty brief — the generation continues.
+        let agentResult = null;
+        if (agentWanted) {
+            agentResult = await runAgentLoop({
+                chat: arr, char, profile, stepOutputs, directive, settings, type, dryRun: isDryRun,
+            });
+        }
+        throwIfAborted(control.signal);
+        if (!isCurrentChat()) return null;
+
         const storyContext = directive ? storyMacroContext(directive) : null;
-        const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings, stepsList: settings.steps, story: storyContext });
+        const briefText = agentResult?.brief ?? '';
+        const agentMacro = briefText || (agentResult?.turn?.rolls?.length)
+            ? { brief: briefText, rollsText: rollsMacroText(agentResult?.turn?.rolls ?? []) }
+            : null;
+        const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings, stepsList: settings.steps, story: storyContext, agent: agentMacro });
         const hasStepBlocks = stepBlocks(settings.steps, stepOutputs).length > 0;
-        // A tail template that embeds {{story}} carries the directive itself; otherwise
-        // the directive is appended below as the FINAL tail section, after the expansion
-        // outputs, so it sits closest to generation.
-        const usesStoryMacro = /\{\{\s*story\s*\}\}/i.test(String(settings.tailPrompt ?? ''));
+        // A tail template that embeds {{story}} / {{brief}} carries those sections
+        // itself; otherwise they are appended below in fixed order — expansion outputs,
+        // then the Turn Brief, then the directive as the FINAL tail section closest to
+        // generation (brief last when the Story Director is inactive).
+        const tailTemplate = String(settings.tailPrompt ?? '');
+        const usesStoryMacro = /\{\{\s*story\s*\}\}/i.test(tailTemplate);
+        const usesBriefMacro = /\{\{\s*(brief|rolls)\s*\}\}/i.test(tailTemplate);
         let injectionText = '';
         if (settings.injectAnchor === 'prompt-end') {
-            if ((expand && hasStepBlocks) || (directive && usesStoryMacro)) {
-                injectionText = substituteParamsSafe(expandMacros(settings.tailPrompt ?? '', resolve)).trim();
+            if ((expand && hasStepBlocks) || (directive && usesStoryMacro) || (briefText && usesBriefMacro)) {
+                injectionText = substituteParamsSafe(expandMacros(tailTemplate, resolve)).trim();
+            }
+            if (briefText && !injectionText.includes(briefText)) {
+                injectionText = injectionText ? `${injectionText}\n\n${briefText}` : briefText;
             }
             if (directive?.text && !injectionText.includes(directive.text)) {
                 injectionText = injectionText ? `${injectionText}\n\n${directive.text}` : directive.text;
             }
         } else if (expand && hasStepBlocks) {
             injectionText = assembleInjection({ settings, char, profile, chat: arr, stepOutputs, story: storyContext });
+            if (briefText && !injectionText.includes(briefText)) {
+                injectionText = injectionText ? `${injectionText}\n\n${briefText}` : briefText;
+            }
+            if (directive?.text && !injectionText.includes(directive.text)) {
+                injectionText = injectionText ? `${injectionText}\n\n${directive.text}` : directive.text;
+            }
+        } else if (briefText || directive?.text) {
+            injectionText = [briefText, directive?.text ?? ''].filter(Boolean).join('\n\n');
         }
-        if (!inject) return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '' }, 'expansion', 'dry run');
+        // Templates may reference these macros anywhere. Relocate their complete
+        // sections so the directive is still last and the brief directly precedes it.
+        const turnSections = [briefText, directive?.text ?? ''].filter(Boolean);
+        for (const section of turnSections) injectionText = injectionText.split(section).join('').trim();
+        injectionText = [injectionText, ...turnSections].filter(Boolean).join('\n\n');
+        const agentRecord = {
+            agentRan: Boolean(agentResult),
+            brief: briefText,
+            agentTranscript: agentResult?.transcript ?? null,
+        };
+        if (!inject) return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '', ...agentRecord }, 'expansion', 'dry run');
 
         if (settings.injectAnchor === 'prompt-end') {
             if (injectionText) {
@@ -517,16 +621,23 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
                 summary = 'Reply prompt tail prepared';
                 activityEntry({ title: `Prompt tail prepared · ${role} · ${injectionText.length} chars`, tone: 'info', text: injectionText });
             } else summary = 'Nothing to inject';
-            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '' }, 'expansion', 'generation');
+            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '', ...agentRecord }, 'expansion', 'generation');
         }
-        const blocks = assembleInjectionBlocks({ settings, char, profile, chat: arr, stepOutputs, story: storyContext });
-        const directiveRole = STEP_ROLES.includes(settings.tailRole) ? settings.tailRole : 'assistant';
+        const blocks = (expand ? assembleInjectionBlocks({ settings, char, profile, chat: arr, stepOutputs, story: storyContext }) : [])
+            .map(block => ({ ...block, text: turnSections.reduce((text, section) => text.split(section).join(''), block.text).trim() }))
+            .filter(block => block.text);
+        const blockRole = STEP_ROLES.includes(settings.tailRole) ? settings.tailRole : 'assistant';
+        // Turn Brief first, then the directive — history anchors keep the same relative
+        // order as the prompt-end tail (expansion outputs → brief → directive last).
+        if (briefText && !blocks.some(block => block.text.includes(briefText))) {
+            blocks.push({ text: briefText, role: blockRole });
+        }
         if (directive?.text && !blocks.some(block => block.text.includes(directive.text))) {
-            blocks.push({ text: directive.text, role: directiveRole });
+            blocks.push({ text: directive.text, role: blockRole });
         }
         if (!blocks.length) {
             summary = 'Nothing to inject';
-            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '' }, 'expansion', 'generation');
+            return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '', ...agentRecord }, 'expansion', 'generation');
         }
 
         let index = resolveInjectIndex(arr, settings);
@@ -535,7 +646,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             activityEntry({ title: `Injecting ${block.text.length} chars as ${block.role}`, tone: 'info', text: block.text });
         }
         if (directive?.text) recordDirectiveInjection(directive);
-        return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '' }, 'expansion', 'generation');
+        return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '', ...agentRecord }, 'expansion', 'generation');
     } catch (error) {
         if (isAbortError(error)) {
             control.cancel();
@@ -558,8 +669,8 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
 
 /**
  * The refinement pass list that actually runs: the enabled user passes plus the
- * built-in Directive Enforcement pass prepended while a story MUST block is active
- * (pending beat or idle escalation; see story.storyEnforcementActive). Single source
+ * built-in Directive Enforcement pass prepended while REQUIRED EVENTS are pending
+ * (story beat, agent musts, dice outcomes; see turnEnforcementActive). Single source
  * of truth for everything that enumerates passes: runRefinementPipeline, the
  * interceptor's pre-veil check, chips and veil names.
  */
@@ -567,7 +678,7 @@ export function effectiveRefinementSteps(settings) {
     const steps = (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim())
         .map(s => ({ ...s }));
-    if (storyEnforcementActive(settings)) {
+    if (turnEnforcementActive(settings)) {
         steps.unshift({
             name: DIRECTIVE_ENFORCEMENT_NAME,
             builtin: true,
@@ -983,9 +1094,13 @@ export async function smarttavernInterceptor(chat, _contextSize, _abort, type) {
         // A new generation invalidates the previous one's story bookkeeping before the
         // directive is compiled (swipe/regenerate re-arm the beat as pending inside).
         resetStoryGenerationState();
-        // The story directive is its own gate: with an active story the pipeline runs
-        // (and injects) even when expansion is disabled.
-        if (settings.expansionEnabled || (settings.storyEnabled !== false && hasStory())) {
+        // …and the previous generation's thinking-agent turn state (its musts/rolls feed
+        // the enforcement pass for THIS generation's reply, so it must be fresh).
+        resetAgentTurn();
+        // The story directive and the thinking agent are their own gates: with an active
+        // story or an active agent the pipeline runs (and injects) even when expansion
+        // is disabled.
+        if (settings.expansionEnabled || (settings.storyEnabled !== false && hasStory()) || agentActiveForTurn(settings)) {
             // The foreground generation is parked on this interceptor while the pipeline
             // runs, so its internal calls are exempt from gen.js's foreground-idle wait.
             await withInterceptorScope(() => runPipeline({ chat, inject: true, type }));

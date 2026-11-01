@@ -7,6 +7,10 @@ import {
     showProfilePopup, showRunResults, runUpdateCommand, runRebuildCommand, runResetCommand,
 } from './panel.js';
 import { runStoryCraft, runStoryBeat, runStoryChapter, showStoryDirective } from './story-ui.js';
+import { armAgent } from './agent.js';
+import { parseDice, rollDice } from './agent-core.js';
+import { listAgentOwnedEntries } from './agent-tools.js';
+import { showContentPopup, appendSection } from './panel.js';
 import { initProgress } from './progress.js';
 
 export function initUI() {
@@ -107,8 +111,33 @@ function applyDrawerFloatingVisibility() {
 }
 
 // --------------------------------------------------------------------------------------------
-// Slash commands
+// Slash command support
 // --------------------------------------------------------------------------------------------
+
+/** /smarttavern-roll — manual, informational roll; never touches the binding turn state. */
+function runManualRoll(arg) {
+    const spec = String(arg ?? '').trim();
+    if (!parseDice(spec)) {
+        toastr.warning('SmartTavern: use a dice expression like d20, 2d6+3 (sides 2–1000, up to 20 dice).', 'SmartTavern');
+        return;
+    }
+    const roll = rollDice(spec);
+    toastr.info(`SmartTavern rolled ${roll.text} (informational — not binding).`, 'SmartTavern');
+}
+
+/** /smarttavern-memory — every agent-owned lorebook entry of this chat. */
+async function listAgentMemory() {
+    const entries = await listAgentOwnedEntries();
+    const container = document.createElement('div');
+    if (!entries.length) {
+        appendSection(container, 'No agent memory yet', 'The thinking agent has not created any lorebook entries in this chat. It records durable facts (names, promises, injuries, places) via its memory tools.');
+    } else {
+        for (const entry of entries) {
+            appendSection(container, `${entry.title} — ${entry.book} #${entry.uid} (keys: ${entry.keys.join(', ') || 'none'})`, entry.content);
+        }
+    }
+    await showContentPopup('SmartTavern — agent memory (this chat)', container);
+}
 
 function registerSlashCommands() {
     const context = getContext();
@@ -124,6 +153,9 @@ function registerSlashCommands() {
         { name: 'smarttavern-beat', help: 'Compile the next story beat (<steering note>)', run: (arg) => runStoryBeat(arg) },
         { name: 'smarttavern-chapter', help: 'Close the current chapter and write the opening beat of the next', run: () => runStoryChapter() },
         { name: 'smarttavern-story', help: 'Show the story directive the reply model will receive', run: () => showStoryDirective() },
+        { name: 'smarttavern-think', help: 'Arm the thinking agent for the next reply (one-shot)', run: (_arg) => { armAgent(); toastr.info('SmartTavern will think before the next reply.', 'SmartTavern'); } },
+        { name: 'smarttavern-roll', help: 'Roll dice now (informational — NOT binding, unlike the agent\'s roll_dice)', run: (arg) => runManualRoll(arg) },
+        { name: 'smarttavern-memory', help: 'List the agent-owned lorebook entries of this chat', run: (_arg) => listAgentMemory() },
         { name: 'smarttavern-hud', help: 'Toggle the SmartTavern floating panel', run: (_arg) => togglePanel() },
     ];
 

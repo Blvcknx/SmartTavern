@@ -52,6 +52,7 @@ function build() {
                 </div>
                 <div class="smarttavern_act_steps"></div>
                 <div class="smarttavern_act_refinement_controls" hidden></div>
+                <div class="smarttavern_act_agent_controls" hidden></div>
                 <div class="smarttavern_act_current"></div>
                 <div class="smarttavern_act_log"></div>
             </div>
@@ -219,6 +220,14 @@ export function activityRefinementControls({ onSkip = null, onEnough = null } = 
     controls.empty().prop('hidden', !onSkip && !onEnough);
     if (onSkip) $('<button type="button" class="menu_button">Skip pass</button>').on('click', onSkip).appendTo(controls);
     if (onEnough) $('<button type="button" class="menu_button">That\'s enough</button>').on('click', onEnough).appendTo(controls);
+}
+
+/** Thinking agent: a Skip button while the loop runs; no arguments clear it. */
+export function activityAgentControls({ onSkip = null } = {}) {
+    build();
+    const controls = $root.find('.smarttavern_act_agent_controls');
+    controls.empty().prop('hidden', !onSkip);
+    if (onSkip) $('<button type="button" class="menu_button">Skip thinking</button>').on('click', onSkip).appendTo(controls);
 }
 
 /** Appends a completed entry (call output or informational note) to the log. */

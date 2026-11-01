@@ -167,6 +167,21 @@ The reply model **never sees the bible**: secrets, cast agendas and future chapt
 
 ## Slash commands
 
+The **Agent** tab configures pre-reply thinking: Always, Armed (one-shot), or Off;
+connection profiles; tool switches; and iteration/time budgets. The agent can roll
+binding dice, consult the character, ask a question, introduce an NPC, and manage
+its own memories in the shared chat lorebook. Its compiled Turn Brief appears before
+the Scene Directive; only the brief reaches the reply model. **Skip thinking** keeps
+completed rolls and answers. Armed mode is triggered by **Think next reply** or
+`/smarttavern-think`. `/smarttavern-roll 2d6+1` is informational, and
+`/smarttavern-memory` lists agent memories. Memory changes are undoable in the Agent
+tab. Dry runs cannot write memory or consume the armed flag.
+
+Thinking adds up to the configured number of planning calls, plus character/NPC
+consults and retries. Use Armed mode to control latency. `npm test` runs the complete
+suite. See [the thinking-agent audit](THINKING_AGENT_AUDIT.md) for verification details
+and the in-app smoke test.
+
 | Command | Alias | Effect |
 | --- | --- | --- |
 | `/smarttavern-profile [char]` | `/st-profile` | Show the stored profile in a popup |

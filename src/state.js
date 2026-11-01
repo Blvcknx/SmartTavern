@@ -153,9 +153,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
     // compiles one concrete event per turn (beat) and injects it as the final tail
     // section. The reply model never sees the bible — only the compiled directive.
     storyEnabled: true,
-    // A built-in first refinement pass (Directive Enforcement) checks that the
-    // required event is on the page and weaves it in when missing.
-    storyEnforce: true,
+    // A built-in first refinement pass (Directive Enforcement) checks that every
+    // REQUIRED EVENT (story beat + agent musts + dice outcomes) is on the page and
+    // weaves the missing ones in. Formerly `storyEnforce` (migrated silently).
+    turnEnforce: true,
     // Idle turns after delivery before the world escalates on its own (deterministic
     // idle clock: rung advances every further storyIdleTurns turns).
     storyIdleTurns: 3,
@@ -190,6 +191,30 @@ export const DEFAULT_SETTINGS = Object.freeze({
         'Use these assessments to guide the upcoming reply: account for the current physical state, motivations, and relevant constraints. Treat assessments as working interpretations; the latest explicit conversation evidence takes precedence. Continue the scene as {{char}} in response to {{user}}. Keep these notes out of the visible reply; do not summarize or repeat them.',
     ].join('\n'),
     profileUpdateProfileId: '',
+    // Thinking Agent: a pre-reply agent reasons across cheap LLM calls with local
+    // tools (dice, character consult, ask-user, NPC intro, chat-lorebook memory) and
+    // compiles a short Turn Brief injected into the reply prompt. The reply model
+    // never sees the agent's reasoning or the tool protocol — only the brief.
+    agentMode: 'always',                     // 'off' | 'always' | 'armed' (one-shot)
+    agentProfileId: '',                      // Connection Manager profile for the loop
+    innerVoiceProfileId: '',                 // consult_character calls ('' = agent profile)
+    agentMaxIterations: 3,
+    agentMaxToolCalls: 6,
+    agentTimeoutMs: 90000,                   // pauses while an ask_user popup is open
+    agentLookback: 8,                        // chat messages the agent sees
+    agentBriefMaxWords: 130,
+    agentAskUser: true,
+    agentAskPerTurn: 1,
+    agentMemoryMode: 'auto',                 // 'auto' | 'confirm' | 'off'
+    agentMemoryWritesPerTurn: 3,             // shared by create/update/delete/npc-persist
+    agentExposeNativeTools: false,          // reserved for an optional native-tool bridge
+    agentToolsEnabled: {
+        roll_dice: true,
+        consult_character: true,
+        ask_user: true,
+        introduce_npc: true,
+        memory: true,
+    },
     updaterMaxTokens: 100000,
     stepMaxTokens: 100000,
     stepExecution: 'dependencies',
@@ -340,8 +365,17 @@ function normalizeSettings(settings) {
         settings.storyEnabled = true;
         changed = true;
     }
-    if (typeof settings.storyEnforce !== 'boolean') {
-        settings.storyEnforce = true;
+    // v-agent: `storyEnforce` was renamed to `turnEnforce` (the enforcement pass now
+    // also covers agent musts and dice outcomes). A persisted old key always wins —
+    // its presence marks a pre-rename config, and deepMerge has already filled the
+    // new key with the default.
+    if (Object.hasOwn(settings, 'storyEnforce')) {
+        if (typeof settings.storyEnforce === 'boolean') settings.turnEnforce = settings.storyEnforce;
+        delete settings.storyEnforce;
+        changed = true;
+    }
+    if (typeof settings.turnEnforce !== 'boolean') {
+        settings.turnEnforce = true;
         changed = true;
     }
     const storyIdleTurns = clampInt(settings.storyIdleTurns, 1, 20, 3);
@@ -357,6 +391,50 @@ function normalizeSettings(settings) {
     if (typeof settings.storyProfileId !== 'string') {
         settings.storyProfileId = '';
         changed = true;
+    }
+    // ------------------------------------------------------------------
+    // Thinking Agent
+    // ------------------------------------------------------------------
+    if (!['off', 'always', 'armed'].includes(settings.agentMode)) {
+        settings.agentMode = 'always';
+        changed = true;
+    }
+    for (const key of ['agentProfileId', 'innerVoiceProfileId']) {
+        if (typeof settings[key] !== 'string') {
+            settings[key] = '';
+            changed = true;
+        }
+    }
+    for (const [key, min, max, fallback] of [
+        ['agentMaxIterations', 1, 8, 3],
+        ['agentMaxToolCalls', 1, 24, 6],
+        ['agentTimeoutMs', 5000, 600000, 90000],
+        ['agentLookback', 0, 100, 8],
+        ['agentBriefMaxWords', 40, 400, 130],
+        ['agentAskPerTurn', 0, 3, 1],
+        ['agentMemoryWritesPerTurn', 0, 10, 3],
+    ]) {
+        const normalized = clampInt(settings[key], min, max, fallback);
+        if (settings[key] !== normalized) {
+            settings[key] = normalized;
+            changed = true;
+        }
+    }
+    if (typeof settings.agentAskUser !== 'boolean') {
+        settings.agentAskUser = true;
+        changed = true;
+    }
+    if (typeof settings.agentExposeNativeTools !== 'boolean') settings.agentExposeNativeTools = false;
+    if (!['auto', 'confirm', 'off'].includes(settings.agentMemoryMode)) {
+        settings.agentMemoryMode = 'auto';
+        changed = true;
+    }
+    if (!isPlainObject(settings.agentToolsEnabled)) settings.agentToolsEnabled = {};
+    for (const tool of ['roll_dice', 'consult_character', 'ask_user', 'introduce_npc', 'memory']) {
+        if (typeof settings.agentToolsEnabled[tool] !== 'boolean') {
+            settings.agentToolsEnabled[tool] = true;
+            changed = true;
+        }
     }
     // Raise persisted token caps (formerly 5000) so long outputs — revised replies,
     // expansion step payloads — are no longer cropped mid-generation.

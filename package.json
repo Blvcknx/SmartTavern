@@ -1,5 +1,6 @@
 {
     "name": "smarttavern",
     "private": true,
+    "scripts": { "test": "node --experimental-vm-modules --test" },
     "type": "module"
 }

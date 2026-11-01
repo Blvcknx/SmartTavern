@@ -9,6 +9,7 @@ import {
 } from './src/pipeline.js';
 import { maybeAutoUpdate } from './src/profiles.js';
 import { onStoryCharacterReply, resetStoryGenerationState } from './src/story.js';
+import { clearAgentSession } from './src/agent.js';
 import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
 import { initPromptTail } from './src/tail.js';
@@ -39,6 +40,9 @@ async function initSmartTavern() {
         sweepEphemeral();
         resetBootstrapFailures();
         resetStoryGenerationState();
+        // Thinking agent: drop the armed flag, the last turn state and the cached
+        // ask-user answers — they belong to the previous chat.
+        clearAgentSession();
         // An in-flight refinement may still be veiling a message from the previous chat;
         // its DOM is gone, so this only clears bookkeeping and any stray overlay.
         dismissAllVeils();

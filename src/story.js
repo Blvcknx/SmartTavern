@@ -14,6 +14,7 @@ import {
 import { serializeProfile, extractJson } from './profiles.js';
 import { generateWithRetry, withInternalGeneration, createGenerationControl, isAbortError, throwIfAborted } from './gen.js';
 import { activityStart, activityStatus, activityEntry, activityFail, activityEnd, activitySteps } from './progress.js';
+import { agentTurnRequirements } from './agent.js';
 import {
     normalizeBible, normalizeChapter, validateBeat, compileDirective, selectRung,
     pushFact, chapterIndexAt, storyCastNames, wordCount, rearmPending,
@@ -132,24 +133,8 @@ export function prepareStoryDirective({ type = 'normal', mutate = true } = {}) {
 // --------------------------------------------------------------------------------------------
 // Enforcement gate + delivery + idle clock
 // --------------------------------------------------------------------------------------------
-
-/**
- * True when the built-in Directive Enforcement pass belongs to the refinement list:
- * enforcement is on, refinement runs, and the current generation's directive carries a
- * MUST block (pending beat, or an idle escalation). Before the pipeline compiles the
- * directive (pre-veil arming, dry runs) the live story is compiled speculatively —
- * the same pure function, so the prediction matches what will be injected.
- */
-export function storyEnforcementActive(settings = getSettings()) {
-    if (!settings || settings.enabled === false || settings.refinementEnabled === false) return false;
-    if (settings.storyEnabled === false || settings.storyEnforce === false) return false;
-    if (lastDirective) return Boolean(lastDirective.must);
-    try {
-        return Boolean(compileStoryDirective(getStory(), settings)?.must);
-    } catch {
-        return false;
-    }
-}
+// NOTE: the enforcement gate lives in pipeline.js (turnEnforcementActive) — the
+// required-events list spans the story beat AND the thinking agent's musts/rolls.
 
 /**
  * Marks the pending beat delivered: deliveredAtMsg pinned to the reply that carries it,
@@ -185,7 +170,12 @@ export function onStoryCharacterReply(messageId) {
         const story = getStory();
         if (!story?.beat) return;
         if (story.beat.status === 'pending') {
-            const enforceWillRun = settings.refinementEnabled !== false && settings.storyEnforce !== false;
+            // The built-in enforcement pass decides delivery when it will run: it may be
+            // triggered by this beat OR by the thinking agent's musts/dice (see
+            // pipeline.turnEnforcementActive).
+            const agent = agentTurnRequirements();
+            const enforceWillRun = settings.refinementEnabled !== false && settings.turnEnforce !== false
+                && (Boolean(lastDirective?.must) || agent.must.length > 0 || agent.rolls.length > 0);
             if (!enforceWillRun) markStoryBeatDelivered(messageId);
             return;
         }

@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { SourceTextModule, createContext } from 'node:vm';
 
-async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0 } = {}) {
+async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0, realAgent = false, directive = null } = {}) {
     const requests = [];
     const savedChat = [{ is_user: true, name: 'User', mes: 'Hello' }];
     const listeners = new Map();
@@ -12,8 +12,8 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         POPUP_TYPE: { CONFIRM: 1 }, POPUP_RESULT: { AFFIRMATIVE: 1, CANCELLED: 0, CUSTOM1: 1001 },
         Popup: class {
             constructor(content, _type, _input, options) { this.content = content; this.options = options; }
-            show() { return new Promise(resolve => { this.resolve = resolve; Promise.resolve(onPopup(this)).then(result => { if (result !== undefined) resolve(result); }); }); }
-            complete(result) { this.resolve?.(result); }
+            show() { return new Promise(resolve => { this.resolve = resolve; Promise.resolve(onPopup(this)).then(result => { if (result !== undefined) this.complete(result); }); }); }
+            complete(result) { this.result = result; this.resolve?.(result); }
         },
         event_types: { GENERATION_STOPPED: 'stop', CHAT_CHANGED: 'chat' },
         eventSource: {
@@ -22,7 +22,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
             emit(type, ...args) { for (const fn of [...(listeners.get(type) ?? [])]) fn(...args); },
         },
         extensionSettings: { smarttavern: { genRetries: 0, bootstrapOnFirstMessage: false, promptTailVersion: 1, injectAnchor: 'before-last-user', ...settings }, connectionManager: { profiles: [{ id: 'model', mode: 'cc' }] } },
-        chat: savedChat, chatMetadata: {}, characterId: 0,
+        chat: savedChat, chatMetadata: {}, characterId: 0, chatId: 'test-chat',
         characters: [{ name: 'Alice', avatar: 'alice.png' }], name1: 'User', name2: 'Alice',
         saveSettingsDebounced() {}, substituteParams: text => text,
         saveMetadata() {}, saveMetadataDebounced() {}, saveChat: async () => {}, updateMessageBlock() {},
@@ -32,7 +32,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         } },
         generateRaw: async options => { requests.push(options); return 'ACTIVE OUTPUT'; },
     };
-    const sandbox = createContext({ context, AbortController, DOMException, setTimeout, clearTimeout, console: { log() {}, warn() {} }, toastr: { warning() {}, info() {}, success() {} },
+    const sandbox = createContext({ context, AbortController, DOMException, setTimeout, clearTimeout, structuredClone, crypto: globalThis.crypto, console: { log() {}, warn() {} }, toastr: { warning() {}, info() {}, success() {} },
         document: { dispatchEvent() {}, createElement() { return { children: [], append(...children) { this.children.push(...children); } }; } }, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
     });
     const modules = new Map();
@@ -44,9 +44,31 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = () => {}; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const armPreVeil = () => {};`,
         // Story Director stub: no chat in these tests carries a story, so the whole
         // feature must stay inert. The no-ops mirror story.js's no-story behavior.
-        story: 'export const prepareStoryDirective = () => null; export const storyMacroContext = () => null; export const storyEnforcementActive = () => false; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};',
+        story: `export const prepareStoryDirective = () => (${JSON.stringify(directive)}); export const storyMacroContext = value => value; export const recordedDirective = () => null; export const compileStoryDirective = () => null; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};`,
+        // Thinking agent stub: these tests exercise the non-agent path (the default
+        // agentMode is 'always', so the stub gate must stay closed explicitly).
+        agent: 'export const agentActiveForTurn = () => false; export const runAgentLoop = async () => null; export const resetAgentTurn = () => {}; export const agentTurnRequirements = () => ({ must: [], rolls: [] }); export const armAgent = () => {}; export const clearAgentSession = () => {};',
     };
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks']) {
+    if (realAgent) {
+        sources.progress += ' export const activityAgentControls = (controls = {}) => { context.agentControls = controls; };';
+        sources['world-info'] = `
+            export const world_names = ['Existing'];
+            export const selected_world_info = [];
+            export const world_info = {};
+            export const METADATA_KEY = 'world_info';
+            export const books = { Existing: { entries: { 0: { uid: 0, comment: 'User memory', key: ['Alice'], content: 'A user fact.' } } } };
+            export const loadWorldInfo = async name => structuredClone(books[name] ?? null);
+            export const saveWorldInfo = async (name, data) => { books[name] = structuredClone(data); };
+            export const createNewWorldInfo = async name => { world_names.push(name); books[name] = { entries: {} }; return true; };
+            export const createWorldInfoEntry = (_name, data) => {
+                let uid = 0; while (data.entries[uid]) uid++;
+                return data.entries[uid] = { uid, key: [], comment: '', content: '', order: 100, smarttavern: false };
+            };
+            export const deleteWorldInfoEntry = async (data, uid) => { delete data.entries[uid]; return true; };
+        `;
+        for (const name of ['agent', 'agent-tools']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
+    }
+    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'agent-core']) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -57,10 +79,154 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     await pipeline.evaluate();
     const state = modules.get('state').namespace;
     state.loadSettings();
-    return { pipeline: pipeline.namespace, checks: modules.get('refinement-checks').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
+    return { pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, checks: modules.get('refinement-checks').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
+
+const agentSettings = { expansionEnabled: false, agentProfileId: 'model', agentMode: 'always' };
+const agentOptions = h => ({ chat: [...h.savedChat], char: h.context.characters[0], settings: h.state.getSettings() });
+
+test('real agent runs without expansion and injects only the brief into the chat copy', async () => {
+    const h = await harness(agentSettings, async () => ({ content: '<think>PRIVATE THOUGHT</think><brief><must>Alice opens the door.</must></brief>' }), { realAgent: true });
+    const core = [...h.savedChat];
+    const result = await h.pipeline.runPipeline({ chat: core });
+    assert.equal(result.agentRan, true);
+    assert.match(result.brief, /Alice opens the door/);
+    assert.ok(core.some(message => message.mes.includes('TURN BRIEF')));
+    assert.ok(core.every(message => !message.mes.includes('PRIVATE THOUGHT')));
+    assert.equal(h.savedChat.length, 1);
+    assert.equal(h.pipeline.turnEnforcementActive(), true);
+    assert.equal(h.pipeline.turnMustList().length, 1);
+    assert.equal(h.context.eventSource.emit('stop'), undefined);
+});
+
+test('real agent enforces the total tool budget within one response', async () => {
+    const calls = Array.from({ length: 3 }, () => '<tool name="roll_dice">{"dice":"d20","reason":"Pick the lock"}</tool>').join('\n');
+    const h = await harness({ ...agentSettings, agentMaxToolCalls: 1 }, async (_messages, index) => ({ content: index === 1 ? calls : '<brief><must>Alice checks the lock.</must></brief>' }), { realAgent: true });
+    const result = await h.agent.runAgentLoop(agentOptions(h));
+    assert.equal(result.turn.toolCalls, 1);
+    assert.equal(result.turn.rolls.length, 1);
+    assert.match(result.brief, /d20 = \d+/);
+});
+
+test('real agent reuses an answer on continue without another tool call or popup', async () => {
+    let popups = 0;
+    const h = await harness(agentSettings, async (_messages, index) => ({ content: index === 1 ? '<tool name="ask_user">{"question":"Which door?","options":["Left","Right"]}</tool>' : '<brief><must>Alice waits beside the door.</must></brief>' }),
+        { realAgent: true, onPopup(popup) { popups++; return popup.options.customButtons[0].result; } });
+    const first = await h.agent.runAgentLoop(agentOptions(h));
+    assert.equal(first.turn.answer.answer, 'Left');
+    h.savedChat.push({ is_user: false, mes: 'Alice waits.' });
+    const replay = await h.agent.runAgentLoop({ ...agentOptions(h), type: 'continue' });
+    assert.match(replay.brief, /answered a question: "Left"/);
+    assert.equal(popups, 1);
+});
+
+test('real agent filters refusal thoughts and retries once without leaking them', async () => {
+    const h = await harness(agentSettings, async (_messages, index) => ({ content: index === 1 ? '<think>REFUSAL SECRET</think>I cannot assist with that.' : '<brief><must>Alice opens the door.</must></brief>' }), { realAgent: true });
+    const result = await h.agent.runAgentLoop(agentOptions(h));
+    assert.equal(h.requests.length, 2);
+    assert.ok(!JSON.stringify(h.requests[1]).includes('REFUSAL SECRET'));
+    assert.ok(!JSON.stringify(result).includes('REFUSAL SECRET'));
+});
+
+test('real agent dry run cannot write memory or consume its armed flag', async () => {
+    const h = await harness({ ...agentSettings, agentMode: 'armed' }, async (_messages, index) => ({ content: index === 1 ? '<tool name="memory_create">{"title":"Promise","keys":["Alice"],"content":"Alice promised to return at dawn."}</tool>' : '<brief><must>Alice remembers the promise.</must></brief>' }), { realAgent: true });
+    h.agent.armAgent();
+    await h.agent.runAgentLoop({ ...agentOptions(h), dryRun: true });
+    assert.equal(h.agent.isAgentArmed(), true);
+    assert.equal(h.context.chatMetadata.world_info, undefined);
+    assert.equal(h.world.world_names.length, 1);
+});
+
+test('memory preserves existing bindings, ownership, and complete deletion snapshots on undo', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    h.context.chatMetadata.world_info = 'Existing';
+    const ctx = { settings: h.state.getSettings(), turn: { memoryWrites: 0 }, toolState: {} };
+    assert.equal((await h.tools.executeToolCall({ name: 'memory_delete', args: { id: '0' } }, ctx)).ok, false);
+    const created = await h.tools.executeToolCall({ name: 'memory_create', args: { title: 'Promise', keys: ['Alice'], content: 'Alice promised to return at dawn.' } }, ctx);
+    assert.equal(created.ok, true);
+    h.world.books.Existing.entries[1].order = 432;
+    const deleted = await h.tools.executeToolCall({ name: 'memory_delete', args: { id: '1' } }, ctx);
+    assert.equal(deleted.ok, true);
+    assert.equal(await h.tools.undoMemoryLogEntry(1), true);
+    assert.equal(h.world.books.Existing.entries[1].order, 432);
+    assert.equal(h.world.books.Existing.entries[1].smarttavern, true);
+    assert.equal(h.context.chatMetadata.world_info, 'Existing');
+    assert.equal(await h.tools.undoMemoryLogEntry(0), false);
+    assert.ok(h.world.books.Existing.entries[1]);
+    assert.equal(h.tools.memoryLog().length, 1);
+});
+
+test('chat-book creation chooses a unique name and never replaces a missing binding', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    h.world.world_names.push('Chat Book test-chat');
+    assert.equal(await h.tools.ensureChatBook(), 'Chat Book test-chat (1)');
+    h.context.chatMetadata.world_info = 'Missing user book';
+    assert.equal(await h.tools.ensureChatBook(), 'Missing user book');
+    assert.equal(h.context.chatMetadata.world_info, 'Missing user book');
+});
+
+test('memory confirmation closes on stop and cannot commit afterward', async () => {
+    const opened = deferred();
+    const h = await harness({ ...agentSettings, agentMemoryMode: 'confirm' }, async () => ({ content: '<tool name="memory_create">{"title":"Promise","keys":["Alice"],"content":"Alice promised to return at dawn."}</tool>' }),
+        { realAgent: true, onPopup() { opened.resolve(); return undefined; } });
+    h.context.chatMetadata.world_info = 'Existing';
+    const run = h.agent.runAgentLoop(agentOptions(h));
+    await opened.promise;
+    h.context.eventSource.emit('stop');
+    assert.equal(await run, null);
+    assert.equal(Object.keys(h.world.books.Existing.entries).length, 1);
+});
+
+test('skip thinking preserves completed binding rolls while discarding the pending model output', async () => {
+    const opened = deferred(), late = deferred();
+    const h = await harness(agentSettings, async (_messages, index) => {
+        if (index === 1) return { content: '<tool name="roll_dice">{"dice":"d20","reason":"Pick the lock"}</tool>' };
+        opened.resolve();
+        return late.promise;
+    }, { realAgent: true });
+    const run = h.agent.runAgentLoop(agentOptions(h));
+    await opened.promise;
+    h.context.agentControls.onSkip();
+    const result = await run;
+    assert.equal(result.turn.rolls.length, 1);
+    assert.match(result.brief, /Dice \(binding, already rolled\): d20 =/);
+    assert.equal(h.agent.isAgentBusy(), false);
+    late.resolve({ content: '<brief><must>STALE RESULT</must></brief>' });
+    assert.ok(!h.agent.getLastBrief().includes('STALE RESULT'));
+});
+
+test('tool-and-brief output is retained as fallback when the final iteration cannot finish', async () => {
+    const h = await harness({ ...agentSettings, agentMaxIterations: 2 }, async (_messages, index) => ({ content: index === 1
+        ? '<tool name="roll_dice">{"dice":"d20","reason":"Pick the lock"}</tool><brief><must>Alice checks the lock.</must></brief>'
+        : 'no protocol' }), { realAgent: true });
+    const result = await h.agent.runAgentLoop(agentOptions(h));
+    assert.match(result.brief, /Alice checks the lock/);
+    assert.match(result.brief, /d20 =/);
+});
+
+test('ask-user toggle is enforced by the registry', async () => {
+    const h = await harness({ ...agentSettings, agentToolsEnabled: { ask_user: false } }, undefined, { realAgent: true });
+    assert.equal(h.tools.toolEnabled('ask_user'), false);
+    assert.ok(!h.tools.toolCatalog().includes('- ask_user('));
+});
+
+test('tail templates cannot place a story directive ahead of the agent brief', async () => {
+    const directive = { text: '[SCENE DIRECTIVE] Alice must find the key.', must: 'Alice finds the key.' };
+    const h = await harness({ ...agentSettings, expansionEnabled: true, injectAnchor: 'prompt-end', steps: [step('Assessment', 'Assess this scene')], tailPrompt: '{{story}}\n{{brief}}\n{{steps}}\nTEMPLATE FOOTER' },
+        async (_messages, index) => ({ content: index === 1 ? 'Assessment output' : '<brief><must>Alice checks the lock.</must></brief>' }), { realAgent: true, directive });
+    const result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.ok(result.injectionText.endsWith(`${result.brief}\n\n${directive.text}`));
+    assert.equal(result.injectionText.split(directive.text).length, 2);
+    assert.ok(result.injectionText.indexOf('Assessment output') < result.injectionText.indexOf(result.brief));
+});
+
+// The refinement contract (see the pass editor placeholder and the default presets):
+// a revision arrives wrapped in <revised_reply>…</revised_reply>, or the pass answers
+// <audit>PASS</audit> to keep the draft. Bare prose is a skip — the pipeline never
+// adopts untagged output as the reply — so revision fixtures are wrapped.
+const tagged = text => `<revised_reply>${text}</revised_reply>`;
 
 const proseDraft = 'Alice stood beside the open window, listening to the rain. She turned toward the door and quietly asked whether he would stay for dinner. The room smelled of fresh bread and wood smoke, and a small lamp glowed on the table.';
 
@@ -78,7 +244,7 @@ test('a rejected refinement retries the same pass without changing the draft or 
     let popups = 0;
     const revised = proseDraft.replace('quietly', 'softly');
     const h = await harness({ savePassesAsSwipes: true, refinementSteps: [step('Edit', '{{draft}}')] },
-        async (_messages, index) => ({ content: index === 1 ? '<revised_reply></revised_reply>' : revised }),
+        async (_messages, index) => ({ content: index === 1 ? '<revised_reply></revised_reply>' : tagged(revised) }),
         { onPopup(popup) {
             popups++;
             assert.equal(message.mes, proseDraft);
@@ -117,7 +283,7 @@ for (const decision of ['accept', 'retry', 'skip']) {
         const revised = proseDraft.replace('quietly', 'softly');
         let popups = 0;
         const h = await harness({ savePassesAsSwipes: true, refinementSteps: [step('Edit', '{{draft}}')] },
-            async (_messages, index) => ({ content: index === 1 ? failed : revised }),
+            async (_messages, index) => ({ content: index === 1 ? failed : tagged(revised) }),
             { onPopup(popup) {
                 popups++;
                 assert.equal(message.mes, proseDraft);
@@ -140,7 +306,10 @@ for (const decision of ['accept', 'retry', 'skip']) {
         assert.equal(h.requests.length, decision === 'retry' ? 2 : 1);
         assert.equal(message.mes, decision === 'retry' ? revised : proseDraft);
         if (decision === 'skip') assert.equal(result.stepStats[0].skipped, true);
-        else assert.equal(result.stepOutputs.Edit, decision === 'retry' ? revised : failed);
+        else if (decision === 'retry') assert.equal(result.stepOutputs.Edit, tagged(revised));
+        // Accept keeps the last accepted draft; the audit-only failure carries no
+        // revised payload, so the pass records as skipped with empty output.
+        else assert.equal(result.stepOutputs.Edit, '');
     });
 }
 
@@ -189,7 +358,7 @@ test('empty provider output is reviewed without automatic fallback or retries', 
 
 test('refinement accepts repeated non-empty output without generic degeneration filters', async () => {
     const output = '!'.repeat(500);
-    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: output }),
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: tagged(output) }),
         { onPopup() { assert.fail('Non-empty output must not be rejected'); } });
     h.savedChat.push({ name: 'Alice', mes: proseDraft });
     h.pipeline.markFreshGeneration();
@@ -383,7 +552,7 @@ for (const change of ['chat', 'edit', 'swipe', 'delete', 'stop', 'disable']) {
 }
 
 test('refinement persists edits in the selected swipe without adding revisions', async () => {
-    const h = await harness({ savePassesAsSwipes: false, refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: 'Revised' }));
+    const h = await harness({ savePassesAsSwipes: false, refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: tagged('Revised') }));
     const message = { name: 'Alice', mes: 'Draft', swipe_id: 1, swipes: ['Earlier', 'Draft'] };
     h.savedChat.push(message);
     h.pipeline.markFreshGeneration();
@@ -396,7 +565,7 @@ test('refinement persists edits in the selected swipe without adding revisions',
 for (const veiled of [true, false]) {
     test(`refinement preserves existing swipes and aligns metadata (veiled: ${veiled})`, async () => {
         const h = await harness({ savePassesAsSwipes: true, refinementSteps: [step('A', '{{draft}}'), step('B', '{{draft}}')] },
-            async (_messages, index) => ({ content: `Revision ${index}` }), { veiled });
+            async (_messages, index) => ({ content: tagged(`Revision ${index}`) }), { veiled });
         const message = { name: 'Alice', mes: 'Draft', swipe_id: 0, swipes: ['Draft', 'Alternative'],
             swipe_info: [{ extra: { marker: 'first' } }, { extra: { marker: 'second' } }] };
         h.savedChat.push(message);
@@ -773,7 +942,7 @@ for (const savePassesAsSwipes of [true, false]) {
     test(`That's enough accepts the completed veiled pass immediately (save swipes: ${savePassesAsSwipes})`, async () => {
         const started = deferred(), response = deferred();
         const h = await harness({ genRetries: 2, savePassesAsSwipes, refinementSteps: [step('A', '{{draft}}'), step('B', '{{draft}}'), step('C', '{{draft}}')] },
-            async (_messages, index) => { if (index === 1) return { content: 'First revision' }; started.resolve(); return response.promise; }, { veiled: true });
+            async (_messages, index) => { if (index === 1) return { content: tagged('First revision') }; started.resolve(); return response.promise; }, { veiled: true });
         const message = { name: 'Alice', mes: 'Original', swipes: ['Original', 'Alternative'], swipe_id: 0 };
         h.savedChat.push(message);
         h.pipeline.markFreshGeneration();
@@ -815,7 +984,7 @@ test("That's enough during the first pass keeps the original draft", async () =>
 test('global Stop preserves swipe consistency after a completed veiled pass', async () => {
     const started = deferred(), response = deferred();
     const h = await harness({ savePassesAsSwipes: true, refinementSteps: [step('A', '{{draft}}'), step('B', '{{draft}}')] },
-        async (_messages, index) => { if (index === 1) return { content: 'First revision' }; started.resolve(); return response.promise; }, { veiled: true });
+        async (_messages, index) => { if (index === 1) return { content: tagged('First revision') }; started.resolve(); return response.promise; }, { veiled: true });
     const message = { name: 'Alice', mes: 'Original', swipes: ['Original'], swipe_id: 0 };
     h.savedChat.push(message);
     h.pipeline.markFreshGeneration();
