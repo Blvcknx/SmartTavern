@@ -497,10 +497,21 @@
     opacity: 0.85;
 }
 
-#smarttavern_activity_body .smarttavern_act_close {
+#smarttavern_activity_body .smarttavern_act_clear {
     margin-left: auto;
+    white-space: nowrap;
+}
+
+#smarttavern_activity_body .smarttavern_act_clear,
+#smarttavern_activity_body .smarttavern_act_close {
+    flex-shrink: 0;
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    padding: 4px 6px;
+    font: inherit;
     cursor: pointer;
-    opacity: 0.8;
 }
 
 #smarttavern_activity_body .smarttavern_act_current {
@@ -534,6 +545,8 @@
 }
 
 #smarttavern_activity_body .smarttavern_act_entry {
+    /* Keep entries readable as calls accumulate; the log handles scrolling. */
+    flex-shrink: 0;
     border: 1px solid var(--SmartThemeBorderColor);
     border-radius: 10px;
     overflow: hidden;
@@ -547,15 +560,58 @@
     word-break: break-word;
 }
 
+#smarttavern_activity_body summary.smarttavern_act_entry_head {
+    cursor: pointer;
+}
+
+#smarttavern_activity_body .smarttavern_act_preview {
+    display: block;
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: normal;
+    opacity: 0.75;
+}
+
+#smarttavern_activity_body details[open] .smarttavern_act_preview {
+    display: none;
+}
+
+#smarttavern_activity_body .smarttavern_act_entry_actions {
+    padding: 6px 8px 0;
+}
+
+#smarttavern_activity_body .smarttavern_act_read {
+    width: auto;
+    margin: 0;
+    font-size: 0.9em;
+}
+
 #smarttavern_activity_body .smarttavern_act_entry pre.smarttavern_act_text {
     margin: 0;
     padding: 8px;
-    max-height: 12em;
-    overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-word;
     font-family: var(--monoFontFamily, monospace);
     font-size: 0.9em;
+}
+
+.smarttavern_act_reader {
+    text-align: left;
+    user-select: text;
+}
+
+.smarttavern_act_reader pre {
+    margin: 0;
+    padding: 12px;
+    background: var(--black30a);
+    border-radius: 8px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 1em;
+    line-height: 1.5;
 }
 
 /* Keep both the folded chip and its wider log centered on narrow screens. */

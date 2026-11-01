@@ -184,6 +184,12 @@ reasoning channel when provided by the connection. The timeout defaults to **0
 Existing installations using the former 90-second default migrate to unlimited once;
 custom deadlines are preserved. **Skip thinking** and Stop remain available.
 
+Click the generation activity chip to inspect completed calls. Entries show a short
+preview; click a heading to expand its output, or choose **Read full output** for a
+larger reading window. Closing the activity panel keeps the log and expanded entries
+intact. The chip stays available while entries are retained; **Clear log** removes
+them explicitly. Activity is kept in memory until cleared or the page is reloaded.
+
 The agent has three GM capabilities:
 
 - **Committed dice outcomes:** `roll_dice` requires `outcomes: [{min, max, text}]`

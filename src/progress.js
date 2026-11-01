@@ -3,6 +3,7 @@
 // Folded it shows the current phase on a status chip; unfolded it reveals a log of every
 // call with its output content as it arrives. Internal calls are not token-streamed, so
 // content appears per completed call; a spinner row marks the call in flight.
+import { getContext } from '../../../../extensions.js';
 import { getSettings } from './state.js';
 import { chipsHtml, setChipState } from './chips.js';
 
@@ -48,7 +49,8 @@ function build() {
                 <div class="smarttavern_act_head">
                     <i class="fa-solid fa-brain"></i>
                     <span>SmartTavern — generation activity</span>
-                    <i class="fa-solid fa-xmark smarttavern_act_close" title="Hide"></i>
+                    <button type="button" class="smarttavern_act_clear" title="Clear retained activity entries">Clear log</button>
+                    <button type="button" class="smarttavern_act_close" title="Collapse activity" aria-label="Collapse activity"><i class="fa-solid fa-xmark"></i></button>
                 </div>
                 <div class="smarttavern_act_steps"></div>
                 <div class="smarttavern_act_refinement_controls" hidden></div>
@@ -64,7 +66,16 @@ function build() {
     $steps = $root.find('.smarttavern_act_steps');
     $log = $root.find('.smarttavern_act_log');
     $root.on('click', '#smarttavern_activity_chip', () => setExpanded(!expanded));
-    $root.on('click', '.smarttavern_act_close', hide);
+    $root.on('click', '.smarttavern_act_close', () => setExpanded(false));
+    $root.on('click', '.smarttavern_act_clear', () => {
+        $log.empty();
+        errorPending = false;
+        render();
+    });
+    $root.on('click', '.smarttavern_act_read', function () {
+        const entry = $(this).closest('.smarttavern_act_entry');
+        void readEntry(entry.find('.smarttavern_act_entry_title').text(), entry.find('.smarttavern_act_text').text());
+    });
     $(document.body).append($root);
     render();
 }
@@ -87,21 +98,19 @@ function hide() {
     stopTicker();
     if ($root) {
         $root.removeClass('show');
-        $log.empty();
-        $steps.empty().removeClass('is-active');
-        setCurrent(null);
     }
     expanded = false;
-    errorPending = false;
-    statusText = '';
     render();
     emitState();
 }
 
-/** Auto-hide the chip once idle, folded and error-free. Open popups and errors stay. */
+/** Retained entries keep the chip available for reopening until explicitly cleared. */
 function scheduleIdleHide() {
-    if (runCount > 0 || expanded || errorPending) return;
-    if (idleTimer) clearTimeout(idleTimer);
+    if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+    }
+    if (runCount > 0 || expanded || errorPending || $log?.children().length || !$root?.hasClass('show')) return;
     idleTimer = setTimeout(hide, IDLE_HIDE_MS);
 }
 
@@ -169,7 +178,7 @@ function emitState() {
 function applyFloatingState() {
     if (!$root) return;
     if (!floatingAllowed()) hide();
-    else if (runCount > 0) show();
+    else if (runCount > 0 || $log.children().length) show();
 }
 
 // --------------------------------------------------------------------------------------------
@@ -179,6 +188,7 @@ function applyFloatingState() {
 /** Opens a tracked run (pipeline pass, profile bootstrap/update). Nests safely. */
 export function activityStart({ status = 'Working…' } = {}) {
     build();
+    if (runCount === 0) errorPending = false;
     runCount++;
     runStartedAt = Date.now();
     if (status) statusText = String(status);
@@ -237,11 +247,37 @@ export function activityEntry({ title = '', text = '', tone = 'ok' } = {}) {
     show();
     const logEl = $log.get(0);
     const stick = !logEl || (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 48;
-    const head = title ? `<div class="smarttavern_act_entry_head">${escapeHtml(title)}</div>` : '';
-    const body = text ? `<pre class="smarttavern_act_text">${escapeHtml(text)}</pre>` : '';
-    $log.append(`<div class="smarttavern_act_entry smarttavern_act_${tone}">${head}${body}</div>`);
+    const titleHtml = `<span class="smarttavern_act_entry_title">${escapeHtml(title || 'Activity output')}</span>`;
+    const toneClass = ['ok', 'info', 'error'].includes(tone) ? tone : 'info';
+    if (text) {
+        const preview = String(text).replace(/\s+/g, ' ').trim().slice(0, 160);
+        $log.append(`<details class="smarttavern_act_entry smarttavern_act_${toneClass}">
+            <summary class="smarttavern_act_entry_head">${titleHtml}<span class="smarttavern_act_preview">${escapeHtml(preview)}</span></summary>
+            <div class="smarttavern_act_entry_actions"><button type="button" class="menu_button smarttavern_act_read">Read full output</button></div>
+            <pre class="smarttavern_act_text">${escapeHtml(text)}</pre>
+        </details>`);
+    } else {
+        $log.append(`<div class="smarttavern_act_entry smarttavern_act_${toneClass}"><div class="smarttavern_act_entry_head">${titleHtml}</div></div>`);
+    }
     if (stick && logEl) logEl.scrollTop = logEl.scrollHeight;
     render();
+}
+
+/** Snapshot the selected output so incoming activity never replaces the reader's text. */
+async function readEntry(title, text) {
+    const context = getContext();
+    const content = document.createElement('div');
+    content.className = 'smarttavern_act_reader';
+    const heading = document.createElement('h3');
+    heading.textContent = title;
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    content.append(heading, pre);
+    await context.callGenericPopup(content, context.POPUP_TYPE.TEXT, '', {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: true,
+    });
 }
 
 /** Failure entry: alerts, auto-unfolds and keeps the chip visible until dismissed. */
