@@ -67,12 +67,12 @@ export const DEFAULT_STEPS = Object.freeze([
 // Per-step `lookback`: messages of chat history for {{chat}} in that step
 // (null = use the global `chatLookback`, 0 = no chat history).
 // Per-step `editMode`: 'surgical' (default preset) sends the draft as numbered
-// paragraphs and the model returns only the paragraphs it changes via
-// <edit id="N">…</edit> / <delete id="N"/> / <insert after="N">…</insert> — a pass
+// paragraphs and the model returns only changed chunks via <replace>, or whole
+// paragraph operations via <edit> / <delete> / <insert> — a pass
 // that touches 10% of the reply costs a fraction of a full rewrite's output
 // tokens, which makes refinement drastically faster. 'full' keeps the classic
 // whole-reply <revised_reply> contract.
-export const DEFAULT_REFINEMENT_STEPS = Object.freeze([
+export const LEGACY_SURGICAL_REFINEMENT_STEPS = Object.freeze([
     {
         name: 'Body & Spatial Awareness',
         enabled: true,
@@ -134,6 +134,13 @@ export const DEFAULT_REFINEMENT_STEPS = Object.freeze([
         ].join('\n'),
     },
 ]);
+
+// Keep the previous preset above for exact-match migration of saved prompts.
+const TEXT_REPLACEMENT_INSTRUCTIONS = 'Prefer <replace id="N"><find>exact original text</find><with>replacement text</with></replace> for a phrase or sentence. Copy <find> exactly, including whitespace and markup; it must occur exactly once in that paragraph (include more context if needed). Multiple replacements in one paragraph must not overlap and must all refer to the original draft. Use an empty <with></with> to remove a chunk. Use <edit id="N">complete paragraph</edit> only when most of a paragraph needs rewriting; never combine it or <delete> with replacements for the same paragraph. Use <delete id="N"/> to drop a paragraph or <insert after="N">...</insert> to add one. Preserve unchanged text, events, dialogue meaning, pacing and formatting. Output only operation tags, with no audit explanation. If nothing needs changing, output <audit>PASS</audit> only.';
+export const DEFAULT_REFINEMENT_STEPS = Object.freeze(LEGACY_SURGICAL_REFINEMENT_STEPS.map(step => ({
+    ...step,
+    prompt: step.prompt.slice(0, step.prompt.lastIndexOf('\n') + 1) + TEXT_REPLACEMENT_INSTRUCTIONS,
+})));
 
 // The pre-surgical default passes (whole-reply <revised_reply> contract), kept verbatim
 // so a stored config still carrying one of them upgrades to the surgical preset once.
@@ -396,6 +403,15 @@ function normalizeSettings(settings) {
             }
         }
         settings.refinementContractVersion = 2;
+        changed = true;
+    }
+    if (settings.refinementTextEditsVersion !== 1) {
+        for (const step of (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])) {
+            if (!isPlainObject(step) || step.editMode !== 'surgical') continue;
+            const index = LEGACY_SURGICAL_REFINEMENT_STEPS.findIndex(preset => preset.name === step.name && preset.prompt === step.prompt);
+            if (index >= 0) step.prompt = DEFAULT_REFINEMENT_STEPS[index].prompt;
+        }
+        settings.refinementTextEditsVersion = 1;
         changed = true;
     }
     const normalizeStepList = (steps) => {

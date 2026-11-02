@@ -44,19 +44,18 @@ const STEP_SYSTEM = 'You are a state-assessment engine for an interactive fictio
 const REFINEMENT_SYSTEM = 'You are a surgical prose editor and continuity auditor for an interactive fiction platform. Make only the targeted adjustments requested by the user prompt while preserving the original scene events, pacing, and structure. Output only the final revised reply (or the requested XML tags) with no meta-commentary or preamble.';
 
 // Surgical passes ('editMode: surgical'): the draft arrives as numbered paragraphs
-// (<p id="1">…) and the model returns only the paragraphs it changed, as
-// <edit id="N">…</edit>, <delete id="N"/> and <insert after="N">…</insert> tags.
+// (<p id="1">…) and the model returns exact text replacements, paragraph edits,
+// deletions or insertions. Unchanged text stays in the locally held draft.
 // Unchanged paragraphs are never re-emitted, so a pass that touches 10% of the
 // reply costs a fraction of a full rewrite's output tokens — this is the whole
 // point of the mode: drastically faster passes. <audit>PASS</audit> keeps the
 // draft. Tag-based (never JSON) so reasoning models cannot corrupt a payload.
-const SURGICAL_SYSTEM = 'You are a surgical prose editor for an interactive fiction platform. The draft reply is provided as numbered paragraphs (<p id="1">, <p id="2">, …). Make only the targeted adjustments requested by the user prompt. Output <edit id="N">…</edit> containing the complete replacement text for every paragraph you change, <delete id="N"/> to remove a paragraph, and <insert after="N">…</insert> (or <insert after="end">) to add a new one. Ids must match the draft exactly. Never quote or re-output paragraphs you are not changing: unchanged paragraphs must not appear in your output at all. If nothing needs changing, output <audit>PASS</audit> only. Output only the requested tags with no meta-commentary or preamble.';
+const SURGICAL_SYSTEM = 'You are a surgical prose editor for an interactive fiction platform. The draft reply is provided as numbered paragraphs (<p id="1">, <p id="2">, …). Make only the targeted adjustments requested by the user prompt. Prefer <replace id="N"><find>exact original text</find><with>replacement text</with></replace> to change a phrase or sentence within paragraph N. Copy <find> exactly, including whitespace and markup; it must match exactly once in that paragraph. Include more context if ambiguous. Multiple replacements in one paragraph must not overlap and must refer to the original draft. An empty <with></with> deletes the matched chunk. Use <edit id="N">…</edit> for a complete paragraph replacement only when most of it needs rewriting; never mix it or <delete> with replacements for the same paragraph. Output <delete id="N"/> to remove a paragraph, and <insert after="N">…</insert> (or <insert after="end">) to add a new one. Ids must match the draft exactly. Never quote or re-output paragraphs you are not changing: unchanged paragraphs must not appear in your output at all. Do not output audit explanations. If nothing needs changing, output <audit>PASS</audit> only. Output only the requested tags with no meta-commentary or preamble.';
 
 // Built-in enforcement pass, prepended to the refinement list while REQUIRED EVENTS are
 // pending: the story beat's must, the thinking agent's musts and one line per binding
 // dice roll. Runs in surgical mode (see SURGICAL_SYSTEM): <audit>PASS</audit> keeps the
-// draft, otherwise <audit>reasoning</audit> plus only the paragraphs that must change —
-// <edit id="N">…</edit> / <insert after="N">…</insert> tags weaving the missing event(s)
+// draft, otherwise only operation tags weaving the missing event(s)
 // in, usually near the top of the draft.
 const DIRECTIVE_ENFORCEMENT_NAME = 'Directive Enforcement';
 const DIRECTIVE_ENFORCEMENT_PROMPT = [
@@ -71,7 +70,7 @@ const DIRECTIVE_ENFORCEMENT_PROMPT = [
     '{{draft}}',
     '',
     'If every event is contained: output <audit>PASS</audit> only.',
-    'If any is missing: reason briefly in <audit>...</audit>, then weave the missing event(s) in with <edit id="N">...</edit> (full replacement text for that paragraph) and/or <insert after="N">...</insert> tags, editing as few paragraphs as possible and placing the event(s) in the first half. Match voice and format. Dice results are binding: the reply must reflect their outcome (a low roll fails, a high roll succeeds). Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
+    'If any is missing: output only operation tags. Prefer <replace id="N"><find>exact original text</find><with>replacement text</with></replace> for small changes, or weave the missing event(s) in with <edit id="N">...</edit> (full replacement text for that paragraph) and/or <insert after="N">...</insert> tags, editing as few paragraphs as possible and placing the event(s) in the first half. Match voice and format. Dice results are binding: the reply must reflect their outcome (a low roll fails, a high roll succeeds). Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
 ].join('\n');
 
 // Characters whose bootstrap already failed this session — no retry spam per generation.
@@ -951,7 +950,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
             }, onEnough: () => { control.accepted = true; control.cancel(); } });
             try {
                 // Surgical mode: the draft travels as numbered paragraphs and the
-                // model returns only the paragraphs it changes (see SURGICAL_SYSTEM).
+                // model returns only text/paragraph changes (see SURGICAL_SYSTEM).
                 // Full mode keeps the classic whole-reply <revised_reply> contract.
                 const surgical = step.editMode === 'surgical';
                 const draftBlocks = surgical ? paragraphBlocks(currentDraft) : null;

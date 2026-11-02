@@ -177,7 +177,17 @@ The model then returns only what changes:
 - `<insert after="1">A new paragraph.</insert>` (`after="end"` appends)
 - `<audit>PASS</audit>` — nothing needs changing; unchanged paragraphs are **never** re-emitted
 
-The patch is validated (ids must exist, no paragraph changed twice, no empty edits) and applied with the draft's original paragraph separators preserved. Invalid patches are treated like any rejected pass: the Retry / Skip / Review popup opens with the exact issue, so even small or old models cannot corrupt the reply — worst case the pass is retried or skipped. `<revised_reply>` remains honored in surgical mode as a full-rewrite escape hatch, and models that ignore the protocol and echo the numbered draft, wrap it in one big `<edit>`, or add prose around their tags are all repaired into the same patch format instead of failing.
+For a phrase or sentence, prefer an exact text replacement:
+
+```xml
+<replace id="1"><find>stood beside the open window</find><with>sat beside the open window</with></replace>
+```
+
+`<find>` must match exactly once in that paragraph, including whitespace, punctuation and markup. Include more context if the phrase repeats. `<with></with>` deletes the matched chunk. Multiple replacements may target the same paragraph when they do not overlap; all refer to the draft as it appeared at the start of the pass. Surrounding text stays unchanged. Do not combine replacements with another operation on the same paragraph.
+
+The patch is validated (ids must exist, no conflicting operations, no empty paragraph edits) and applied with the draft's original paragraph separators preserved. Missing, ambiguous or overlapping text matches reject the entire patch. Invalid patches are treated like any rejected pass: the Retry / Skip / Review popup opens with the exact issue, so even small or old models cannot corrupt the reply — worst case the pass is retried or skipped. `<revised_reply>` remains honored in surgical mode as a full-rewrite escape hatch, and models that ignore the protocol and echo the numbered draft, wrap it in one big `<edit>`, or add prose around their tags are all repaired into the same patch format instead of failing.
+
+Default surgical prompts request operation tags only, without a written audit explanation. Existing unmodified surgical presets upgrade automatically; custom prompts remain intact. Actual latency depends on the model and its reasoning settings; smaller replacements reduce output tokens but do not eliminate the cost of reading the draft. To reduce calls further, combine checks into one pass. To reduce input, lower each pass's chat lookback or omit unnecessary definitions. Refinement passes run sequentially so later passes can inspect earlier edits.
 
 The parser is deliberately hardened for weak/reasoning models (e.g. DeepSeek R1): unclosed tags salvage to end-of-output, `<think>` reasoning blocks are stripped, unquoted or misquoted attributes still parse, and there is no JSON anywhere in the protocol — a tag grammar cannot be corrupted the way a half-emitted JSON object can.
 

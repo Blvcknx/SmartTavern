@@ -1,9 +1,8 @@
 // SmartTavern — surgical refinement helpers: paragraph splitting, numbered draft
-// rendering and the <edit>/<delete>/<insert> patch parser/validator/applier.
+// rendering and the <replace>/<edit>/<delete>/<insert> parser/validator/applier.
 //
 // Surgical passes send the draft as numbered paragraphs and receive only the
-// paragraphs that changed — a pass that touches 10% of the reply costs 10% of a
-// full rewrite's tokens, which is the entire point: drastically faster passes.
+// changed phrases, sentences or paragraphs, reducing generated output tokens.
 // The parser is deliberately forgiving toward small or old models (DeepSeek R1
 // and friends): unclosed tags are salvaged to end-of-output, <think> reasoning
 // blocks are stripped, and models that ignore the protocol and echo either a
@@ -188,6 +187,7 @@ function echoEdits(raw) {
  *  - `<revised_reply>`/`<final_reply>` payload → kind 'full'; a numbered draft
  *    inside the payload is mapped back into per-paragraph edits when possible
  *  - `<edit id="N">…</edit>` / `<delete id="N"/>` / `<insert after="N">…</insert>`
+ *    / `<replace id="N"><find>…</find><with>…</with></replace>`
  *    ops → kind 'ops' (unclosed tags salvage to end-of-output)
  *  - a bare echoed numbered draft → per-paragraph edits (repair)
  *
@@ -212,13 +212,19 @@ export function parseDraftEdits(rawOutput) {
     }
 
     const order = [];
-    for (const kind of ['edit', 'delete', 'insert']) {
+    for (const kind of ['edit', 'delete', 'insert', 'replace']) {
         for (const span of collectSpans(raw, kind)) order.push({ kind, span });
     }
     order.sort((a, b) => a.span.start - b.span.start);
     const ops = [];
     for (const { kind, span } of order) {
-        if (kind === 'edit') {
+        if (kind === 'replace') {
+            // Exact text: preserve whitespace, markup and punctuation inside both
+            // fields. Unlike paragraph edits, an empty replacement is a deletion.
+            const find = span.body.match(/<find>([\s\S]*?)<\/find>/i);
+            const replacement = span.body.match(/<with>([\s\S]*?)<\/with>/i);
+            ops.push({ type: 'replace', id: anchorValue(span.rawTag), find: find?.[1], body: replacement?.[1] });
+        } else if (kind === 'edit') {
             const id = anchorValue(span.rawTag);
             const body = span.body;
             // Repair: one <edit> wrapping the whole numbered draft becomes
@@ -254,8 +260,9 @@ export function parseDraftEdits(rawOutput) {
 
 /**
  * Validates a parsed patch against the numbered draft: edit/delete/insert ids
- * must exist in the draft, ids may not repeat, and an empty edit body is an
- * error (use <delete> to remove a paragraph).
+ * must exist in the draft. Text replacements must match uniquely and cannot
+ * overlap or mix with another operation on the same paragraph. An empty edit
+ * body is an error (use <delete> to remove a paragraph).
  *
  * @returns {string[]} issue list; empty when the patch is applicable.
  */
@@ -265,12 +272,31 @@ export function editIssues(patch, blocks) {
     if (patch.kind === 'pass' || patch.kind === 'full') return [];
     const issues = [];
     const seen = new Set();
+    const ranges = new Map();
     for (const op of patch.ops) {
         if (op.type === 'insert' && op.anchor === 'end') continue;
         const id = op.type === 'insert' ? op.anchor : op.id;
         const valid = Number.isInteger(id) && id >= 1 && id <= count;
         if (!valid) issues.push(`Paragraph ${id ?? '(missing)'} is out of range — the draft has ${count} paragraph(s).`);
-        else if (seen.has(id)) issues.push(`Paragraph ${id} is changed more than once.`);
+        else if (op.type === 'replace') {
+            if (seen.has(id)) issues.push(`Paragraph ${id} mixes text replacements with another operation.`);
+            if (!op.find || typeof op.body !== 'string') {
+                issues.push(`Replacement for paragraph ${id} requires a non-empty <find> and a <with> field (which may be empty).`);
+                continue;
+            }
+            const text = blocks[id - 1].text;
+            const start = text.indexOf(op.find);
+            if (start < 0) issues.push(`Replacement text in paragraph ${id} was not found. Copy <find> exactly from the draft.`);
+            else if (text.indexOf(op.find, start + 1) !== -1) issues.push(`Replacement text in paragraph ${id} is ambiguous. Include more surrounding text in <find>.`);
+            else {
+                const end = start + op.find.length;
+                const previous = ranges.get(id) ?? [];
+                if (previous.some(range => start < range.end && end > range.start)) issues.push(`Text replacements in paragraph ${id} overlap.`);
+                previous.push({ start, end });
+                ranges.set(id, previous);
+            }
+        }
+        else if (seen.has(id) || ranges.has(id)) issues.push(`Paragraph ${id} is changed more than once.`);
         else if (op.type === 'edit' && !String(op.body ?? '').trim()) issues.push(`Edit for paragraph ${id} is empty.`);
         else seen.add(id);
     }
@@ -289,14 +315,29 @@ export function applyDraftEdits(patch, blocks) {
     if (!patch) return null;
     if (patch.kind === 'pass') return null;
     if (patch.kind === 'full') return patch.text || null;
+    if (editIssues(patch, blocks).length) return null;
 
     const edits = new Map();
     const deletes = new Set();
     const inserts = [];
+    const replacements = new Map();
     for (const op of patch.ops) {
         if (op.type === 'edit') edits.set(op.id, op.body);
         else if (op.type === 'delete') deletes.add(op.id);
+        else if (op.type === 'replace') {
+            if (!replacements.has(op.id)) replacements.set(op.id, []);
+            replacements.get(op.id).push({ ...op, start: blocks[op.id - 1].text.indexOf(op.find) });
+        }
         else inserts.push(op);
+    }
+    // All matches refer to the original paragraph. Apply right to left so an
+    // earlier replacement cannot shift or accidentally create a later match.
+    for (const [id, ops] of replacements) {
+        let text = blocks[id - 1].text;
+        for (const op of ops.sort((a, b) => b.start - a.start)) {
+            text = text.slice(0, op.start) + op.body + text.slice(op.start + op.find.length);
+        }
+        edits.set(id, text);
     }
     const tail = inserts.filter(op => op.anchor === 'end');
     // Slot = paragraph id the insert attaches to. 'before' inserts emit ahead of

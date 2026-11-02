@@ -539,6 +539,61 @@ test('a surgical pass that changes nothing keeps the draft and records a skip', 
     assert.equal(result.stepStats[0].skipped, true);
 });
 
+test('text replacements preserve surrounding prose and use original offsets in either order', async () => {
+    const { edits } = await harness();
+    const draft = 'Keep *this*. She stood.  He waited.\n\nUntouched.';
+    const blocks = edits.paragraphBlocks(draft);
+    for (const ops of [
+        '<replace id="1"><find>She stood.</find><with>She sat.</with></replace><replace id="1"><find>He waited.</find><with>She stood.</with></replace>',
+        '<replace id="1"><find>He waited.</find><with>She stood.</with></replace><replace id="1"><find>She stood.</find><with>She sat.</with></replace>',
+    ]) {
+        const patch = edits.parseDraftEdits(ops);
+        assert.equal(edits.editIssues(patch, blocks).length, 0);
+        assert.equal(edits.applyDraftEdits(patch, blocks), 'Keep *this*. She sat.  She stood.\n\nUntouched.');
+    }
+    const deletion = edits.parseDraftEdits('<replace id="1"><find>  He waited.</find><with></with></replace>');
+    assert.equal(edits.applyDraftEdits(deletion, blocks), 'Keep *this*. She stood.\n\nUntouched.');
+    const literal = edits.parseDraftEdits('<replace id="1"><find>*this*</find><with> $& <em>that</em> </with></replace>');
+    assert.equal(edits.applyDraftEdits(literal, blocks), 'Keep  $& <em>that</em> . She stood.  He waited.\n\nUntouched.');
+});
+
+test('unsafe text replacements are rejected atomically', async () => {
+    const { edits } = await harness();
+    const blocks = edits.paragraphBlocks('One. One. Two.');
+    const replace = (find, body = 'Changed.') => `<replace id="1"><find>${find}</find><with>${body}</with></replace>`;
+    for (const [raw, issue] of [
+        [replace('Absent.'), /not found/],
+        [replace('One.'), /ambiguous/],
+        [replace(''), /non-empty/],
+        ['<replace id="1"><find>Two.</find></replace>', /<with>/],
+        ['<replace><find>Two.</find><with>Three.</with></replace>', /out of range/],
+        [replace('Two.') + replace('Two.'), /overlap/],
+        [replace('One. One.') + replace('One. Two.'), /overlap/],
+        [replace('Two.') + '<edit id="1">Rewritten.</edit>', /more than once/],
+        ['<delete id="1"/>' + replace('Two.'), /mixes/],
+    ]) {
+        const patch = edits.parseDraftEdits(raw);
+        assert.match(edits.editIssues(patch, blocks).join(' '), issue, raw);
+        assert.equal(edits.applyDraftEdits(patch, blocks), null, raw);
+    }
+});
+
+test('surgical pipeline saves exact text replacements and passes the updated draft onward', async () => {
+    const h = await harness({ savePassesAsSwipes: true, refinementSteps: [surgicalStep('Edit', '{{draft}}'), surgicalStep('Check', '{{draft}}')] },
+        async (_messages, index) => ({ content: index === 1
+            ? '<replace id="2"><find>quietly</find><with>softly</with></replace>'
+            : '<audit>PASS</audit>' }));
+    const message = { name: 'Alice', mes: multiDraft, swipes: [multiDraft], swipe_id: 0 };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.match(h.requests[0].messages[0].content, /<replace id="N">/);
+    assert.ok(h.requests[1].messages.at(-1).content.includes('softly'));
+    assert.equal(result.changed, 1);
+    assert.equal(message.mes, multiDraft.replace('quietly', 'softly'));
+    assert.equal(message.swipes[1], message.mes);
+});
+
 test('surgical passes accept a full revised_reply as an escape hatch', async () => {
     const h = await harness({ refinementSteps: [surgicalStep('Edit', '{{draft}}')] },
         async () => ({ content: tagged(multiDraft.replace('open window', 'half-open window')) }));
@@ -598,6 +653,22 @@ test('legacy default refinement prompts migrate to surgical; custom prompts stay
     assert.equal(steps[3].editMode, 'full');
     assert.equal(steps[3].prompt, custom.prompt);
     assert.equal(h.state.getSettings().refinementContractVersion, 2);
+});
+
+test('saved paragraph presets upgrade to text replacements while custom prompts and routing survive', async () => {
+    const probe = await harness();
+    const saved = probe.state.LEGACY_SURGICAL_REFINEMENT_STEPS.map(s => ({ ...s, profileId: 'editor', lookback: 2 }));
+    const custom = { ...saved[0], prompt: saved[0].prompt + '\nMy custom rule.' };
+    const h = await harness({ refinementContractVersion: 2, refinementSteps: [...saved, custom] });
+    const settings = h.state.getSettings();
+    for (const step of settings.refinementSteps.slice(0, 3)) {
+        assert.ok(step.prompt.includes('<replace id="N">'));
+        assert.ok(!step.prompt.includes('First reason briefly'));
+        assert.equal(step.profileId, 'editor');
+        assert.equal(step.lookback, 2);
+    }
+    assert.equal(settings.refinementSteps[3].prompt, custom.prompt);
+    assert.equal(settings.refinementTextEditsVersion, 1);
 });
 
 test('dry run surgical passes validate patches without mutating chat', async () => {

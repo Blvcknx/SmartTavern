@@ -960,7 +960,7 @@ function renderStepEditor() {
 /** Renders one pipeline's editable step cards into `container`. */
 function renderStepCards($container, steps, { refinement = false } = {}) {
     const placeholder = refinement
-        ? 'Prompt for this pass. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{draft}}, {{original_draft}}, {{draft_plain}}, {{draft_paragraphs}}. Surgical passes receive the draft as numbered paragraphs; the model returns <edit id="N">…</edit> / <delete id="N"/> / <insert after="N">…</insert> (or <audit>PASS</audit> to keep the draft). Full passes wrap the whole revised reply in <revised_reply></revised_reply> instead.'
+        ? 'Prompt for this pass. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{draft}}, {{original_draft}}, {{draft_plain}}, {{draft_paragraphs}}. Surgical passes receive the draft as numbered paragraphs; the model returns <replace id="N"><find>exact text</find><with>replacement</with></replace> for phrases or sentences, or <edit id="N">…</edit> / <delete id="N"/> / <insert after="N">…</insert> (or <audit>PASS</audit> to keep the draft). Full passes wrap the whole revised reply in <revised_reply></revised_reply> instead.'
         : 'Prompt for this step. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{steps}}.';
     $container.empty();
     steps.forEach((step, index) => {
@@ -976,7 +976,7 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
                     </label>
                     <input class="text_margin_input smarttavern_step_name" type="text" value="${escapeHtml(step.name)}" title="Step name (target of {{step:Name}})">
                     ${refinement ? `
-                    <select class="smarttavern_step_editmode" title="How this pass may change the draft. Surgical: the draft is sent as numbered paragraphs and the model returns only the paragraphs it changes (much faster). Full: the model rewrites and returns the whole reply.">
+                    <select class="smarttavern_step_editmode" title="How this pass may change the draft. Surgical: the draft is sent as numbered paragraphs and the model returns only changed phrases, sentences or paragraphs (much faster). Full: the model rewrites and returns the whole reply.">
                         <option value="surgical"${editMode === 'surgical' ? ' selected' : ''}>Surgical edits</option>
                         <option value="full"${editMode === 'full' ? ' selected' : ''}>Full rewrite</option>
                     </select>` : ''}
@@ -1151,7 +1151,7 @@ function addStep(listKey) {
 async function restoreDefaultRefinementSteps() {
     const confirmed = await confirmPopup(
         'Load the default refinement passes?',
-        'This replaces your refinement pass list with the 3-pass preset: Body & Spatial Awareness, Character & Psychological Authenticity, and Prose & Wording Polish — all in surgical mode (the model edits only the paragraphs it changes). Expansion steps are not touched.',
+        'This replaces your refinement pass list with the 3-pass preset: Body & Spatial Awareness, Character & Psychological Authenticity, and Prose & Wording Polish — all in surgical mode (the model returns only changed phrases, sentences or paragraphs). Expansion steps are not touched.',
     );
     if (!confirmed) return;
     getSettings().refinementSteps = structuredClone(DEFAULT_REFINEMENT_STEPS).map(s => ({ ...s }));
