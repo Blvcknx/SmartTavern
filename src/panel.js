@@ -960,11 +960,12 @@ function renderStepEditor() {
 /** Renders one pipeline's editable step cards into `container`. */
 function renderStepCards($container, steps, { refinement = false } = {}) {
     const placeholder = refinement
-        ? 'Prompt for this pass. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{draft}}, {{original_draft}}. Wrap the revised reply in <revised_reply></revised_reply> or answer <audit>PASS</audit> to keep the draft.'
+        ? 'Prompt for this pass. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{draft}}, {{original_draft}}, {{draft_plain}}, {{draft_paragraphs}}. Surgical passes receive the draft as numbered paragraphs; the model returns <edit id="N">…</edit> / <delete id="N"/> / <insert after="N">…</insert> (or <audit>PASS</audit> to keep the draft). Full passes wrap the whole revised reply in <revised_reply></revised_reply> instead.'
         : 'Prompt for this step. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{steps}}.';
     $container.empty();
     steps.forEach((step, index) => {
         const role = STEP_ROLES.includes(step.role) ? step.role : 'assistant';
+        const editMode = step.editMode === 'surgical' ? 'surgical' : 'full';
         const card = $(`
             <div class="smarttavern_step_card">
                 <div class="smarttavern_step_header">
@@ -974,6 +975,11 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
                         <span>Enabled</span>
                     </label>
                     <input class="text_margin_input smarttavern_step_name" type="text" value="${escapeHtml(step.name)}" title="Step name (target of {{step:Name}})">
+                    ${refinement ? `
+                    <select class="smarttavern_step_editmode" title="How this pass may change the draft. Surgical: the draft is sent as numbered paragraphs and the model returns only the paragraphs it changes (much faster). Full: the model rewrites and returns the whole reply.">
+                        <option value="surgical"${editMode === 'surgical' ? ' selected' : ''}>Surgical edits</option>
+                        <option value="full"${editMode === 'full' ? ' selected' : ''}>Full rewrite</option>
+                    </select>` : ''}
                     ${refinement ? '' : `
                     <select class="smarttavern_step_role" title="Role for history injection; prompt-end mode uses the tail role from Settings">
                         <option value="user"${role === 'user' ? ' selected' : ''}>User</option>
@@ -1001,6 +1007,10 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
         });
         card.find('.smarttavern_step_enabled').on('change', function () {
             steps[index].enabled = /** @type {HTMLInputElement} */ (this).checked;
+            saveSettings();
+        });
+        card.find('.smarttavern_step_editmode').on('change', function () {
+            steps[index].editMode = String(/** @type {HTMLSelectElement} */ (this).value);
             saveSettings();
         });
         card.find('.smarttavern_step_name').on('input', function () {
@@ -1129,6 +1139,9 @@ function addStep(listKey) {
         role: 'assistant',
         profileId: '',
         lookback: null,
+        // New refinement passes start surgical — the fast default. Full rewrites
+        // stay one select away for prompts that need them.
+        ...(listKey === 'refinementSteps' ? { editMode: 'surgical' } : {}),
         prompt: '',
     });
     saveSettings();
@@ -1138,7 +1151,7 @@ function addStep(listKey) {
 async function restoreDefaultRefinementSteps() {
     const confirmed = await confirmPopup(
         'Load the default refinement passes?',
-        'This replaces your refinement pass list with the 3-pass preset: Body & Spatial Awareness, Character & Psychological Authenticity, and Prose & Wording Polish. Expansion steps are not touched.',
+        'This replaces your refinement pass list with the 3-pass preset: Body & Spatial Awareness, Character & Psychological Authenticity, and Prose & Wording Polish — all in surgical mode (the model edits only the paragraphs it changes). Expansion steps are not touched.',
     );
     if (!confirmed) return;
     getSettings().refinementSteps = structuredClone(DEFAULT_REFINEMENT_STEPS).map(s => ({ ...s }));

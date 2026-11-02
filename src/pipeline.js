@@ -22,7 +22,7 @@ import { system_message_types } from '../../../../system-messages.js';
 import { generateWithRetry, withInternalGeneration, isInternalGeneration, createGenerationControl, isAbortError, throwIfAborted, withInterceptorScope } from './gen.js';
 import { bootstrapProfile, serializeProfile } from './profiles.js';
 import { activityStart, activityStatus, activityEntry, activityFail, activityEnd, activitySteps, activityStepState, activityRefinementControls } from './progress.js';
-import { refinementIssues, hasRefinedPayload } from './refinement-checks.js';
+import { refinementIssues, hasRefinedPayload, parseDraftEdits, editIssues, applyDraftEdits, numberedDraft, paragraphBlocks, stripThinkBlocks } from './refinement-checks.js';
 import { applyVeil, setVeilStep, setVeilStatus, revealVeil, dismissVeil, armPreVeil } from './veil.js';
 import { stagePromptTail, clearPromptTail } from './tail.js';
 import {
@@ -43,10 +43,21 @@ const STEP_SYSTEM = 'You are a state-assessment engine for an interactive fictio
 
 const REFINEMENT_SYSTEM = 'You are a surgical prose editor and continuity auditor for an interactive fiction platform. Make only the targeted adjustments requested by the user prompt while preserving the original scene events, pacing, and structure. Output only the final revised reply (or the requested XML tags) with no meta-commentary or preamble.';
 
+// Surgical passes ('editMode: surgical'): the draft arrives as numbered paragraphs
+// (<p id="1">…) and the model returns only the paragraphs it changed, as
+// <edit id="N">…</edit>, <delete id="N"/> and <insert after="N">…</insert> tags.
+// Unchanged paragraphs are never re-emitted, so a pass that touches 10% of the
+// reply costs a fraction of a full rewrite's output tokens — this is the whole
+// point of the mode: drastically faster passes. <audit>PASS</audit> keeps the
+// draft. Tag-based (never JSON) so reasoning models cannot corrupt a payload.
+const SURGICAL_SYSTEM = 'You are a surgical prose editor for an interactive fiction platform. The draft reply is provided as numbered paragraphs (<p id="1">, <p id="2">, …). Make only the targeted adjustments requested by the user prompt. Output <edit id="N">…</edit> containing the complete replacement text for every paragraph you change, <delete id="N"/> to remove a paragraph, and <insert after="N">…</insert> (or <insert after="end">) to add a new one. Ids must match the draft exactly. Never quote or re-output paragraphs you are not changing: unchanged paragraphs must not appear in your output at all. If nothing needs changing, output <audit>PASS</audit> only. Output only the requested tags with no meta-commentary or preamble.';
+
 // Built-in enforcement pass, prepended to the refinement list while REQUIRED EVENTS are
 // pending: the story beat's must, the thinking agent's musts and one line per binding
-// dice roll. Same tag contract as user passes: <audit>PASS</audit> keeps the draft,
-// otherwise <audit>reasoning</audit> + <revised_reply>full reply</revised_reply>.
+// dice roll. Runs in surgical mode (see SURGICAL_SYSTEM): <audit>PASS</audit> keeps the
+// draft, otherwise <audit>reasoning</audit> plus only the paragraphs that must change —
+// <edit id="N">…</edit> / <insert after="N">…</insert> tags weaving the missing event(s)
+// in, usually near the top of the draft.
 const DIRECTIVE_ENFORCEMENT_NAME = 'Directive Enforcement';
 const DIRECTIVE_ENFORCEMENT_PROMPT = [
     'You are checking the DRAFT reply of {{char}} against a list of REQUIRED EVENTS.',
@@ -56,11 +67,11 @@ const DIRECTIVE_ENFORCEMENT_PROMPT = [
     'Recent chat:',
     '{{chat}}',
     '',
-    'DRAFT:',
+    'DRAFT (paragraphs are numbered):',
     '{{draft}}',
     '',
     'If every event is contained: output <audit>PASS</audit> only.',
-    'If any is missing: reason briefly in <audit>...</audit>, then output the full reply in <revised_reply>...</revised_reply> with the missing event(s) woven in by minimal edits, in the first half, matching voice and format. Dice results are binding: the reply must reflect their outcome (a low roll fails, a high roll succeeds). Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
+    'If any is missing: reason briefly in <audit>...</audit>, then weave the missing event(s) in with <edit id="N">...</edit> (full replacement text for that paragraph) and/or <insert after="N">...</insert> tags, editing as few paragraphs as possible and placing the event(s) in the first half. Match voice and format. Dice results are binding: the reply must reflect their outcome (a low roll fails, a high roll succeeds). Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
 ].join('\n');
 
 // Characters whose bootstrap already failed this session — no retry spam per generation.
@@ -211,6 +222,17 @@ export function sweepEphemeral(chatArr = null) {
 // --------------------------------------------------------------------------------------------
 
 /**
+ * Rewrites an echoed numbered draft back to plain text. A paragraph wrapped as
+ * <p id="N">…</p> (close tag optional) becomes its inner text; wrappers joined
+ * by blank lines keep that layout naturally. Wrappers around an unchanged draft
+ * must vanish before the text is shown or saved.
+ */
+function stripNumberedParagraphs(text) {
+    if (!/<p\s+id\s*=/i.test(text)) return text;
+    return text.replace(/<p\s+id\s*=\s*["']?\s*\d+\s*["']?\s*>([\s\S]*?)(?:<\/p\s*>|$)/gi, (whole, inner) => inner.trim());
+}
+
+/**
  * The REQUIRED EVENTS list for the built-in enforcement pass (and the {{must}}
  * macro): the story beat's must plus the thinking agent's musts plus one line per
  * binding dice roll. Single source of truth — refinement passes and the panel read
@@ -267,9 +289,12 @@ export function turnEnforcementActive(settings = getSettings()) {
  * passes — refinement macros must never resolve against the expansion list).
  * `currentDraft` / `originalDraft` feed {{draft}} / {{original_draft}} in refinement
  * passes; `draftMessageId` excludes the message being refined from chat excerpts so
- * the draft is never duplicated inside {{chat}}.
+ * the draft is never duplicated inside {{chat}}. `draftPlain` is the unrendered
+ * working draft: surgical passes pass the numbered rendering as `currentDraft` and
+ * the plain text as `draftPlain`, so {{draft}} shows the numbered paragraphs while
+ * {{draft_plain}} / {{draft_paragraphs}} still resolve usefully.
  */
-export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, step = null, stepsList = null, currentDraft = null, originalDraft = null, draftMessageId = null, story = null, agent = null }) {
+export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, step = null, stepsList = null, currentDraft = null, originalDraft = null, draftPlain = null, draftMessageId = null, story = null, agent = null }) {
     const fieldLookup = new Map((settings.fields ?? []).map(f => [String(f?.name ?? '').trim().toLowerCase(), String(f?.name ?? '')]));
     const list = Array.isArray(stepsList) ? stepsList : (Array.isArray(settings.steps) ? settings.steps : []);
     const stepLookup = new Map(list.map(s => [String(s?.name ?? '').trim().toLowerCase(), String(s?.name ?? '')]));
@@ -287,6 +312,15 @@ export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, 
         if (m === 'user') return context.name1 ?? 'User';
         if (m === 'card') return cardText(char);
         if (m === 'draft') return currentDraft ?? '';
+        // {{draft_plain}}: the working draft without the numbered-paragraph
+        // rendering surgical passes apply to {{draft}}.
+        if (m === 'draft_plain') return draftPlain ?? currentDraft ?? '';
+        // {{draft_paragraphs}}: the numbered rendering even in full-rewrite passes
+        // (identical to {{draft}} in surgical mode).
+        if (m === 'draft_paragraphs') {
+            const base = draftPlain ?? currentDraft;
+            return base ? numberedDraft(base) : '';
+        }
         if (m === 'original_draft') return originalDraft ?? '';
         if (m === 'definitions') return serializeProfile(profile, settings.fields ?? []) || '(no profile stored yet)';
         if (m === 'chat') return chatExcerpt(excerptChat, lookback);
@@ -688,19 +722,23 @@ export function effectiveRefinementSteps(settings) {
             role: 'assistant',
             profileId: settings.storyProfileId || '',
             lookback: 3,
+            editMode: 'surgical',
             prompt: DIRECTIVE_ENFORCEMENT_PROMPT,
         });
     }
     return steps;
 }
 
-/** Strips audit blocks, stray refinement tags and a surrounding code fence. */
+/** Strips audit blocks, stray refinement tags, reasoning blocks and a surrounding code fence. */
 function stripRefinedNoise(text) {
-    let out = String(text ?? '').trim();
+    let out = stripThinkBlocks(String(text ?? '')).trim();
     const fenced = out.match(/^```[^\n]*\n([\s\S]*?)\n?```$/);
     if (fenced) out = fenced[1].trim();
     out = out.replace(/<audit>[\s\S]*?<\/audit>/gi, '');
     out = out.replace(/<\/?(?:revised_reply|final_reply|audit)>/gi, '');
+    // Repair: paragraphs echoed as the numbered <p id="N">…</p> draft (or wrapped
+    // inside a full rewrite) recover their plain text.
+    out = stripNumberedParagraphs(out);
     return out.trim();
 }
 
@@ -708,11 +746,25 @@ function stripRefinedNoise(text) {
  * Extracts the refined reply from a refinement pass. Models may reason inside
  * <audit>...</audit> first; only the <revised_reply>/<final_reply> payload (or the
  * cleaned raw output) becomes the new draft. `<audit>PASS</audit>` keeps the draft.
+ *
+ * `blocks` switches the pass into surgical mode: the output is parsed as an
+ * <edit>/<delete>/<insert> patch against the numbered draft instead, applied on
+ * top of `fallbackDraft`'s paragraph structure. A patch that fails validation is
+ * ignored (the caller surfaces it through the retry/review flow); a full
+ * <revised_reply> inside a surgical pass is still honored as an escape hatch.
  */
-export function extractRefinedDraft(rawOutput, fallbackDraft) {
+export function extractRefinedDraft(rawOutput, fallbackDraft, { blocks = null } = {}) {
     const fallback = typeof fallbackDraft === 'string' ? fallbackDraft : String(fallbackDraft ?? '');
     const text = String(rawOutput ?? '').trim();
     if (!text) return fallback;
+    if (blocks) {
+        const patch = parseDraftEdits(text);
+        if (!editIssues(patch, blocks).length) {
+            const patched = applyDraftEdits(patch, blocks);
+            if (patched) return patched;
+        }
+        return fallback;
+    }
     const wrapped = text.match(/<revised_reply>([\s\S]*?)<\/revised_reply>/i)
         ?? text.match(/<final_reply>([\s\S]*?)<\/final_reply>/i);
     if (wrapped) return stripRefinedNoise(wrapped[1]) || fallback;
@@ -898,9 +950,17 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 passControl.cancel();
             }, onEnough: () => { control.accepted = true; control.cancel(); } });
             try {
+                // Surgical mode: the draft travels as numbered paragraphs and the
+                // model returns only the paragraphs it changes (see SURGICAL_SYSTEM).
+                // Full mode keeps the classic whole-reply <revised_reply> contract.
+                const surgical = step.editMode === 'surgical';
+                const draftBlocks = surgical ? paragraphBlocks(currentDraft) : null;
                 const resolve = makeMacroResolver({
                     char, profile, chat: arr, stepOutputs, settings,
-                    stepsList: steps, step, currentDraft, originalDraft, draftMessageId: messageId, story: storyCtx,
+                    stepsList: steps, step,
+                    currentDraft: surgical ? numberedDraft(currentDraft) : currentDraft,
+                    draftPlain: currentDraft,
+                    originalDraft, draftMessageId: messageId, story: storyCtx,
                 });
                 const text = substituteParamsSafe(expandMacros(step.prompt, resolve));
                 let output;
@@ -915,7 +975,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                         const result = await withInternalGeneration(() => generateWithRetry({
                             signal: passControl.signal,
                             profileId: step.profileId || '',
-                            systemPrompt: REFINEMENT_SYSTEM,
+                            systemPrompt: surgical ? SURGICAL_SYSTEM : REFINEMENT_SYSTEM,
                             prompt: text,
                             maxTokens: settings.stepMaxTokens,
                             checkOutput: false,
@@ -923,8 +983,8 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                         throwIfAborted(passControl.signal);
                         if (!isCurrentDraft()) return null;
                         output = String(result?.content ?? '').trim();
-                        extracted = extractRefinedDraft(output, workingDraft);
-                        issues = refinementIssues(output);
+                        extracted = extractRefinedDraft(output, workingDraft, { blocks: draftBlocks });
+                        issues = refinementIssues(output, draftBlocks);
                     } catch (error) {
                         if (isAbortError(error)) throw error;
                         issues = [`Generation failed: ${error?.message ?? error}`];
@@ -958,7 +1018,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 // A pass that returned no revised payload (bare prose, or only an
                 // audit) is a skip, not a revision: keep the last accepted draft
                 // rather than adopting untagged output as the reply.
-                if (output && !hasRefinedPayload(output)) {
+                if (output && !hasRefinedPayload(output, draftBlocks)) {
                     stepOutputs[step.name] = '';
                     stepStats[index] = { name: label, chars: 0, elapsedMs: Date.now() - startedAt, skipped: true, attempts };
                     activityStepState(index, 'skipped');
@@ -970,8 +1030,14 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, failed: false, attempts };
                 activityStepState(index, 'done');
                 setVeilStep(messageId, index, 'done');
+                // Surgical passes log the edit footprint ("2 of 7 paragraphs") —
+                // the whole speed argument of the mode — full passes log chars.
+                const patch = draftBlocks ? parseDraftEdits(output) : null;
+                const opsLabel = patch?.kind === 'ops'
+                    ? `${patch.ops.length} edit(s) across ${new Set(patch.ops.map(op => op.type === 'insert' && op.anchor === 'end' ? 'end' : op.type === 'insert' ? op.anchor : op.id)).size} of ${draftBlocks.length} paragraphs`
+                    : 'full rewrite';
                 activityEntry({
-                    title: `${label} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s · ${output.length} chars`,
+                    title: `${label} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s · ${draftBlocks ? opsLabel : `${output.length} chars`}`,
                     text: output,
                 });
                 if (extracted && extracted !== workingDraft) {

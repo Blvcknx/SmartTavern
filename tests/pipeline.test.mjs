@@ -69,7 +69,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         `;
         for (const name of ['agent', 'agent-tools']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'agent-core']) {
+    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core']) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -80,7 +80,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     await pipeline.evaluate();
     const state = modules.get('state').namespace;
     state.loadSettings();
-    return { pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, checks: modules.get('refinement-checks').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
+    return { pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
@@ -423,6 +423,193 @@ test('tail templates cannot place a story directive ahead of the agent brief', a
 // <audit>PASS</audit> to keep the draft. Bare prose is a skip — the pipeline never
 // adopts untagged output as the reply — so revision fixtures are wrapped.
 const tagged = text => `<revised_reply>${text}</revised_reply>`;
+
+// Surgical passes (editMode 'surgical'): the draft is sent as numbered paragraphs
+// and the model returns only the paragraphs it changes, as <edit>/<delete>/<insert>.
+const surgicalStep = (name, prompt) => ({ ...step(name, prompt), editMode: 'surgical' });
+
+const multiDraft = [
+    'Alice stood beside the open window, listening to the rain.',
+    'She turned toward the door and quietly asked whether he would stay for dinner.',
+    'The room smelled of fresh bread and wood smoke, and a small lamp glowed on the table.',
+].join('\n\n');
+
+test('paragraph splitting keeps fenced blocks atomic, trims, and falls back to lines', async () => {
+    const { edits } = await harness();
+    // JSON round-trips: the vm realm builds the arrays, deepEqual compares prototypes.
+    const split = JSON.stringify(edits.splitParagraphs('A\n\nB\n\nC'));
+    assert.equal(split, JSON.stringify({ paragraphs: ['A', 'B', 'C'], separators: ['\n\n', '\n\n'] }));
+    assert.equal(JSON.stringify(edits.splitParagraphs('one\ntwo\nthree')), JSON.stringify({ paragraphs: ['one', 'two', 'three'], separators: ['\n', '\n'] }));
+    assert.equal(JSON.stringify(edits.splitParagraphs('A\n\n\n\nB').separators), JSON.stringify(['\n\n']));
+    assert.equal(JSON.stringify(edits.splitParagraphs('single paragraph')), JSON.stringify({ paragraphs: ['single paragraph'], separators: [] }));
+    const fenced = edits.splitParagraphs('Intro\n\n```js\n\nconst x = 1;\n\n```\n\nOutro');
+    assert.equal(JSON.stringify(fenced), JSON.stringify({ paragraphs: ['Intro', '```js\n\nconst x = 1;\n\n```', 'Outro'], separators: ['\n\n', '\n\n'] }));
+    assert.equal(edits.numberedDraft('A\n\nB'), '<p id="1">A</p>\n\n<p id="2">B</p>');
+});
+
+test('edits, deletes and inserts apply with separators and breaks preserved', async () => {
+    const { edits } = await harness();
+    const blocks = edits.paragraphBlocks('A\n\nB\n\nC');
+    const patch = edits.parseDraftEdits('<edit id="2">B2</edit>');
+    assert.equal(edits.editIssues(patch, blocks).length, 0);
+    assert.equal(edits.applyDraftEdits(patch, blocks), 'A\n\nB2\n\nC');
+    const all = edits.parseDraftEdits('<edit id="1">A2</edit><delete id="2"/><insert after="3">D</insert>');
+    assert.equal(edits.applyDraftEdits(all, blocks), 'A2\n\nC\n\nD');
+    const front = edits.parseDraftEdits('<insert before="1">Start</insert>');
+    assert.equal(edits.applyDraftEdits(front, blocks), 'Start\n\nA\n\nB\n\nC');
+    const tail = edits.parseDraftEdits('<insert after="end">End</insert>');
+    assert.equal(edits.applyDraftEdits(tail, blocks), 'A\n\nB\n\nC\n\nEnd');
+    const junction = edits.parseDraftEdits('<delete id="1"/>');
+    assert.equal(edits.applyDraftEdits(junction, blocks), 'B\n\nC');
+    const lined = edits.paragraphBlocks('one\ntwo');
+    const linePatch = edits.parseDraftEdits('<edit id="2">deux</edit>');
+    assert.equal(edits.applyDraftEdits(linePatch, lined), 'one\ndeux');
+});
+
+test('the patch parser tolerates quoting, prose, fences and unclosed tags', async () => {
+    const { edits } = await harness();
+    const blocks = edits.paragraphBlocks('A\n\nB\n\nC');
+    const quoted = edits.parseDraftEdits("prose preamble\n<edit id=1>\nX\n</edit>\ntail prose");
+    assert.equal(edits.applyDraftEdits(quoted, blocks), 'X\n\nB\n\nC');
+    const unclosed = edits.parseDraftEdits('<audit>reasoning</audit><edit id="3">C2</edit>');
+    assert.equal(edits.applyDraftEdits(unclosed, blocks), 'A\n\nB\n\nC2');
+    const fenced = edits.parseDraftEdits('```xml\n<delete id="1"></delete>\n```');
+    assert.equal(edits.applyDraftEdits(fenced, blocks), 'B\n\nC');
+    const thinking = edits.parseDraftEdits('<think>internal reasoning about ids</think><edit id="2">B2</edit>');
+    assert.equal(edits.applyDraftEdits(thinking, blocks), 'A\n\nB2\n\nC');
+});
+
+test('echoed numbered drafts are repaired into edits in every shape', async () => {
+    const { edits } = await harness();
+    const blocks = edits.paragraphBlocks('A\n\nB\n\nC');
+    const echoed = edits.parseDraftEdits('<p id="1">A</p>\n\n<p id="2">B!</p>\n\n<p id="3">C</p>');
+    assert.equal(echoed.kind, 'ops');
+    assert.equal(edits.applyDraftEdits(echoed, blocks), 'A\n\nB!\n\nC');
+    const nested = edits.parseDraftEdits('<edit id="1"><p id="2">B2</p><p id="3">C2</p></edit>');
+    assert.equal(edits.applyDraftEdits(nested, blocks), 'A\n\nB2\n\nC2');
+    const wrapped = edits.parseDraftEdits('<revised_reply><p id="1">A</p><p id="2">B2</p><p id="3">C</p></revised_reply>');
+    assert.equal(edits.applyDraftEdits(wrapped, blocks), 'A\n\nB2\n\nC');
+    assert.equal(edits.parseDraftEdits('<audit>PASS</audit>').kind, 'pass');
+});
+
+test('invalid patches are rejected with actionable issues', async () => {
+    const { edits } = await harness();
+    const blocks = edits.paragraphBlocks('A\n\nB\n\nC');
+    for (const [raw, fragment] of [
+        ['<edit id="9">X</edit>', '9 is out of range'],
+        ['<edit id="0">X</edit>', '0 is out of range'],
+        ['<edit id="1">X</edit><delete id="1"/>', 'more than once'],
+        ['<insert after="12">X</insert>', 'out of range'],
+        ['<edit id="1"></edit>', /empty/i],
+    ]) {
+        const patch = edits.parseDraftEdits(raw);
+        const issues = edits.editIssues(patch, blocks);
+        assert.ok(issues.length, raw);
+        if (typeof fragment === 'string') assert.ok(issues.join(' ').includes(fragment), `${raw} → ${issues}`);
+        else assert.match(issues.join(' '), fragment);
+    }
+});
+
+test('surgical passes send a numbered draft and apply only paragraph edits', async () => {
+    const h = await harness({ savePassesAsSwipes: true, refinementSteps: [surgicalStep('Edit', 'Refine: {{draft}}')] },
+        async () => ({ content: '<audit>check</audit>\n<edit id="2">She turned toward the door and softly asked whether he would stay for dinner.</edit>' }));
+    const message = { name: 'Alice', mes: multiDraft, swipes: [multiDraft], swipe_id: 0 };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    const prompt = h.requests[0].messages.at(-1).content;
+    assert.ok(prompt.includes('<p id="1">Alice stood beside the open window'));
+    assert.ok(prompt.includes('<p id="3">The room smelled'));
+    assert.equal(h.requests[0].messages[0].role, 'system');
+    assert.match(h.requests[0].messages[0].content, /surgical prose editor/);
+    assert.equal(result.changed, 1);
+    assert.equal(message.mes, multiDraft.replace('quietly', 'softly'));
+    assert.equal(message.swipes.length, 2);
+    assert.equal(message.swipes[1], message.mes);
+});
+
+test('a surgical pass that changes nothing keeps the draft and records a skip', async () => {
+    const h = await harness({ refinementSteps: [surgicalStep('Check', '{{draft}}')] }, async () => ({ content: '<audit>PASS</audit>' }));
+    const message = { name: 'Alice', mes: multiDraft };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(result.changed, 0);
+    assert.equal(message.mes, multiDraft);
+    assert.equal(result.stepStats[0].skipped, true);
+});
+
+test('surgical passes accept a full revised_reply as an escape hatch', async () => {
+    const h = await harness({ refinementSteps: [surgicalStep('Edit', '{{draft}}')] },
+        async () => ({ content: tagged(multiDraft.replace('open window', 'half-open window')) }));
+    const message = { name: 'Alice', mes: multiDraft };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(result.changed, 1);
+    assert.ok(message.mes.includes('half-open window'));
+    assert.ok(!message.mes.includes('<p id='));
+});
+
+test('an out-of-range surgical patch is rejected, reviewed and can recover', async () => {
+    let popups = 0;
+    const h = await harness({ refinementSteps: [surgicalStep('Edit', '{{draft}}')] },
+        async (_messages, index) => ({ content: index === 1 ? '<edit id="9">Text.</edit>' : '<edit id="1">Fixed.</edit>' }),
+        { onPopup(popup) {
+            popups++;
+            assert.ok(popup.content.children[1].textContent.includes('9'));
+            return 1;
+        } });
+    const message = { name: 'Alice', mes: 'One paragraph only.' };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(popups, 1);
+    assert.equal(result.stepStats[0].attempts, 2);
+    assert.equal(message.mes, 'Fixed.');
+});
+
+test('later passes build on the patched draft and full passes see plain text', async () => {
+    const h = await harness({ refinementSteps: [surgicalStep('S', '{{draft}}'), step('F', '{{draft}}')] },
+        async (_messages, index) => ({ content: index === 1
+            ? '<insert after="end">A new final line.</insert>'
+            : tagged('FULL REWRITE OF THE PATCHED DRAFT') }));
+    const message = { name: 'Alice', mes: 'First.\n\nSecond.' };
+    h.savedChat.push(message);
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.ok(h.requests[0].messages.at(-1).content.includes('<p id="1">First.'));
+    const secondPrompt = h.requests[1].messages.at(-1).content;
+    assert.ok(secondPrompt.includes('A new final line.'));
+    assert.ok(!secondPrompt.includes('<p id='));
+    assert.equal(result.workingDraft, 'FULL REWRITE OF THE PATCHED DRAFT');
+});
+
+test('legacy default refinement prompts migrate to surgical; custom prompts stay full', async () => {
+    const custom = { name: 'My Custom Pass', enabled: true, role: 'assistant', profileId: '', lookback: null, prompt: 'My own contract for {{draft}}.' };
+    const probe = await harness();
+    const legacySteps = probe.state.LEGACY_REFINEMENT_STEPS.map(s => ({ ...s, enabled: true, role: 'assistant', profileId: '', lookback: null }));
+    const h = await harness({ refinementSteps: [...legacySteps, custom] });
+    const steps = h.state.getSettings().refinementSteps;
+    for (const migrated of steps.slice(0, 3)) {
+        assert.equal(migrated.editMode, 'surgical');
+        assert.ok(migrated.prompt.includes('<edit id='));
+    }
+    assert.equal(steps[3].editMode, 'full');
+    assert.equal(steps[3].prompt, custom.prompt);
+    assert.equal(h.state.getSettings().refinementContractVersion, 2);
+});
+
+test('dry run surgical passes validate patches without mutating chat', async () => {
+    const h = await harness({ refinementSteps: [surgicalStep('Edit', '{{draft}}')] },
+        async () => ({ content: '<edit id="1">Revised.</edit>' }));
+    const message = { name: 'Alice', mes: 'Original one.\n\nOriginal two.' };
+    h.savedChat.push(message);
+    const result = await h.pipeline.runRefinementPipeline(1, { dryRun: true });
+    assert.equal(result.workingDraft, 'Revised.\n\nOriginal two.');
+    assert.equal(message.mes, 'Original one.\n\nOriginal two.');
+    assert.equal(message.extra, undefined);
+});
 
 const proseDraft = 'Alice stood beside the open window, listening to the rain. She turned toward the door and quietly asked whether he would stay for dinner. The room smelled of fresh bread and wood smoke, and a small lamp glowed on the table.';
 

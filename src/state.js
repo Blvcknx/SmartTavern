@@ -66,6 +66,12 @@ export const DEFAULT_STEPS = Object.freeze([
 // Preset for 'refinement' pipeline: each pass audits and surgically edits the fresh reply.
 // Per-step `lookback`: messages of chat history for {{chat}} in that step
 // (null = use the global `chatLookback`, 0 = no chat history).
+// Per-step `editMode`: 'surgical' (default preset) sends the draft as numbered
+// paragraphs and the model returns only the paragraphs it changes via
+// <edit id="N">…</edit> / <delete id="N"/> / <insert after="N">…</insert> — a pass
+// that touches 10% of the reply costs a fraction of a full rewrite's output
+// tokens, which makes refinement drastically faster. 'full' keeps the classic
+// whole-reply <revised_reply> contract.
 export const DEFAULT_REFINEMENT_STEPS = Object.freeze([
     {
         name: 'Body & Spatial Awareness',
@@ -73,6 +79,67 @@ export const DEFAULT_REFINEMENT_STEPS = Object.freeze([
         role: 'assistant',
         profileId: '',
         lookback: 3,
+        editMode: 'surgical',
+        prompt: [
+            'You are auditing the latest reply of {{char}} (the DRAFT) for body and spatial continuity.',
+            '',
+            'Recent conversation (context):',
+            '{{chat}}',
+            '',
+            'DRAFT reply to refine (paragraphs are numbered):',
+            '{{draft}}',
+            '',
+            'Task: Check the draft against the recent conversation for physical posture and position, held or worn objects, injuries, pain, exhaustion, arousal, breathing, and the continuity of the surrounding space and anatomy. Fix ONLY physical and spatial inconsistencies so positions, objects and body states agree with the conversation.',
+            'First reason briefly inside <audit>...</audit>, then output one <edit id="N">...</edit> per paragraph you change (the complete replacement text for that paragraph), <delete id="N"/> to drop one, or <insert after="N">...</insert> to add one. Never re-output unchanged paragraphs. Preserve every event, action, line of dialogue (including its meaning), pacing, formatting and length. If nothing needs changing, output <audit>PASS</audit> and nothing else.',
+        ].join('\n'),
+    },
+    {
+        name: 'Character & Psychological Authenticity',
+        enabled: true,
+        role: 'assistant',
+        profileId: '',
+        lookback: 6,
+        editMode: 'surgical',
+        prompt: [
+            'You are auditing the latest reply of {{char}} (the DRAFT) for character and psychological authenticity.',
+            '',
+            'Character definitions:',
+            '{{definitions}}',
+            '',
+            'Recent conversation (context):',
+            '{{chat}}',
+            '',
+            'DRAFT reply to refine (paragraphs are numbered):',
+            '{{draft}}',
+            '',
+            'Task: Check the draft against the character definitions and the recent conversation for voice and speech patterns, psychology, temperament, values, fears, aspirations, and motivations. Adjust ONLY passages that break character or motivation consistency.',
+            'First reason briefly inside <audit>...</audit>, then output one <edit id="N">...</edit> per paragraph you adjust (the complete replacement text for that paragraph), <delete id="N"/> to drop one, or <insert after="N">...</insert> to add one. Never re-output unchanged paragraphs. Preserve every event, action, line of dialogue (including its meaning), pacing, formatting and length. If nothing needs changing, output <audit>PASS</audit> and nothing else.',
+        ].join('\n'),
+    },
+    {
+        name: 'Prose & Wording Polish',
+        enabled: true,
+        role: 'assistant',
+        profileId: '',
+        lookback: 0,
+        editMode: 'surgical',
+        prompt: [
+            'You are polishing the prose of the latest reply of {{char}} (the DRAFT).',
+            '',
+            'DRAFT reply to polish (paragraphs are numbered):',
+            '{{draft}}',
+            '',
+            'Task: Perform purely linguistic and prose enhancements — wording choice, sentence flow, repetition removal, grammar, punctuation and paragraphing. Do NOT alter events, actions, or the meaning of any dialogue, and do not add or remove information. Judge the text on its own; no chat history or character definitions are provided.',
+            'First reason briefly inside <audit>...</audit>, then output one <edit id="N">...</edit> per paragraph you improve (the complete replacement text for that paragraph). Never re-output unchanged paragraphs. If the prose is already clean, output <audit>PASS</audit> and nothing else.',
+        ].join('\n'),
+    },
+]);
+
+// The pre-surgical default passes (whole-reply <revised_reply> contract), kept verbatim
+// so a stored config still carrying one of them upgrades to the surgical preset once.
+export const LEGACY_REFINEMENT_STEPS = Object.freeze([
+    {
+        name: 'Body & Spatial Awareness',
         prompt: [
             'You are auditing the latest reply of {{char}} (the DRAFT) for body and spatial continuity.',
             '',
@@ -88,10 +155,6 @@ export const DEFAULT_REFINEMENT_STEPS = Object.freeze([
     },
     {
         name: 'Character & Psychological Authenticity',
-        enabled: true,
-        role: 'assistant',
-        profileId: '',
-        lookback: 6,
         prompt: [
             'You are auditing the latest reply of {{char}} (the DRAFT) for character and psychological authenticity.',
             '',
@@ -110,10 +173,6 @@ export const DEFAULT_REFINEMENT_STEPS = Object.freeze([
     },
     {
         name: 'Prose & Wording Polish',
-        enabled: true,
-        role: 'assistant',
-        profileId: '',
-        lookback: 0,
         prompt: [
             'You are polishing the prose of the latest reply of {{char}} (the DRAFT).',
             '',
@@ -319,6 +378,26 @@ function normalizeSettings(settings) {
         settings.outputRolesVersion = 1;
         changed = true;
     }
+    // v2 contract: refinement passes move from whole-reply rewrites to surgical
+    // paragraph edits. Saved passes still carrying a legacy default prompt (exact
+    // match) upgrade to the new surgical prompt automatically; anything custom
+    // keeps its prompt and stays on the classic full-rewrite contract.
+    if (settings.refinementContractVersion !== 2) {
+        if (Array.isArray(settings.refinementSteps)) {
+            for (const step of settings.refinementSteps) {
+                if (!isPlainObject(step)) continue;
+                const legacy = LEGACY_REFINEMENT_STEPS.find(s => s.name === step.name && s.prompt === step.prompt);
+                const preset = legacy && DEFAULT_REFINEMENT_STEPS.find(s => s.name === legacy.name);
+                if (preset) {
+                    step.prompt = preset.prompt;
+                    step.editMode = 'surgical';
+                    changed = true;
+                }
+            }
+        }
+        settings.refinementContractVersion = 2;
+        changed = true;
+    }
     const normalizeStepList = (steps) => {
         for (const step of (Array.isArray(steps) ? steps : [])) {
             if (!isPlainObject(step)) continue;
@@ -337,6 +416,16 @@ function normalizeSettings(settings) {
     };
     normalizeStepList(settings.steps);
     normalizeStepList(settings.refinementSteps);
+    // Refinement passes carry an edit mode ('surgical' paragraph patches or the
+    // classic 'full' rewrite). Expansion steps never get the field.
+    for (const step of (Array.isArray(settings.refinementSteps) ? settings.refinementSteps : [])) {
+        if (!isPlainObject(step)) continue;
+        const editMode = step.editMode === 'surgical' ? 'surgical' : 'full';
+        if (step.editMode !== editMode) {
+            step.editMode = editMode;
+            changed = true;
+        }
+    }
     if (!INJECT_ANCHORS.includes(settings.injectAnchor)) {
         settings.injectAnchor = 'prompt-end';
         changed = true;

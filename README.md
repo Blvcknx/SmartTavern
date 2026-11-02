@@ -117,7 +117,7 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Injection name / header / footer | Settings for history positions; `{{char}}` and other macros resolve |
 | Profile schema fields | Rows: name + description — the JSON schema is built from this list (defaults: Brief Summary, Appearance, Background, Personality incl. sexual preferences, Aspirations, Fears, Values) |
 | Expansion steps | Cards: enabled, name, role, per-step lookback, connection profile, prompt; reorder / duplicate / delete; defaults: **Physical Condition** → **Mental Condition** |
-| Refinement passes | Same cards minus the role selector (passes are strictly sequential and work on the draft); defaults: **Body & Spatial Awareness** → **Character & Psychological Authenticity** → **Prose & Wording Polish** |
+| Refinement passes | Same cards minus the role selector (passes are strictly sequential and work on the draft), plus an **Edit mode** select: **Surgical edits** (default) or **Full rewrite**. Defaults: **Body & Spatial Awareness** → **Character & Psychological Authenticity** → **Prose & Wording Polish** |
 | Step execution | Expansion only: parallel where independent (default), or sequential. `{{step:Name}}` waits for that earlier step; `{{steps}}` waits for all earlier steps. Refinement passes are always strictly sequential. Active-connection calls are serialized because ST temporarily changes shared generation settings. |
 | Block role | Expansion steps only: role of each generated output when using a history anchor; prompt-end mode uses the global tail role. Refinement passes have no role selector. |
 | Profile updater connection profile | Saved Connection Manager profile used by bootstrap/update/rebuild |
@@ -143,11 +143,43 @@ An empty result or exhausted generation error pauses refinement with **Retry pas
 | `{{field:Name}}` | A single profile field (case-insensitive) |
 | `{{step:Step Name}}` | An earlier step's output (case-insensitive) |
 | `{{steps}}` | Earlier completed outputs in a step prompt; all generated outputs in the reply-tail template, in configured order |
-| `{{draft}}` / `{{original_draft}}` | Refinement passes only: the current working draft / the original reply before any pass touched it |
+| `{{draft}}` / `{{original_draft}}` | Refinement passes only: the current working draft / the original reply before any pass touched it. In surgical passes `{{draft}}` renders the numbered paragraphs; `{{draft_plain}}` gives the unnumbered working draft, `{{draft_paragraphs}}` forces the numbered rendering in any pass |
 | `{{story}}` | The compiled scene directive text (Story Director; never contains secrets or future chapters) |
 | `{{must}}` / `{{beat}}` / `{{chapter}}` / `{{ledger}}` | The required event / the current beat text / the current chapter line / the fact ledger |
 
 These macros also work in the reply-tail template. Include `{{steps}}` or selected `{{step:Name}}` references to supply the generated assessments. `{{step:Name}}` and `{{steps}}` resolve against the list of the pipeline the prompt belongs to — a refinement pass never sees expansion outputs, and vice versa. Unknown macros are left intact for SillyTavern's own substitution pass. The Results tab shows the assembled reply context (expansion) and the final refined reply (refinement) so you can inspect exactly what each pipeline produced.
+
+### Refinement guardrails
+
+Every completed refinement pass is checked only for an empty reply payload. An explicit `<audit>PASS</audit>` without a reply wrapper keeps the current draft. There are no length, similarity, placeholder, repetition, or tag-format filters for refinement. Other internal calls retain their generation sanity checks.
+
+An empty result or exhausted generation error pauses refinement with **Retry pass**, **Skip Pass**, and **Review** buttons. Review opens the returned output in a scrollable window with **Accept**, **Retry**, and **Skip Pass**. Accept uses the reviewed result and continues; when it contains no reply, Accept keeps the current draft. Retry repeats the same prompt using the last accepted draft. Skip discards the failed output and continues to the next pass. Only accepted outputs become swipes or `{{step:Name}}` values. The same workflow applies to dry runs without changing chat.
+
+**Skip pass** is also available while a request is running, in the veil and the expanded activity log. **That's enough** ends the whole refinement run. Global Stop and chat changes cancel pending rejection and review windows.
+
+### Surgical refinement (edit modes)
+
+Every pass picks how it may change the draft — the point is speed: a pass that touches 10% of the reply should not re-emit (and re-bill, and re-wait for) the other 90%.
+
+**Full rewrite** is the classic contract: the model reasons inside `<audit>…</audit>` and returns the complete revised reply inside `<revised_reply>…</revised_reply>`, or `<audit>PASS</audit>` to keep the draft.
+
+**Surgical edits** (the default for the preset passes and new passes) splits the draft into paragraphs automatically (blank lines; fenced code blocks stay atomic; single-newline drafts fall back to line granularity) and numbers them:
+
+```
+<p id="1">Alice stood beside the open window.</p>
+<p id="2">She turned toward the door.</p>
+```
+
+The model then returns only what changes:
+
+- `<edit id="2">She spun toward the door.</edit>` — the complete replacement text for paragraph 2
+- `<delete id="3"/>` — drop a paragraph
+- `<insert after="1">A new paragraph.</insert>` (`after="end"` appends)
+- `<audit>PASS</audit>` — nothing needs changing; unchanged paragraphs are **never** re-emitted
+
+The patch is validated (ids must exist, no paragraph changed twice, no empty edits) and applied with the draft's original paragraph separators preserved. Invalid patches are treated like any rejected pass: the Retry / Skip / Review popup opens with the exact issue, so even small or old models cannot corrupt the reply — worst case the pass is retried or skipped. `<revised_reply>` remains honored in surgical mode as a full-rewrite escape hatch, and models that ignore the protocol and echo the numbered draft, wrap it in one big `<edit>`, or add prose around their tags are all repaired into the same patch format instead of failing.
+
+The parser is deliberately hardened for weak/reasoning models (e.g. DeepSeek R1): unclosed tags salvage to end-of-output, `<think>` reasoning blocks are stripped, unquoted or misquoted attributes still parse, and there is no JSON anywhere in the protocol — a tag grammar cannot be corrupted the way a half-emitted JSON object can.
 
 ### Per-step model routing
 
