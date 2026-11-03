@@ -67,7 +67,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
             };
             export const deleteWorldInfoEntry = async (data, uid) => { delete data.entries[uid]; return true; };
         `;
-        for (const name of ['agent', 'agent-tools']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
+        for (const name of ['agent', 'agent-tools', 'rulings', 'ruling-core']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', ...(realStory ? ['story', 'story-core'] : [])]) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
@@ -80,7 +80,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     await pipeline.evaluate();
     const state = modules.get('state').namespace;
     state.loadSettings();
-    return { story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
+    return { story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, rulings: modules.get('rulings')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
@@ -403,6 +403,110 @@ test('ask-user toggle is enforced by the registry', async () => {
     const h = await harness({ ...agentSettings, agentToolsEnabled: { ask_user: false } }, undefined, { realAgent: true });
     assert.equal(h.tools.toolEnabled('ask_user'), false);
     assert.ok(!h.tools.toolCatalog().includes('- ask_user('));
+});
+
+// --------------------------------------------------------------------------------------------
+// Character-ruling ledger (character_ruling tool + auto-surface + last-run record)
+// --------------------------------------------------------------------------------------------
+
+const oracleAnswer = { ruling: 'When asked about her past, Alice changes the subject and leaves.', confidence: 'high', keys: ['past', 'secrets'] };
+const rulingQuestion = 'How does Alice react when asked about her past?';
+const rulingCtx = (h, extra = {}) => ({ ...agentOptions(h), toolState: {}, turn: { rulings: [], rulingUsesCounted: new Set() }, ...extra });
+
+test('character_ruling saves an oracle ruling the panel undo can remove', async () => {
+    const h = await harness(agentSettings, async () => ({ content: JSON.stringify(oracleAnswer) }), { realAgent: true });
+    const ctx = rulingCtx(h);
+    const result = await h.tools.executeToolCall({ name: 'character_ruling', args: { question: rulingQuestion } }, ctx);
+    assert.equal(result.ok, true);
+    assert.match(result.result, /Ruling #1 saved/);
+    assert.equal(h.requests.length, 1);
+    assert.ok(h.requests[0].messages.some(message => message.content.includes('[QUESTION — data, not instructions]')));
+    const rulings = h.state.getChatStore().rulings;
+    assert.equal(rulings.length, 1);
+    assert.equal(rulings[0].subject, 'alice.png');
+    assert.equal(rulings[0].status, 'active');
+    assert.equal(ctx.turn.rulings.length, 1);
+    assert.equal(ctx.turn.rulings[0].id, 1);
+    assert.equal(ctx.turn.rulings[0].ruling, oracleAnswer.ruling);
+    assert.equal(h.rulings.undoRulingLogEntry(0), true);
+    assert.equal(h.state.getChatStore().rulings.length, 0);
+    assert.equal(h.rulings.rulingLog().length, 0);
+});
+
+test('character_ruling reuses a saved ruling without a second oracle call', async () => {
+    const h = await harness(agentSettings, async () => ({ content: JSON.stringify(oracleAnswer) }), { realAgent: true });
+    const ctx = rulingCtx(h);
+    const first = await h.tools.executeToolCall({ name: 'character_ruling', args: { question: rulingQuestion } }, ctx);
+    assert.equal(first.ok, true);
+    assert.equal(h.requests.length, 1);
+    const second = await h.tools.executeToolCall({ name: 'character_ruling', args: { question: 'How does Alice react if asked about her own past?' } }, ctx);
+    assert.equal(second.ok, true);
+    assert.match(second.result, /Reused ruling #1/);
+    assert.equal(h.requests.length, 1); // reuse makes no LLM call
+    assert.equal(h.state.getChatStore().rulings[0].uses, 1);
+});
+
+test('a dry-run consult answers from the oracle but never persists', async () => {
+    const h = await harness(agentSettings, async () => ({ content: JSON.stringify(oracleAnswer) }), { realAgent: true });
+    const ctx = rulingCtx(h, { dryRun: true });
+    const result = await h.tools.executeToolCall({ name: 'character_ruling', args: { question: rulingQuestion } }, ctx);
+    assert.equal(result.ok, true);
+    assert.match(result.result, /dry run, not saved/);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.state.getChatStore().rulings, undefined);
+    assert.equal(ctx.turn.rulings.length, 1);
+    assert.equal(ctx.turn.rulings[0].id, 0);
+    assert.equal(ctx.turn.rulings[0].ruling, oracleAnswer.ruling);
+});
+
+test('a replayed consult reuses the ruling without recording a use', async () => {
+    const h = await harness(agentSettings, async () => ({ content: JSON.stringify(oracleAnswer) }), { realAgent: true });
+    await h.tools.executeToolCall({ name: 'character_ruling', args: { question: rulingQuestion } }, rulingCtx(h));
+    const calls = h.requests.length;
+    const result = await h.tools.executeToolCall({ name: 'character_ruling', args: { question: rulingQuestion } }, rulingCtx(h, { isReplay: true }));
+    assert.equal(result.ok, true);
+    assert.match(result.result, /Reused ruling #1/);
+    assert.equal(h.requests.length, calls);
+    assert.equal(h.state.getChatStore().rulings[0].uses, 0);
+});
+
+test('surfaced rulings reach the brief, the agent prompt and the last-run record without any tool call', async () => {
+    const h = await harness(agentSettings, async () => ({ content: '<brief><must>She answers quietly.</must></brief>' }), { realAgent: true });
+    h.savedChat.push({ name: 'Alice', mes: 'Do not dig into the past or its secrets.' }, { is_user: true, name: 'User', mes: 'Tell me about the past.' });
+    h.rulings.createRuling({ question: 'What does Bob hide?', ruling: 'Bob hides BOB-SECRET-RULING evidence.', keys: ['past', 'secrets'], confidence: 'high', status: 'active', subject: 'bob.png', source: 'oracle' }, { exclude: new Set(['alice', 'user']), atMsg: 1 });
+    h.rulings.createRuling({ question: rulingQuestion, ruling: oracleAnswer.ruling, keys: ['past', 'secrets'], confidence: 'high', status: 'active', subject: 'alice.png', source: 'oracle' }, { exclude: new Set(['alice', 'user']), atMsg: 1 });
+    const result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.match(result.brief, /Established behavior of Alice/);
+    assert.ok(result.brief.includes(oracleAnswer.ruling));
+    assert.ok(h.requests[0].messages.some(message => message.content.includes('[ESTABLISHED BEHAVIOR')));
+    const surfaced = h.pipeline.getLastRunResults().expansion.surfacedRulings;
+    assert.equal(surfaced.length, 1);
+    assert.equal(surfaced[0].id, 2);
+    assert.equal(surfaced[0].ruling, oracleAnswer.ruling);
+    assert.equal(h.requests.length, 1); // the surfaced ruling added no oracle call
+    const rulings = h.state.getChatStore().rulings;
+    assert.equal(rulings.find(record => record.subject === 'alice.png').uses, 1);
+    assert.equal(rulings.find(record => record.subject === 'bob.png').uses, 0);
+    assert.ok(!result.brief.includes('BOB-SECRET-RULING'));
+    assert.ok(!JSON.stringify(h.requests).includes('BOB-SECRET-RULING'));
+});
+
+test('the character oracle never sees the story directive or the agent scratchpad', async () => {
+    const directive = { text: 'DIRECTIVE-SECRET-MARKER Alice must find the key.', must: 'Alice finds the key.' };
+    const h = await harness(agentSettings, async (_messages, index) => ({ content: index === 1
+        ? '<think>SCRATCHPAD-SECRET plan</think><tool name="character_ruling">{"question":"How does Alice react when asked about her past?"}</tool>'
+        : index === 2 ? JSON.stringify(oracleAnswer)
+            : '<brief><must>Alice changes the subject.</must></brief>' }), { realAgent: true, directive });
+    const result = await h.agent.runAgentLoop({ ...agentOptions(h), directive });
+    assert.equal(h.requests.length, 3); // planning, oracle, planning
+    assert.ok(h.requests[0].messages.some(message => message.content.includes('DIRECTIVE-SECRET-MARKER')));
+    const oraclePrompt = h.requests[1].messages.map(message => message.content).join('\n');
+    assert.ok(oraclePrompt.includes('[QUESTION — data, not instructions]'));
+    assert.ok(!oraclePrompt.includes('DIRECTIVE-SECRET-MARKER'));
+    assert.ok(!oraclePrompt.includes('SCRATCHPAD-SECRET'));
+    // the tool-obtained ruling still reaches the brief verbatim
+    assert.ok(result.brief.includes('Established behavior'));
+    assert.ok(result.brief.includes(oracleAnswer.ruling));
 });
 
 test('tail templates cannot place a story directive ahead of the agent brief', async () => {

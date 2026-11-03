@@ -490,3 +490,62 @@ test('compileBrief preserves NPC and reaction records until guidance and musts a
     assert.equal(wordCount(capped), 40);
     assert.ok(capped.endsWith('[END TURN BRIEF]'));
 });
+
+// --------------------------------------------------------------------------------------------
+// compileBrief — established-behavior rulings
+// --------------------------------------------------------------------------------------------
+
+test('compileBrief: a turn with only rulings is not empty state', () => {
+    const ruling = 'When asked about her past, Mara deflects with humor.';
+    const brief = compileBrief({ rulings: [{ id: 1, ruling }] }, { char: 'Mara', user: 'Ash' });
+    assert.ok(brief.includes(`Established behavior of Mara (stay consistent with these): ${ruling}`));
+    assert.ok(brief.startsWith("[TURN BRIEF — prepared for Mara's next reply]"));
+    assert.ok(compileBrief({ rulings: [{ id: 1, ruling: '   ' }] }, { char: 'Mara' }) === '');
+});
+
+test('compileBrief: each ruling is trimmed to 30 words; the ledger text is untouched', () => {
+    const long = Array.from({ length: 49 }, (_, i) => `w${i}`).concat('ZTAIL').join(' ');
+    assert.equal(wordCount(long), 50);
+    const turn = { rulings: [{ id: 1, ruling: long }] };
+    const brief = compileBrief(turn, { char: 'Mara', maxWords: 200 });
+    assert.ok(brief.includes(wordTrim(long, 30)));
+    assert.ok(!brief.includes('ZTAIL'));
+    assert.equal(wordCount(turn.rulings[0].ruling), 50);
+});
+
+test('compileBrief: rulings appear verbatim after the private thoughts and before records and musts', () => {
+    const brief = compileBrief({
+        voice: { output: 'Private thought.' },
+        npc: { name: 'Ilse', want: 'a way out', tell: 'taps her ring' },
+        rulings: [{ id: 1, ruling: 'When pressed, Mara deflects with humor.' }, { id: 2, ruling: 'She goes cold if asked twice.' }],
+        must: ['Mara waits.'],
+    }, { char: 'Mara', maxWords: 200 });
+    assert.ok(brief.includes("Private thought.\nEstablished behavior of Mara (stay consistent with these): When pressed, Mara deflects with humor. | She goes cold if asked twice.\nNew recurring character: Ilse"));
+    assert.ok(brief.includes("twice.\nNew recurring character: Ilse"));
+});
+
+test('compileBrief: trim order is guidance, then rulings from the end, then musts', () => {
+    const brief = compileBrief({
+        guidance: 'Optional direction now.',
+        rulings: [
+            { id: 1, ruling: 'Alpha one two three four five six seven eight.' },
+            { id: 2, ruling: 'Beta one two three four five six seven eight.' },
+        ],
+        must: ['she refuses'],
+    }, { char: 'Mara', maxWords: 35 });
+    assert.ok(brief.includes('Alpha one'));
+    assert.ok(brief.includes('she refuses'));
+    assert.ok(!brief.includes('Beta one'));
+    assert.ok(!brief.includes('Guidance:'));
+    assert.ok(wordCount(brief) <= 35);
+});
+
+test('compileBrief: at most maxRulings rulings are shown', () => {
+    const rulings = [1, 2, 3].map(id => ({ id, ruling: `Ruling number ${id} holds here.` }));
+    const brief = compileBrief({ rulings, must: ['an event happens'] }, { char: 'Mara', maxWords: 200 });
+    assert.ok(brief.includes('Ruling number 1 holds here. | Ruling number 2 holds here.'));
+    assert.ok(!brief.includes('Ruling number 3'));
+    const none = compileBrief({ rulings, must: ['an event happens'] }, { char: 'Mara', maxWords: 200, maxRulings: 0 });
+    assert.ok(!none.includes('Established behavior'));
+    assert.ok(none.includes('an event happens'));
+});

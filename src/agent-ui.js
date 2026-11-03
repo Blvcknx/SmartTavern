@@ -6,11 +6,15 @@
 // The tab is re-rendered on every open/switch (renderAgentTab) while the wiring is
 // delegated ONCE on the panel root — the panel is built DETACHED from the DOM (see
 // panel.js buildPanel), so a document-level query at wire time would bind nothing.
-import { getSettings, saveSettings } from './state.js';
-import { isAgentArmed, armAgent, isAgentBusy, getLastBrief, getLastTranscript } from './agent.js';
+import { getSettings, saveSettings, getChatStore, charKey, isGroupChat, getGroupMembers, resolveTargetChar } from './state.js';
+import { isAgentArmed, armAgent, isAgentBusy, getLastBrief, getLastTranscript, getSurfacedRulings } from './agent.js';
 import {
     TOOL_REGISTRY, toolEnabled, memoryLog, undoMemoryLogEntry, listAgentOwnedEntries, getSceneState,
 } from './agent-tools.js';
+import {
+    listRulings, updateRuling, deleteRuling, setPinned, undoRulingLogEntry, rulingLog,
+    consultOracleManual, isRulingBusy,
+} from './rulings.js';
 import { profileOptionsHtml } from './panel.js';
 
 const htmlEscapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -27,6 +31,15 @@ function coerceNumber(el, current) {
     return Math.min(max, Math.max(min, Math.round(num)));
 }
 
+/** Like coerceNumber but keeps floats (ruling thresholds live between 0.3 and 0.95). */
+function coerceFloat(el, current) {
+    const num = Number(el.value);
+    if (!Number.isFinite(num)) return current;
+    const min = el.min !== '' && Number.isFinite(Number(el.min)) ? Number(el.min) : -Infinity;
+    const max = el.max !== '' && Number.isFinite(Number(el.max)) ? Number(el.max) : Infinity;
+    return Math.min(max, Math.max(min, num));
+}
+
 const TOOL_LABELS = {
     roll_dice: 'Dice (roll_dice) — binding rolls when outcomes are uncertain',
     consult_character: 'Character consult (consult_character) — inner voice: feel / react / backstory',
@@ -35,12 +48,120 @@ const TOOL_LABELS = {
     ask_user: 'Ask the user (ask_user) — one popup when a decision is truly theirs',
     introduce_npc: 'Introduce NPC (introduce_npc) — invent + persist a recurring side character',
     memory: 'Memory (search / create / update / delete) — durable facts in the chat lorebook',
+    ruling: 'Character ruling (character_ruling) — ask the oracle for a reusable behavioral ruling',
 };
 
 let wired = false;
 
+// Rulings section state — survives the per-open re-renders of the tab.
+let rulingTabCharKey = null;   // null = follow the chat's target character
+let rulingTabFilter = 'all';
+let rulingEditTimer = null;
+let pendingRulingEdit = null;
+
 function $agentRoot() {
     return $('#smarttavern_panel #smarttavern_agent_root');
+}
+
+// --------------------------------------------------------------------------------------------
+// Rulings section helpers
+// --------------------------------------------------------------------------------------------
+
+function rulingSubject() {
+    if (rulingTabCharKey) return rulingTabCharKey;
+    const target = resolveTargetChar();
+    return target ? charKey(target) : '';
+}
+
+function rulingSubjectOptions() {
+    if (!isGroupChat()) return '';
+    const members = getGroupMembers();
+    const selected = rulingSubject();
+    const options = members.map(member => {
+        const key = charKey(member);
+        return `<option value="${escapeHtml(key)}"${key === selected ? ' selected' : ''}>${escapeHtml(member?.name ?? key)}</option>`;
+    }).join('');
+    return `<label title="Group chat — each character keeps its own rulings">Character
+        <select id="smarttavern_ruling_char">${options}</select>
+    </label>`;
+}
+
+function rulingRowHtml(record, surfacedIds) {
+    const id = Number(record.id);
+    const pinned = record.pinned === true;
+    return `
+    <div class="smarttavern_ruling_row" data-id="${id}">
+        <div class="smarttavern_ruling_meta">
+            <span class="smarttavern_ruling_id">#${id}</span>
+            <span class="smarttavern_ruling_status smarttavern_ruling_status_${escapeHtml(record.status ?? 'active')}">${escapeHtml(record.status ?? 'active')}</span>
+            <span class="smarttavern_ruling_conf smarttavern_ruling_conf_${escapeHtml(record.confidence ?? 'medium')}" title="Oracle confidence">${escapeHtml(record.confidence ?? 'medium')}</span>
+            ${record.source === 'manual' ? '<span class="smarttavern_ruling_source" title="Edited by the user">manual</span>' : ''}
+            <span class="smarttavern_ruling_uses" title="Times surfaced or reused">×${Math.max(0, Math.round(Number(record.uses ?? 0)))}</span>
+            ${surfacedIds.has(id) ? '<span class="smarttavern_ruling_surfaced" title="Surfaced in the last brief">★ last brief</span>' : ''}
+            <span class="smarttavern_ruling_spacer"></span>
+            <a class="menu_button menu_button_icon smarttavern_ruling_pin${pinned ? ' is-pinned' : ''}" data-id="${id}" data-pinned="${pinned ? '1' : ''}" title="${pinned ? 'Unpin — allow superseding and pruning again' : 'Pin — never superseded, expired or evicted'}"><i class="fa-solid fa-thumbtack"></i></a>
+            <a class="menu_button menu_button_icon smarttavern_ruling_delete" data-id="${id}" title="Delete this ruling"><i class="fa-solid fa-trash"></i></a>
+        </div>
+        ${String(record.question ?? '').trim() ? `<div class="smarttavern_ruling_question" title="${escapeHtml(record.question)}">Q: ${escapeHtml(record.question)}</div>` : ''}
+        <textarea class="smarttavern_ruling_text text_pole" rows="2" data-id="${id}" title="Edit the ruling — autosaves; an edit marks it manual and active">${escapeHtml(record.ruling ?? '')}</textarea>
+    </div>`;
+}
+
+function rulingSectionHtml(settings) {
+    if (settings.agentRulingsEnabled === false) {
+        return `
+        <div class="smarttavern_steps_section_title"><i class="fa-solid fa-scale-balanced"></i><span>Rulings</span></div>
+        <div class="smarttavern_hint">The rulings ledger is disabled. Enable it to let the agent ask the character oracle for reusable behavioral rulings.</div>
+        <label class="checkbox">
+            <input id="smarttavern_agentRulingsEnabled" type="checkbox">
+            <span>Enable the rulings ledger</span>
+        </label>`;
+    }
+    const subject = rulingSubject();
+    const store = getChatStore();
+    const hasLedger = Array.isArray(store.rulings);
+    const all = hasLedger ? listRulings(subject) : [];
+    const filtered = rulingTabFilter === 'all' ? all : all.filter(record => record.status === rulingTabFilter);
+    const surfacedIds = new Set(getSurfacedRulings().map(record => Number(record.id)).filter(id => id > 0));
+    const rows = filtered.length
+        ? filtered.map(record => rulingRowHtml(record, surfacedIds)).join('')
+        : `<div class="smarttavern_hint">${hasLedger ? 'No rulings for this character yet.' : 'No ledger in this chat yet — the first ruling creates it.'} Ask an open behavioral question below or let the agent call character_ruling.</div>`;
+    const filterOptions = ['all', 'active', 'tentative', 'superseded']
+        .map(value => `<option value="${value}"${rulingTabFilter === value ? ' selected' : ''}>${value}</option>`)
+        .join('');
+    const logRows = rulingLog().length
+        ? rulingLog().map((row, index) => `
+            <div class="smarttavern_agent_memory_row">
+                <span class="smarttavern_agent_memory_action smarttavern_agent_action_${escapeHtml(row.action)}">${escapeHtml(row.action)}</span>
+                <span class="smarttavern_agent_memory_title" title="${escapeHtml(`ruling #${row.id}`)}">ruling #${escapeHtml(String(row.id ?? ''))}${row.before?.question ? ` — ${escapeHtml(String(row.before.question).slice(0, 60))}` : ''}</span>
+                <a class="menu_button menu_button_icon smarttavern_ruling_undo" data-index="${index}" title="Undo this ruling change"><i class="fa-solid fa-rotate-left"></i></a>
+            </div>`).reverse().join('')
+        : '<div class="smarttavern_hint">No ruling changes in this chat yet.</div>';
+    return `
+    <div class="smarttavern_steps_section_title"><i class="fa-solid fa-scale-balanced"></i><span>Rulings</span></div>
+    <div class="smarttavern_hint">Durable character behavior, saved per chat: the agent asks the oracle once, later turns surface matching rulings as "Established behavior". Editing, pinning, deleting and undoing happen here.</div>
+    <label class="checkbox">
+        <input id="smarttavern_agentRulingsEnabled" type="checkbox" checked>
+        <span>Enable the rulings ledger</span>
+    </label>
+    <label title="Connection profile for the character oracle; empty uses the agent profile">Oracle connection profile
+        <select id="smarttavern_rulingProfileId" class="smarttavern_profile_select">${profileOptionsHtml(settings.rulingProfileId ?? '')}</select>
+        <span class="smarttavern_missing_profile" id="smarttavern_ruling_missing_profile" title="The pinned connection profile no longer exists — requests fall back to the agent profile"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
+    </label>
+    ${rulingSubjectOptions()}
+    <label>Consult now
+        <div class="smarttavern_row_actions">
+            <input id="smarttavern_ruling_question" type="text" class="text_pole" placeholder="How does she behave when someone flatters her?" maxlength="300">
+            <a id="smarttavern_ruling_consult" class="menu_button smarttavern_busy_guard" title="Ask the character oracle and save the ruling"><i class="fa-solid fa-wand-magic-sparkles"></i><span>${isRulingBusy() ? 'Consulting…' : 'Ask'}</span></a>
+        </div>
+        <small>Saves the answer into this chat's ledger. Existing matching rulings are reused without a new oracle call.</small>
+    </label>
+    <label>Show
+        <select id="smarttavern_ruling_filter">${filterOptions}</select>
+    </label>
+    <div id="smarttavern_ruling_list">${rows}</div>
+    <div class="smarttavern_steps_section_title"><i class="fa-solid fa-clock-rotate-left"></i><span>Ruling changes (undo)</span></div>
+    <div id="smarttavern_ruling_log">${logRows}</div>`;
 }
 
 // --------------------------------------------------------------------------------------------
@@ -153,12 +274,29 @@ export function renderAgentTab() {
             <label title="Shared by memory create/update/delete and NPC persistence">Memory writes per turn
                 <input id="smarttavern_agentMemoryWritesPerTurn" class="text_margin_input" type="number" min="0" max="10" step="1" value="${settings.agentMemoryWritesPerTurn}">
             </label>
+            <label title="character_ruling calls per turn (0 disables)">Rulings per turn
+                <input id="smarttavern_agentConsultPerTurn" class="text_margin_input" type="number" min="0" max="4" step="1" value="${settings.agentConsultPerTurn}">
+            </label>
+            <label title="Maximum saved rulings per chat; superseded and tentative ones are pruned first">Ledger cap
+                <input id="smarttavern_agentRulingsMax" class="text_margin_input" type="number" min="5" max="300" step="5" value="${settings.agentRulingsMax}">
+            </label>
+            <label title="Rulings auto-surfaced into one Turn Brief">Surfaced per brief
+                <input id="smarttavern_agentRulingsSurfaceMax" class="text_margin_input" type="number" min="0" max="4" step="1" value="${settings.agentRulingsSurfaceMax}">
+            </label>
+            <label title="Reuse an existing ruling when the question matches at/above this similarity">Reuse threshold
+                <input id="smarttavern_agentRulingReuseThreshold" class="text_margin_input" type="number" min="0.3" max="0.95" step="0.05" value="${settings.agentRulingReuseThreshold}">
+            </label>
+            <label title="Surface a ruling into the brief when its keys match the chat at/above this score">Surface threshold
+                <input id="smarttavern_agentRulingSurfaceThreshold" class="text_margin_input" type="number" min="0.3" max="0.95" step="0.05" value="${settings.agentRulingSurfaceThreshold}">
+            </label>
         </div>
 
         <div class="smarttavern_steps_section_title"><i class="fa-solid fa-file-lines"></i><span>Last Turn Brief</span></div>
         <pre id="smarttavern_agent_brief" class="smarttavern_story_directive">${escapeHtml(brief || '(no brief compiled yet — send a message)')}</pre>
         <div class="smarttavern_steps_section_title"><i class="fa-solid fa-map-pin"></i><span>Scene state</span></div>
         <pre class="smarttavern_story_directive">${escapeHtml(JSON.stringify(getSceneState(), null, 2))}</pre>
+
+        ${rulingSectionHtml(settings)}
 
         <div class="smarttavern_steps_section_title"><i class="fa-solid fa-list"></i><span>Last thinking transcript</span></div>
         <div id="smarttavern_agent_transcript">${transcriptHtml}</div>
@@ -224,6 +362,88 @@ export function wireAgentTab($rootPanel) {
         saveSettings();
     });
 
+    $panel.on('change', '#smarttavern_rulingProfileId', function () {
+        getSettings().rulingProfileId = String(this.value ?? '');
+        saveSettings();
+    });
+
+    $panel.on('change', '#smarttavern_agentRulingsEnabled', function () {
+        getSettings().agentRulingsEnabled = this.checked;
+        saveSettings();
+        renderAgentTab();
+    });
+
+    $panel.on('change', '#smarttavern_ruling_char', function () {
+        rulingTabCharKey = String(this.value ?? '') || null;
+        renderAgentTab();
+    });
+
+    $panel.on('change', '#smarttavern_ruling_filter', function () {
+        rulingTabFilter = ['all', 'active', 'tentative', 'superseded'].includes(this.value) ? this.value : 'all';
+        renderAgentTab();
+    });
+
+    // Ruling edits autosave (debounced); the value is captured so re-renders never
+    // clobber the in-flight edit, and the list is NOT re-rendered on keystrokes.
+    $panel.on('input', '.smarttavern_ruling_text', function () {
+        const id = Number($(this).data('id') ?? 0);
+        const value = String(this.value ?? '');
+        pendingRulingEdit = { id, value };
+        if (rulingEditTimer) clearTimeout(rulingEditTimer);
+        rulingEditTimer = setTimeout(() => {
+            rulingEditTimer = null;
+            const edit = pendingRulingEdit;
+            pendingRulingEdit = null;
+            if (!edit || !Number.isInteger(edit.id) || edit.id <= 0) return;
+            const current = listRulings(rulingSubject()).find(record => record.id === edit.id);
+            if (!current || String(current.ruling ?? '') === edit.value.trim()) return;
+            if (updateRuling(edit.id, { ruling: edit.value })) {
+                toastr.success(`SmartTavern: ruling #${edit.id} updated.`, 'SmartTavern');
+            } else {
+                toastr.warning(`SmartTavern: ruling #${edit.id} could not be updated.`, 'SmartTavern');
+            }
+        }, 500);
+    });
+
+    $panel.on('click', '.smarttavern_ruling_pin', function () {
+        const id = Number($(this).data('id') ?? 0);
+        const pinned = $(this).data('pinned') !== '1';
+        setPinned(id, pinned);
+        renderAgentTab();
+    });
+
+    $panel.on('click', '.smarttavern_ruling_delete', function () {
+        const id = Number($(this).data('id') ?? 0);
+        if (deleteRuling(id)) toastr.info(`SmartTavern: ruling #${id} deleted (undo below).`, 'SmartTavern');
+        renderAgentTab();
+    });
+
+    $panel.on('click', '.smarttavern_ruling_undo', function () {
+        const index = Number($(this).data('index') ?? -1);
+        if (!Number.isInteger(index) || index < 0) return;
+        const undone = undoRulingLogEntry(index);
+        if (undone) toastr.success('SmartTavern: ruling change undone.', 'SmartTavern');
+        else toastr.warning('SmartTavern: the ruling changed since — undo skipped.', 'SmartTavern');
+        renderAgentTab();
+    });
+
+    $panel.on('click', '#smarttavern_ruling_consult', async function () {
+        const $input = $panel.find('#smarttavern_ruling_question');
+        const question = String($input.val() ?? '').trim();
+        if (question.length < 4) {
+            toastr.warning('SmartTavern: ask a behavioral question first (at least 4 characters).', 'SmartTavern');
+            return;
+        }
+        // Group chats: consult the character selected in the tab, not the chat default.
+        const char = rulingTabCharKey
+            ? (getGroupMembers().find(member => charKey(member) === rulingTabCharKey) ?? null)
+            : null;
+        const outcome = await consultOracleManual({ question, char });
+        if (outcome?.error) toastr.warning(`SmartTavern: ${outcome.error}`, 'SmartTavern');
+        else if (outcome) toastr.success(outcome.text, 'SmartTavern', { timeOut: 8000 });
+        renderAgentTab();
+    });
+
     $panel.on('change', '.smarttavern_agent_tool', function () {
         const settings = getSettings();
         const tool = String($(this).data('tool') ?? '');
@@ -241,7 +461,20 @@ export function wireAgentTab($rootPanel) {
         smarttavern_agentAuxMaxTokens: 'agentAuxMaxTokens',
         smarttavern_agentAskPerTurn: 'agentAskPerTurn',
         smarttavern_agentMemoryWritesPerTurn: 'agentMemoryWritesPerTurn',
+        smarttavern_agentConsultPerTurn: 'agentConsultPerTurn',
+        smarttavern_agentRulingsMax: 'agentRulingsMax',
+        smarttavern_agentRulingsSurfaceMax: 'agentRulingsSurfaceMax',
     };
+    const FLOAT_FIELDS = {
+        smarttavern_agentRulingReuseThreshold: 'agentRulingReuseThreshold',
+        smarttavern_agentRulingSurfaceThreshold: 'agentRulingSurfaceThreshold',
+    };
+    for (const [id, key] of Object.entries(FLOAT_FIELDS)) {
+        $panel.on('input', `#${id}`, function () {
+            getSettings()[key] = coerceFloat(this, Number(getSettings()[key]));
+            saveSettings();
+        });
+    }
     for (const [id, key] of Object.entries(NUMBER_FIELDS)) {
         $panel.on('input', `#${id}`, function () {
             getSettings()[key] = coerceNumber(this, Number(getSettings()[key]));

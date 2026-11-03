@@ -1088,3 +1088,85 @@
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+
+/* Thinking agent — rulings ledger */
+
+#smarttavern_panel .smarttavern_ruling_row {
+    border: 1px solid var(--SmartThemeBorderColor, transparent);
+    border-radius: 8px;
+    padding: 6px 8px;
+    margin: 4px 0;
+    font-size: 0.85em;
+}
+
+#smarttavern_panel .smarttavern_ruling_meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+#smarttavern_panel .smarttavern_ruling_id {
+    font-weight: 700;
+    opacity: 0.9;
+}
+
+#smarttavern_panel .smarttavern_ruling_status,
+#smarttavern_panel .smarttavern_ruling_conf,
+#smarttavern_panel .smarttavern_ruling_source,
+#smarttavern_panel .smarttavern_ruling_uses,
+#smarttavern_panel .smarttavern_ruling_surfaced {
+    text-transform: uppercase;
+    font-size: 0.85em;
+    letter-spacing: 0.04em;
+    border-radius: 6px;
+    padding: 1px 6px;
+    border: 1px solid var(--SmartThemeBorderColor, transparent);
+    white-space: nowrap;
+}
+
+#smarttavern_panel .smarttavern_ruling_status_active,
+#smarttavern_panel .smarttavern_ruling_conf_high {
+    color: var(--SmartThemeGreenColor, #75ac28);
+}
+
+#smarttavern_panel .smarttavern_ruling_status_tentative,
+#smarttavern_panel .smarttavern_ruling_conf_low {
+    color: var(--SmartThemeQuoteColor);
+}
+
+#smarttavern_panel .smarttavern_ruling_status_superseded,
+#smarttavern_panel .smarttavern_ruling_conf_medium {
+    opacity: 0.65;
+}
+
+#smarttavern_panel .smarttavern_ruling_surfaced {
+    color: var(--SmartThemeQuoteColor);
+}
+
+#smarttavern_panel .smarttavern_ruling_spacer {
+    flex: 1 1 auto;
+}
+
+#smarttavern_panel .smarttavern_ruling_pin.is-pinned {
+    color: var(--SmartThemeQuoteColor);
+}
+
+#smarttavern_panel .smarttavern_ruling_question {
+    opacity: 0.75;
+    margin: 2px 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#smarttavern_panel .smarttavern_ruling_text {
+    width: 100%;
+    margin: 4px 0 2px;
+    resize: vertical;
+    font-size: 0.95em;
+}
+
+#smarttavern_panel #smarttavern_ruling_question {
+    flex: 1 1 auto;
+}

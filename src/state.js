@@ -265,7 +265,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
     agentTask: 'Plan concrete events for the next reply. Check continuity, consult relevant lore, and use tools when they can change the scene.',
     agentProfileId: '',                      // Connection Manager profile for the loop
     innerVoiceProfileId: '',                 // consult_character calls ('' = agent profile)
-    expertProfileId: '',                     // consult_expert calls ('' = agent profile)
+    expertProfileId: '',                      // consult_expert calls ('' = agent profile)
+    agentRulingsEnabled: true,                // character-ruling ledger (rulings.js)
+    rulingProfileId: '',                      // character-oracle calls ('' = agent profile)
+    agentConsultPerTurn: 2,                   // character_ruling calls per turn (0 disables)
+    agentRulingsMax: 60,                      // ledger cap per chat (pruned on create)
+    agentRulingsSurfaceMax: 2,                // rulings auto-surfaced into one brief
+    agentRulingReuseThreshold: 0.6,           // reuse an existing ruling at/above this score
+    agentRulingSurfaceThreshold: 0.34,        // surface a ruling into the brief at/above this score
     agentMaxIterations: 3,
     agentMaxToolCalls: 6,
     agentTimeoutMs: 0,                       // 0 = unlimited; pauses while an ask_user popup is open
@@ -285,6 +292,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
         ask_user: true,
         introduce_npc: true,
         memory: true,
+        ruling: true,
     },
     updaterMaxTokens: 100000,
     stepMaxTokens: 100000,
@@ -513,7 +521,7 @@ function normalizeSettings(settings) {
         settings.agentMode = 'always';
         changed = true;
     }
-    for (const key of ['agentProfileId', 'innerVoiceProfileId', 'expertProfileId']) {
+    for (const key of ['agentProfileId', 'innerVoiceProfileId', 'expertProfileId', 'rulingProfileId']) {
         if (typeof settings[key] !== 'string') {
             settings[key] = '';
             changed = true;
@@ -528,12 +536,31 @@ function normalizeSettings(settings) {
         ['agentAuxMaxTokens', 1, 100000, 4000],
         ['agentAskPerTurn', 0, 3, 1],
         ['agentMemoryWritesPerTurn', 0, 10, 3],
+        ['agentConsultPerTurn', 0, 4, 2],
+        ['agentRulingsMax', 5, 300, 60],
+        ['agentRulingsSurfaceMax', 0, 4, 2],
     ]) {
         const normalized = clampInt(settings[key], min, max, fallback);
         if (settings[key] !== normalized) {
             settings[key] = normalized;
             changed = true;
         }
+    }
+    // Ruling thresholds are floats — clampInt would round them away.
+    for (const [key, min, max, fallback] of [
+        ['agentRulingReuseThreshold', 0.3, 0.95, 0.6],
+        ['agentRulingSurfaceThreshold', 0.3, 0.95, 0.34],
+    ]) {
+        const num = Number(settings[key]);
+        const normalized = Number.isFinite(num) ? Math.min(max, Math.max(min, num)) : fallback;
+        if (settings[key] !== normalized) {
+            settings[key] = normalized;
+            changed = true;
+        }
+    }
+    if (typeof settings.agentRulingsEnabled !== 'boolean') {
+        settings.agentRulingsEnabled = true;
+        changed = true;
     }
     if (typeof settings.agentAskUser !== 'boolean') {
         settings.agentAskUser = true;
@@ -545,7 +572,7 @@ function normalizeSettings(settings) {
         changed = true;
     }
     if (!isPlainObject(settings.agentToolsEnabled)) settings.agentToolsEnabled = {};
-    for (const tool of ['roll_dice', 'consult_character', 'consult_expert', 'scene', 'ask_user', 'introduce_npc', 'memory']) {
+    for (const tool of ['roll_dice', 'consult_character', 'consult_expert', 'scene', 'ask_user', 'introduce_npc', 'memory', 'ruling']) {
         if (typeof settings.agentToolsEnabled[tool] !== 'boolean') {
             settings.agentToolsEnabled[tool] = true;
             changed = true;

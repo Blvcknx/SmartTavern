@@ -10,6 +10,7 @@ import { runStoryCraft, runStoryBeat, runStoryChapter, showStoryDirective } from
 import { armAgent } from './agent.js';
 import { parseDice, rollDice } from './agent-core.js';
 import { listAgentOwnedEntries } from './agent-tools.js';
+import { consultOracleManual } from './rulings.js';
 import { showContentPopup, appendSection } from './panel.js';
 import { initProgress } from './progress.js';
 
@@ -139,6 +140,19 @@ async function listAgentMemory() {
     await showContentPopup('SmartTavern — agent memory (this chat)', container);
 }
 
+/** /smarttavern-ruling — ask the character oracle a behavioral question and save it. */
+async function runManualRuling(arg) {
+    const question = String(arg ?? '').trim();
+    if (question.length < 4) {
+        toastr.warning('SmartTavern: provide a behavioral question, e.g. /smarttavern-ruling How does she react to flattery?', 'SmartTavern');
+        return;
+    }
+    const outcome = await consultOracleManual({ question });
+    if (outcome === null) return; // busy or cancelled — the HUD already reported it
+    if (outcome.error) toastr.warning(`SmartTavern: ${outcome.error}`, 'SmartTavern');
+    else toastr.success(outcome.text, 'SmartTavern', { timeOut: 8000 });
+}
+
 function registerSlashCommands() {
     const context = getContext();
     const { SlashCommandParser, SlashCommand, SlashCommandArgument, ARGUMENT_TYPE } = context;
@@ -154,6 +168,7 @@ function registerSlashCommands() {
         { name: 'smarttavern-chapter', help: 'Close the current chapter and write the opening beat of the next', run: () => runStoryChapter() },
         { name: 'smarttavern-story', help: 'Show the story directive the reply model will receive', run: () => showStoryDirective() },
         { name: 'smarttavern-think', help: 'Arm the thinking agent for the next reply (one-shot)', run: (_arg) => { armAgent(); toastr.info('SmartTavern will think before the next reply.', 'SmartTavern'); } },
+        { name: 'smarttavern-ruling', help: 'Ask the character oracle a behavioral question and save the ruling (<question>)', run: (arg) => runManualRuling(arg) },
         { name: 'smarttavern-roll', help: 'Roll dice now (informational — NOT binding, unlike the agent\'s roll_dice)', run: (arg) => runManualRoll(arg) },
         { name: 'smarttavern-memory', help: 'List the agent-owned lorebook entries of this chat', run: (_arg) => listAgentMemory() },
         { name: 'smarttavern-hud', help: 'Toggle the SmartTavern floating panel', run: (_arg) => togglePanel() },

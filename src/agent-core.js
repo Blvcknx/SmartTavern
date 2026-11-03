@@ -281,13 +281,17 @@ export function rollsMacroText(rolls) {
         .join('; ');
 }
 
+// Per-ruling word cap inside the Turn Brief (the ledger keeps the full text; local
+// copy — agent-core cannot import ruling-core, which imports this module).
+const RULING_BRIEF_WORDS = 30;
+
 /**
- * Compiles the Turn Brief injected into the reply prompt. Word cap: guidance is
- * trimmed first, then must items drop from the end; dice/answer/voice records are
- * never trimmed. NPC/reaction records shorten only after guidance and musts are
- * exhausted. Empty state → ''.
+ * Compiles the Turn Brief injected into the reply prompt. Word cap trim order:
+ * guidance first, then rulings drop from the end, then must items drop from the
+ * end; dice/answer/voice records are never trimmed. NPC/reaction records shorten
+ * only after guidance, rulings and musts are exhausted. Empty state → ''.
  */
-export function compileBrief(turn, { char = '', user = '', maxWords = 130 } = {}) {
+export function compileBrief(turn, { char = '', user = '', maxWords = 130, maxRulings = 2 } = {}) {
     const state = turn ?? {};
     const rolls = Array.isArray(state.rolls) ? state.rolls : [];
     const answer = state.answer && String(state.answer.answer ?? '').trim() ? state.answer : null;
@@ -299,7 +303,11 @@ export function compileBrief(turn, { char = '', user = '', maxWords = 130 } = {}
         .map(item => String(item ?? '').trim())
         .filter(Boolean);
     let guidance = String(state.guidance ?? '').trim();
-    if (!rolls.length && !answer && !voice && !npc && !reactionOutput && !must.length && !guidance) return '';
+    let rulings = (Array.isArray(state.rulings) ? state.rulings : [])
+        .map(item => (item && String(item.ruling ?? '').trim()) ? wordTrim(String(item.ruling).trim(), RULING_BRIEF_WORDS) : '')
+        .filter(Boolean)
+        .slice(0, Math.max(0, Math.round(Number(maxRulings) || 0)));
+    if (!rolls.length && !answer && !voice && !npc && !reactionOutput && !must.length && !guidance && !rulings.length) return '';
 
     const cap = Math.max(30, Math.round(Number(maxWords) || 130));
     const charName = String(char ?? '').trim() || 'the character';
@@ -310,11 +318,12 @@ export function compileBrief(turn, { char = '', user = '', maxWords = 130 } = {}
     if (npc) records.push(`New recurring character: ${String(npc.name).trim()} — wants: ${String(npc.want ?? '').trim()}. Tell: ${String(npc.tell ?? '').trim()}. (Introduce them naturally in this reply or soon.)`);
     if (reactionOutput) records.push(`${charName}'s likely reaction: ${reactionOutput}`);
 
-    const assemble = (mustList, guidanceText) => {
+    const assemble = (mustList, guidanceText, rulingList) => {
         const lines = [header];
         if (diceText) lines.push(`Dice (binding, already rolled): ${diceText}`);
         if (answer) lines.push(`${userName} answered a question: "${String(answer.answer).trim()}"`);
         if (voice) lines.push(`${charName}'s private thoughts (shade the reply; never quote them): ${String(voice.output).trim()}`);
+        if (rulingList.length) lines.push(`Established behavior of ${charName} (stay consistent with these): ${rulingList.join(' | ')}`);
         lines.push(...records.filter(Boolean));
         if (mustList.length) lines.push(`Must show:\n${mustList.map(item => `- ${item}`).join('\n')}`);
         if (guidanceText) lines.push(`Guidance: ${guidanceText}`);
@@ -322,20 +331,24 @@ export function compileBrief(turn, { char = '', user = '', maxWords = 130 } = {}
         return lines.join('\n');
     };
 
-    let text = assemble(must, guidance);
+    let text = assemble(must, guidance, rulings);
     while (wordCount(text) > cap && guidance) {
         const words = wordCount(guidance);
         const smaller = wordTrim(guidance, Math.max(0, words - Math.max(1, Math.ceil(words / 4))));
         guidance = smaller === guidance ? '' : smaller;
-        text = assemble(must, guidance);
+        text = assemble(must, guidance, rulings);
+    }
+    while (wordCount(text) > cap && rulings.length) {
+        rulings = rulings.slice(0, -1);
+        text = assemble(must, guidance, rulings);
     }
     while (wordCount(text) > cap && must.length) {
         must = must.slice(0, -1);
-        text = assemble(must, guidance);
+        text = assemble(must, guidance, rulings);
     }
     for (let i = records.length - 1; i >= 0 && wordCount(text) > cap; i--) {
         records[i] = wordTrim(records[i], Math.max(0, wordCount(records[i]) - (wordCount(text) - cap)));
-        text = assemble(must, guidance);
+        text = assemble(must, guidance, rulings);
     }
     return text;
 }

@@ -1098,6 +1098,9 @@ export function refreshProfileSelects() {
     const voiceSelect = $panel().find('#smarttavern_innerVoiceProfileId').get(0);
     if (voiceSelect) refresh(voiceSelect, settings.innerVoiceProfileId ?? '');
     updateBadge($panel().find('#smarttavern_voice_missing_profile'), settings.innerVoiceProfileId ?? '');
+    const rulingSelect = $panel().find('#smarttavern_rulingProfileId').get(0);
+    if (rulingSelect) refresh(rulingSelect, settings.rulingProfileId ?? '');
+    updateBadge($panel().find('#smarttavern_ruling_missing_profile'), settings.rulingProfileId ?? '');
     // Both step lists render through the same card builder; each select carries its own
     // step object so index-based lookups cannot cross wires between the two pipelines.
     $panel().find('.smarttavern_step_profile').each(function () {
@@ -1286,6 +1289,13 @@ function renderRunResult(body, result, pipeline) {
         appendSection(body, 'Turn Brief (thinking agent — injected before the directive)', result.brief || '(nothing at stake — no brief this turn)');
     } else if (result.brief) {
         appendSection(body, 'Turn Brief', result.brief);
+    }
+    if (Array.isArray(result.surfacedRulings) && result.surfacedRulings.length) {
+        appendSection(
+            body,
+            'Rulings surfaced in the last brief',
+            result.surfacedRulings.map(record => `#${record.id}: ${record.ruling}`).join('\n'),
+        );
     }
     if (Array.isArray(result.agentTranscript) && result.agentTranscript.length) {
         const text = result.agentTranscript

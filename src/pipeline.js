@@ -188,6 +188,7 @@ function recordLastRun(result, pipeline, source) {
         agentRan: Boolean(result.agentRan),
         brief: result.brief ?? '',
         agentTranscript: result.agentTranscript ?? null,
+        surfacedRulings: result.surfacedRulings ?? [],
         source,
         at: Date.now(),
     };
@@ -347,9 +348,11 @@ export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, 
         if (m === 'beat') return story?.beat ?? '';
         if (m === 'chapter') return story?.chapter ?? '';
         if (m === 'ledger') return story?.ledger ?? '';
-        // Thinking agent macros: the compiled Turn Brief and the dice line(s).
+        // Thinking agent macros: the compiled Turn Brief, the dice line(s) and the
+        // established-behavior lines.
         if (m === 'brief') return agent?.brief ?? '';
         if (m === 'rolls') return agent?.rollsText ?? '';
+        if (m === 'rulings') return agent?.rulingsText ?? '';
         return null;
     };
 }
@@ -602,8 +605,15 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
 
         const storyContext = directive ? storyMacroContext(directive) : null;
         const briefText = agentResult?.brief ?? '';
-        const agentMacro = briefText || (agentResult?.turn?.rolls?.length)
-            ? { brief: briefText, rollsText: rollsMacroText(agentResult?.turn?.rolls ?? []) }
+        const surfacedRulings = (Array.isArray(agentResult?.turn?.rulings) ? agentResult.turn.rulings : [])
+            .map(record => ({ id: Number(record?.id) || 0, ruling: String(record?.ruling ?? '').trim() }))
+            .filter(record => record.ruling);
+        const agentMacro = briefText || (agentResult?.turn?.rolls?.length) || surfacedRulings.length
+            ? {
+                brief: briefText,
+                rollsText: rollsMacroText(agentResult?.turn?.rolls ?? []),
+                rulingsText: surfacedRulings.map(record => record.ruling).join(' | '),
+            }
             : null;
         const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings, stepsList: settings.steps, story: storyContext, agent: agentMacro });
         const hasStepBlocks = stepBlocks(settings.steps, stepOutputs).length > 0;
@@ -645,6 +655,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             agentRan: Boolean(agentResult),
             brief: briefText,
             agentTranscript: agentResult?.transcript ?? null,
+            surfacedRulings,
         };
         if (!inject) return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '', ...agentRecord }, 'expansion', 'dry run');
 

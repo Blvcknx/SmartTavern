@@ -20,6 +20,7 @@ import {
 import { generateWithRetry, withInternalGeneration, isAbortError, throwIfAborted } from './gen.js';
 import { serializeProfile, extractJson } from './profiles.js';
 import { parseDice, rollDice, agentRollExtreme, validateToolArgs, looksRefusal, wordTrim, truncate } from './agent-core.js';
+import { consultOracle } from './rulings.js';
 
 // --------------------------------------------------------------------------------------------
 // Chat lorebook helpers (the chat binds exactly ONE book; SmartTavern shares it)
@@ -385,12 +386,17 @@ async function consultCharacter(args, ctx) {
     const charName = ctx.char?.name ?? 'the character';
     const definitions = serializeProfile(ctx.profile, settings.fields ?? []);
     const excerpt = chatExcerpt(ctx.chat, clampInt(settings.agentLookback, 0, 100, 8));
+    // Saved rulings about this character: momentary reactions must respect them.
+    const established = (Array.isArray(ctx.turn?.rulings) ? ctx.turn.rulings : [])
+        .map(record => String(record?.ruling ?? '').trim())
+        .filter(Boolean);
     const prompt = [
         `You ARE ${charName} in an ongoing interactive story. Speak in first person, as ${charName}.`,
         '',
         definitions ? `Your living profile:\n${definitions}` : `Your character card:\n${cardText(ctx.char)}`,
         '',
         excerpt ? `Recent conversation:\n${excerpt}` : '',
+        established.length ? `Established behavior (stay consistent):\n${established.map(line => `- ${line}`).join('\n')}` : '',
         focus ? `Situation to consider: ${focus}` : '',
         '',
         `Task: ${CONSULT_MODES[mode]}. 1–4 sentences, at most 80 words, plain first-person prose. No preamble, no headings, no out-of-character commentary.`,
@@ -611,6 +617,52 @@ export const TOOL_REGISTRY = [
             const { refused, output, record } = await consultCharacter(args, ctx);
             if (refused) return { ok: false, result: '{"error":"no in-character answer was produced — continue without it"}' };
             return { ok: true, result: `${ctx.char?.name ?? 'The character'} (${record.mode}):\n${output}` };
+        },
+    },
+    {
+        name: 'character_ruling',
+        description: 'Ask the character oracle how the character would behave in a KIND of situation; the answer is saved as a reusable behavioral ruling that later turns surface automatically. For durable character behavior only — momentary feelings use consult_character, world facts use the memory tools. The oracle reuses an existing matching ruling instead of answering again, so consult sparingly.',
+        usage: '<tool name="character_ruling">{"question":"How does she behave when asked about her past?","situation":"A stranger asks about the fire at the mill"}</tool>',
+        inputSchema: {
+            type: 'object',
+            required: ['question'],
+            properties: {
+                question: { type: 'string', minLength: 4, maxLength: 300, description: 'The behavioral question, phrased for reuse (a KIND of situation, not this exact one)' },
+                situation: { type: 'string', maxLength: 300, description: 'Optional current-situation context grounding the question' },
+                save: { type: 'boolean', description: 'default true — store the ruling in the chat ledger for reuse' },
+            },
+        },
+        mode: 'read', // consults (and reuses) even during dry runs; consultOracle itself never persists then
+        maxPerTurn: settings => clampInt(settings.agentConsultPerTurn, 0, 4, 2),
+        enabled: settings => settings.agentRulingsEnabled !== false && settings.agentToolsEnabled?.ruling !== false,
+        async run(args, ctx) {
+            const outcome = await consultOracle({
+                question: args.question,
+                situation: args.situation,
+                save: args.save !== false,
+                char: ctx.char,
+                profile: ctx.profile,
+                chat: ctx.chat,
+                settings: ctx.settings,
+                signal: ctx.signal,
+                isCurrentChat: ctx.isCurrentChat,
+                dryRun: ctx.dryRun,
+                isReplay: ctx.isReplay,
+            });
+            if (outcome?.error) return { ok: false, result: `{"error":"${String(outcome.error).replace(/"/g, "'")}"}` };
+            const ruling = outcome.ruling;
+            // Carry the ruling verbatim into the brief even if auto-surface missed it.
+            if (ruling && Array.isArray(ctx.turn?.rulings)) {
+                const dedupeKey = Number(ruling.id) > 0 ? `id:${ruling.id}` : `text:${ruling.ruling}`;
+                if (!ctx.turn.rulings.some(record => (Number(record?.id) > 0 ? `id:${record.id}` : `text:${record?.ruling}`) === dedupeKey)) {
+                    ctx.turn.rulings.push({ id: Number(ruling.id) || 0, ruling: String(ruling.ruling ?? '').trim() });
+                }
+            }
+            // Reuses (and fresh creates) were already accounted for this turn.
+            if (ruling && Number(ruling.id) > 0 && !ctx.dryRun && ctx.turn?.rulingUsesCounted instanceof Set) {
+                ctx.turn.rulingUsesCounted.add(Number(ruling.id));
+            }
+            return { ok: true, result: outcome.text };
         },
     },
     {
