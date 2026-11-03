@@ -31,7 +31,7 @@ import {
     recordedDirective, compileStoryDirective,
 } from './story.js';
 import {
-    agentActiveForTurn, runAgentLoop, resetAgentTurn, agentTurnRequirements,
+    agentActiveForTurn, runAgentLoop, resetAgentTurn, agentTurnRequirements, getTurnBrief,
 } from './agent.js';
 import { rollsMacroText } from './agent-core.js';
 
@@ -62,6 +62,9 @@ const DIRECTIVE_ENFORCEMENT_PROMPT = [
     'You are checking the DRAFT reply of {{char}} against a list of REQUIRED EVENTS.',
     'REQUIRED EVENTS (each must visibly happen on the page, not merely be alluded to):',
     '{{must}}',
+    '',
+    'TURN BRIEF (what the reply model was told; judge dice outcomes by its declared difficulty and interpretation):',
+    '{{brief}}',
     '',
     'Recent chat:',
     '{{chat}}',
@@ -960,6 +963,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                     currentDraft: surgical ? numberedDraft(currentDraft) : currentDraft,
                     draftPlain: currentDraft,
                     originalDraft, draftMessageId: messageId, story: storyCtx,
+                    agent: { brief: getTurnBrief(), rollsText: rollsMacroText(agentTurnRequirements().rolls) },
                 });
                 const text = substituteParamsSafe(expandMacros(step.prompt, resolve));
                 let output;

@@ -144,6 +144,9 @@ export function renderAgentTab() {
             <label title="Hard word cap of the compiled brief (guidance trims first)">Brief word cap
                 <input id="smarttavern_agentBriefMaxWords" class="text_margin_input" type="number" min="40" max="400" step="10" value="${settings.agentBriefMaxWords}">
             </label>
+            <label title="Output token budget for consult_character and NPC generation">Auxiliary max tokens
+                <input id="smarttavern_agentAuxMaxTokens" class="text_margin_input" type="number" min="1" max="100000" step="100" value="${settings.agentAuxMaxTokens}">
+            </label>
             <label title="ask_user calls per turn (0 disables)">Asks per turn
                 <input id="smarttavern_agentAskPerTurn" class="text_margin_input" type="number" min="0" max="3" step="1" value="${settings.agentAskPerTurn}">
             </label>
@@ -235,6 +238,7 @@ export function wireAgentTab($rootPanel) {
         smarttavern_agentTimeoutMs: 'agentTimeoutMs',
         smarttavern_agentLookback: 'agentLookback',
         smarttavern_agentBriefMaxWords: 'agentBriefMaxWords',
+        smarttavern_agentAuxMaxTokens: 'agentAuxMaxTokens',
         smarttavern_agentAskPerTurn: 'agentAskPerTurn',
         smarttavern_agentMemoryWritesPerTurn: 'agentMemoryWritesPerTurn',
     };

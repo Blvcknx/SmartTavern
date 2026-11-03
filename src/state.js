@@ -271,6 +271,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     agentTimeoutMs: 0,                       // 0 = unlimited; pauses while an ask_user popup is open
     agentLookback: 8,                        // chat messages the agent sees
     agentBriefMaxWords: 130,
+    agentAuxMaxTokens: 4000,
     agentAskUser: true,
     agentAskPerTurn: 1,
     agentMemoryMode: 'auto',                 // 'auto' | 'confirm' | 'off'
@@ -524,6 +525,7 @@ function normalizeSettings(settings) {
         ['agentTimeoutMs', 0, 600000, 0],
         ['agentLookback', 0, 100, 8],
         ['agentBriefMaxWords', 40, 400, 130],
+        ['agentAuxMaxTokens', 1, 100000, 4000],
         ['agentAskPerTurn', 0, 3, 1],
         ['agentMemoryWritesPerTurn', 0, 10, 3],
     ]) {

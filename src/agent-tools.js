@@ -400,11 +400,11 @@ async function consultCharacter(args, ctx) {
         profileId: settings.innerVoiceProfileId || settings.agentProfileId || '',
         systemPrompt: `You are the inner voice of ${charName}. You stay fully in character and never moralize or break the fourth wall.`,
         prompt,
-        maxTokens: 300,
+        maxTokens: settings.agentAuxMaxTokens,
     }));
     throwIfAborted(ctx.signal);
     const output = wordTrim(String(result?.content ?? '').trim(), 80);
-    if (!output || looksRefusal(output)) {
+    if (!output || looksRefusal(output, { inCharacter: true })) {
         return { refused: true, output: '' };
     }
     const record = { mode, focus, output };
@@ -450,7 +450,7 @@ async function inventNpc(args, ctx) {
         profileId: settings.agentProfileId || '',
         systemPrompt: 'You are a character designer for an interactive fiction platform. Output only the requested JSON object.',
         prompt,
-        maxTokens: 400,
+        maxTokens: settings.agentAuxMaxTokens,
         jsonSchema: NPC_SCHEMA,
         validate: (candidate) => Boolean(extractJson(candidate?.content)?.name),
     }));
@@ -892,6 +892,9 @@ export async function executeToolCall(call, ctx) {
     const cap = typeof tool.maxPerTurn === 'function' ? tool.maxPerTurn(ctx.settings) : tool.maxPerTurn;
     if (Number.isFinite(cap) && count >= cap) {
         return wrap({ ok: false, result: `{"error":"per-turn limit (${cap}) reached for ${name}"}` });
+    }
+    if (name === 'roll_dice' && typeof call.args?.dice === 'string') {
+        call.args.dice = call.args.dice.toLowerCase();
     }
     const issues = validateToolArgs(tool.inputSchema, call.args ?? {});
     if (issues.length) return wrap({ ok: false, result: `{"error":"${issues.join(' ').replace(/"/g, "'")}"}` });

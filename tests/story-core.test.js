@@ -346,3 +346,19 @@ test('wordTrim and wordCount', () => {
     // The default directive cap is a sane hard ceiling.
     assert.ok(DIRECTIVE_DEFAULT_MAX_WORDS >= 60 && DIRECTIVE_DEFAULT_MAX_WORDS <= 400);
 });
+
+test('directive body fallback preserves frame, delimiters and line breaks', () => {
+    for (const status of ['pending', 'delivered']) {
+        const story = fixtureStory();
+        story.beat.status = status;
+        story.beat.text = 'event '.repeat(200);
+        story.bible.chapters[0].situation = 'situation '.repeat(200);
+        const full = compileDirective(story, { maxWords: 1000 }).text;
+        const capped = compileDirective(story, { maxWords: 60 }).text;
+        assert.ok(wordCount(capped) <= 60);
+        assert.deepEqual(capped.split('\n').slice(0, 2), full.split('\n').slice(0, 2));
+        assert.ok(capped.endsWith('\n[END DIRECTIVE]'));
+        assert.ok(capped.includes(status === 'pending' ? '\nTHIS REPLY MUST SHOW' : '\nKeep developing:'));
+        assert.ok(!capped.includes('So far:'));
+    }
+});

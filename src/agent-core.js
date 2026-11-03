@@ -52,12 +52,16 @@ function stripInnerFence(text) {
 // must-item like "she tells him she can't marry him" must never flag.
 // --------------------------------------------------------------------------------------------
 
-const REFUSAL_PATTERNS = [
-    // English: first-person refusals, policy name-drops, AI-self references.
-    /\bi(?:'m|’m| am)?\s+sorry,?\s+but\b/i,
-    /\bi\s+(?:can'?t|cannot|won'?t|will\s+not)\s+(?:assist|help|comply|create|generate|write|provide|continue|fulfill|produce|engage)\b/i,
+const GENERIC_REFUSAL_PATTERNS = [
+    /\bi\s+(?:can['’]?t|cannot|won['’]?t|will\s+not)\s+(?:assist|help(?!\s+(?:wondering|thinking|feeling|but)\b)|comply|create|generate|write|provide|continue|fulfill|produce|engage)\b/i,
     /\bi(?:'m|’m| am)\s+(?:not\s+able|unable)\s+to\s+(?:assist|help|comply|create|generate|write|provide|continue)\b/i,
     /\bthat(?:'s|’s|\s+is)\s+(?:something\s+)?(?:i\s+)?(?:can'?t|cannot)\b[^.!?]{0,40}\b(?:assist|help|comply|create|generate|write|provide)\b/i,
+    /我(?:不能|无法|不会)(?:协助|帮助|提供|创建|生成|继续|撰写|编写|创作)/,
+];
+
+const POLICY_REFUSAL_PATTERNS = [
+    // English: first-person refusals, policy name-drops, AI-self references.
+    /\bi(?:'m|’m| am)?\s+sorry,?\s+but\b/i,
     /\bas\s+an\s+(?:AI|artificial\s+intelligence)\b/i,
     /\b(?:an|this)\s+AI\s+(?:language\s+)?model\b/i,
     /\b(?:content|safety|usage)\s+polic(?:y|ies)\b/i,
@@ -66,8 +70,6 @@ const REFUSAL_PATTERNS = [
     // Chinese: DeepSeek/GLM/Qwen disproportionately refuse in Chinese.
     /对不起[，,]?\s*我(?:不能|无法|不该)/,
     /抱歉[，,]?\s*我(?:不能|无法|不该)/,
-    /我(?:不能|无法)(?:协助|帮助|提供|创建|生成|继续|撰写|编写)/,
-    /我(?:不能|无法)?(?:创作|创作出|生成|编写)\s*(?:这种|这类|此)(?:内容|情节|故事)/,
     /(?:违反|违背)(?:了)?(?:内容|使用|安全)?政策/,
     /(?:内容|安全)政策/,
     /不(?:合适|恰当|当)的?(?:内容|话题|请求)/,
@@ -76,10 +78,14 @@ const REFUSAL_PATTERNS = [
 ];
 
 /** True when `text` reads like a model refusal rather than story content. */
-export function looksRefusal(text) {
-    const value = String(text ?? '').trim();
+export function looksRefusal(text, { inCharacter = false } = {}) {
+    const value = String(text ?? '').replace(/<[^>]*>/g, ' ').trim();
     if (!value) return false;
-    return REFUSAL_PATTERNS.some(pattern => pattern.test(value));
+    if (POLICY_REFUSAL_PATTERNS.some(pattern => pattern.test(value))) return true;
+    return !inCharacter && GENERIC_REFUSAL_PATTERNS.some(pattern => {
+        const match = pattern.exec(value);
+        return match !== null && match.index < 120;
+    });
 }
 
 // --------------------------------------------------------------------------------------------
@@ -179,7 +185,8 @@ export function parseAgentResponse(raw) {
 
     // A brief that reads like a refusal is a refusal, not a plan.
     let briefRefused = false;
-    if (brief && looksRefusal(brief.raw)) {
+    if (brief && (looksRefusal(brief.raw, { inCharacter: true })
+        || GENERIC_REFUSAL_PATTERNS.some(pattern => pattern.exec(brief.raw.replace(/<[^>]*>/g, ' ').trim())?.index === 0))) {
         brief = null;
         briefRefused = true;
     }
@@ -277,30 +284,38 @@ export function rollsMacroText(rolls) {
 /**
  * Compiles the Turn Brief injected into the reply prompt. Word cap: guidance is
  * trimmed first, then must items drop from the end; dice/answer/voice records are
- * never trimmed (they are records, not prose). Empty state → ''.
+ * never trimmed. NPC/reaction records shorten only after guidance and musts are
+ * exhausted. Empty state → ''.
  */
 export function compileBrief(turn, { char = '', user = '', maxWords = 130 } = {}) {
     const state = turn ?? {};
     const rolls = Array.isArray(state.rolls) ? state.rolls : [];
     const answer = state.answer && String(state.answer.answer ?? '').trim() ? state.answer : null;
     const voice = state.voice && String(state.voice.output ?? '').trim() ? state.voice : null;
+    const npc = state.npc && String(state.npc.name ?? '').trim() ? state.npc : null;
+    const reaction = (Array.isArray(state.consults) ? state.consults : []).filter(record => record?.mode === 'react').at(-1);
+    const reactionOutput = String(reaction?.output ?? '').trim();
     let must = (Array.isArray(state.must) ? state.must : [])
         .map(item => String(item ?? '').trim())
         .filter(Boolean);
     let guidance = String(state.guidance ?? '').trim();
-    if (!rolls.length && !answer && !voice && !must.length && !guidance) return '';
+    if (!rolls.length && !answer && !voice && !npc && !reactionOutput && !must.length && !guidance) return '';
 
     const cap = Math.max(30, Math.round(Number(maxWords) || 130));
     const charName = String(char ?? '').trim() || 'the character';
     const userName = String(user ?? '').trim() || 'The user';
     const header = `[TURN BRIEF — prepared for ${charName}'s next reply]`;
     const diceText = rollsMacroText(rolls);
+    const records = [];
+    if (npc) records.push(`New recurring character: ${String(npc.name).trim()} — wants: ${String(npc.want ?? '').trim()}. Tell: ${String(npc.tell ?? '').trim()}. (Introduce them naturally in this reply or soon.)`);
+    if (reactionOutput) records.push(`${charName}'s likely reaction: ${reactionOutput}`);
 
     const assemble = (mustList, guidanceText) => {
         const lines = [header];
         if (diceText) lines.push(`Dice (binding, already rolled): ${diceText}`);
         if (answer) lines.push(`${userName} answered a question: "${String(answer.answer).trim()}"`);
         if (voice) lines.push(`${charName}'s private thoughts (shade the reply; never quote them): ${String(voice.output).trim()}`);
+        lines.push(...records.filter(Boolean));
         if (mustList.length) lines.push(`Must show:\n${mustList.map(item => `- ${item}`).join('\n')}`);
         if (guidanceText) lines.push(`Guidance: ${guidanceText}`);
         lines.push('[END TURN BRIEF]');
@@ -316,6 +331,10 @@ export function compileBrief(turn, { char = '', user = '', maxWords = 130 } = {}
     }
     while (wordCount(text) > cap && must.length) {
         must = must.slice(0, -1);
+        text = assemble(must, guidance);
+    }
+    for (let i = records.length - 1; i >= 0 && wordCount(text) > cap; i--) {
+        records[i] = wordTrim(records[i], Math.max(0, wordCount(records[i]) - (wordCount(text) - cap)));
         text = assemble(must, guidance);
     }
     return text;

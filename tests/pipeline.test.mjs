@@ -27,7 +27,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         saveSettingsDebounced() {}, substituteParams: text => text,
         saveMetadata() {}, saveMetadataDebounced() {}, saveChat: async () => {}, updateMessageBlock() {}, addOneMessage(message) { context.renderedMessage = message; },
         ConnectionManagerRequestService: { async sendRequest(id, messages, _maxTokens, custom) {
-            requests.push({ id, messages, signal: custom?.signal });
+            requests.push({ id, messages, maxTokens: _maxTokens, signal: custom?.signal });
             return respond(messages, requests.length);
         } },
         generateRaw: async options => { requests.push(options); return 'ACTIVE OUTPUT'; },
@@ -48,7 +48,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         story: `export const prepareStoryDirective = () => (${JSON.stringify(directive)}); export const storyMacroContext = value => value; export const recordedDirective = () => null; export const compileStoryDirective = () => null; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};`,
         // Thinking agent stub: these tests exercise the non-agent path (the default
         // agentMode is 'always', so the stub gate must stay closed explicitly).
-        agent: 'export const agentActiveForTurn = () => false; export const runAgentLoop = async () => null; export const resetAgentTurn = () => {}; export const agentTurnRequirements = () => ({ must: [], rolls: [] }); export const armAgent = () => {}; export const clearAgentSession = () => {};',
+        agent: 'export const getTurnBrief = () => ""; export const agentActiveForTurn = () => false; export const runAgentLoop = async () => null; export const resetAgentTurn = () => {}; export const agentTurnRequirements = () => ({ must: [], rolls: [] }); export const armAgent = () => {}; export const clearAgentSession = () => {};',
     };
     if (realAgent) {
         sources.progress += ' export const activityAgentControls = (controls = {}) => { context.agentControls = controls; };';
@@ -1595,4 +1595,43 @@ test('agent rolls reject modifiers and custom dice', async () => {
         assert.equal(result.ok, false);
         assert.equal(ctx.turn.rolls.length, 0);
     }
+});
+
+test('agent rolls accept d20 spelling case-insensitively', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    for (const dice of ['d20', 'D20', '1d20', '1D20']) {
+        const ctx = { ...agentOptions(h), toolState: {}, turn: { rolls: [] } };
+        assert.equal((await h.tools.executeToolCall({ name: 'roll_dice', args: { dice, reason: 'Pick the lock', difficulty: lockDifficulty } }, ctx)).ok, true);
+        assert.equal(ctx.turn.rolls.length, 1);
+    }
+});
+
+test('auxiliary budget is normalized and used for in-character consultation and NPCs', async () => {
+    const h = await harness({ ...agentSettings, agentAuxMaxTokens: 6500 }, async (_messages, index) => ({ content: index === 1 ? "I can't continue like this." : '{"name":"Ilse","want":"escape","tell":"taps her ring"}' }), { realAgent: true });
+    const ctx = { ...agentOptions(h), toolState: {}, turn: { consults: [] }, dryRun: true };
+    assert.equal((await h.tools.executeToolCall({ name: 'consult_character', args: { mode: 'react', focus: 'The danger' } }, ctx)).ok, true);
+    await h.tools.executeToolCall({ name: 'introduce_npc', args: { role_hint: 'a clerk' } }, ctx);
+    assert.equal(h.requests.length, 2);
+    assert.ok(h.requests.every(request => request.maxTokens === 6500));
+    assert.equal((await harness()).state.getSettings().agentAuxMaxTokens, 4000);
+    assert.equal((await harness({ agentAuxMaxTokens: -1 })).state.getSettings().agentAuxMaxTokens, 1);
+});
+
+test('refinement macros use current agent brief and rolls and clear on turn reset', async () => {
+    const h = await harness({ ...agentSettings, storyProfileId: 'model', refinementSteps: [step('Check', 'BRIEF={{brief}}\nROLLS={{rolls}}')] }, async (_messages, index) => ({ content: index === 1 ? lockRoll : index === 2 ? '<brief><must>Alice waits by the lock.</must></brief>' : '<audit>PASS</audit>' }), { realAgent: true });
+    const result = await h.agent.runAgentLoop(agentOptions(h));
+    h.savedChat.push({ name: 'Alice', mes: 'Alice waits by the lock.' });
+    h.pipeline.markFreshGeneration();
+    await h.pipeline.runRefinementPipeline(1);
+    const prompts = h.requests.slice(2).map(request => request.messages.map(message => message.content).join('\n'));
+    assert.ok(prompts.some(prompt => prompt.includes('TURN BRIEF (what the reply model was told; judge dice outcomes by its declared difficulty and interpretation):\n' + result.brief)));
+    assert.ok(prompts.some(prompt => prompt.includes('BRIEF=' + result.brief) && prompt.includes('ROLLS=' + result.turn.rolls[0].text)));
+    h.agent.resetAgentTurn();
+    assert.equal(h.agent.getTurnBrief(), '');
+    assert.equal(h.agent.getLastBrief(), result.brief);
+    h.pipeline.markFreshGeneration();
+    await h.pipeline.runRefinementPipeline(1);
+    const last = h.requests.at(-1).messages.map(message => message.content).join('\n');
+    assert.ok(last.includes('BRIEF=\nROLLS='));
+    assert.ok(!last.includes(lockDifficulty));
 });

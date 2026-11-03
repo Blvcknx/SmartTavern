@@ -109,6 +109,11 @@ export function getLastBrief() {
     return lastBrief;
 }
 
+/** Current generation only; the panel's saved brief can outlive its turn. */
+export function getTurnBrief() {
+    return lastTurn ? lastBrief : '';
+}
+
 export function getLastTranscript() {
     return lastTranscript;
 }

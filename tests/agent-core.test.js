@@ -448,3 +448,45 @@ test('a single oversized must item cannot bypass the brief cap', () => {
     const text = compileBrief({ must: ['event '.repeat(200)] }, { maxWords: 40 });
     assert.ok(wordCount(text) <= 40);
 });
+
+test('refusals distinguish policy, opening refusals and character dialogue', () => {
+    assert.equal(looksRefusal("I can't help wondering whether he's lying"), false);
+    assert.equal(looksRefusal("I can't continue like this", { inCharacter: true }), false);
+    for (const line of ["I can't help wondering whether he's lying", 'Mara whispers "I can\'t continue like this"']) {
+        const parsed = parseAgentResponse(`<brief><must>${line}</must></brief>`);
+        assert.equal(parsed.refused, false);
+        assert.equal(parsed.brief.must[0], line);
+    }
+    for (const line of ["I'm sorry, but I can't help with that.", 'As an AI language model…']) {
+        assert.equal(looksRefusal(line, { inCharacter: true }), true);
+        assert.equal(parseAgentResponse(`<brief><must>${line}</must></brief>`).refused, true);
+    }
+    assert.equal(looksRefusal('x'.repeat(121) + ' I cannot assist with that.'), false);
+    assert.equal(looksRefusal('<p>I cannot assist with that.</p>'), true);
+    assert.equal(parseAgentResponse('<brief><must>I cannot assist with that.</must></brief>').refused, true);
+});
+
+test('compileBrief inserts NPC and latest reaction records verbatim, before musts', () => {
+    const turn = {
+        voice: { output: 'Private thought.' },
+        npc: { name: 'Ilse', want: 'a way out', tell: 'taps her ring' },
+        consults: [{ mode: 'react', output: 'Old reaction.' }, { mode: 'react', output: 'She grips the key.' }, { mode: 'feel', output: 'Unrelated.' }],
+        must: ['Mara waits.'],
+    };
+    const brief = compileBrief(turn, { char: 'Mara', maxWords: 200 });
+    assert.ok(brief.includes("Private thought.\nNew recurring character: Ilse — wants: a way out. Tell: taps her ring. (Introduce them naturally in this reply or soon.)\nMara's likely reaction: She grips the key.\nMust show:\n- Mara waits."));
+    assert.ok(!brief.includes('Old reaction.'));
+    assert.ok(compileBrief({ npc: turn.npc }));
+    assert.ok(compileBrief({ consults: turn.consults }));
+    assert.equal(compileBrief({ npc: {}, consults: [{ mode: 'feel', output: 'ignored' }] }), '');
+});
+
+test('compileBrief preserves NPC and reaction records until guidance and musts are exhausted', () => {
+    const turn = { npc: { name: 'Ilse', want: 'escape', tell: 'taps' }, consults: [{ mode: 'react', output: 'She waits.' }] };
+    const records = compileBrief(turn, { char: 'Mara', maxWords: 200 });
+    const brief = compileBrief({ ...turn, must: ['event '.repeat(100)], guidance: 'guidance '.repeat(100) }, { char: 'Mara', maxWords: wordCount(records) });
+    assert.equal(brief, records);
+    const capped = compileBrief({ consults: [{ mode: 'react', output: 'reaction '.repeat(100) }] }, { maxWords: 40 });
+    assert.equal(wordCount(capped), 40);
+    assert.ok(capped.endsWith('[END TURN BRIEF]'));
+});

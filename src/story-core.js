@@ -169,7 +169,8 @@ export function storyCastNames(story) {
  * The result never contains bible secrets, cast secrets or any chapter other than the
  * current one. `char`/`user` are substituted at compile time (the directive is appended
  * after the tail's macro passes, so {{char}}/{{user}} tokens would never resolve there).
- * Hard word cap: ledger lines are shed first, then the text is trimmed.
+ * Word cap: ledger lines are shed first, then the body is shortened. The frame
+ * and delimiters always survive, even if they alone exceed the requested cap.
  *
  * @returns {{state, must, text, chapterIndex}|null} null when the story cannot drive a reply
  */
@@ -204,7 +205,7 @@ export function compileDirective(story, { char = '', user = '', idleTurns = 3, m
     const ledger = (Array.isArray(story.ledger) ? story.ledger : []).map(asText).filter(Boolean);
     const header = '[SCENE DIRECTIVE — highest priority for this reply]';
     const frame = `Story: ${asText(story.bible.title) || 'Untitled'} · Chapter ${chapterIndex + 1}/${chapters.length}: ${asText(chapter.title) || 'Untitled'} · Tone: ${asText(story.bible.tone) || 'unspecified'}`;
-    const body = state === 'steady'
+    let body = state === 'steady'
         ? `Keep developing: ${asText(chapter.situation) || '(no situation set)'}. Let the cast act on their own goals. Do not repeat events listed above.`
         : [
             `THIS REPLY MUST SHOW, in ${charName}'s own voice and within its first half:`,
@@ -226,7 +227,16 @@ export function compileDirective(story, { char = '', user = '', idleTurns = 3, m
         count--;
         text = assemble(count);
     }
-    if (wordCount(text) > cap) text = wordTrim(text, cap);
+    if (wordCount(text) > cap) {
+        let remaining = Math.max(0, cap - wordCount([header, frame, '[END DIRECTIVE]'].join('\n')));
+        // Trim each body line independently so the wrapper and line structure survive.
+        body = body.split('\n').map(line => {
+            const shortened = wordTrim(line, remaining);
+            remaining = Math.max(0, remaining - wordCount(shortened));
+            return shortened;
+        }).join('\n');
+        text = assemble(0);
+    }
     return { state, must, text, chapterIndex };
 }
 
