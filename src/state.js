@@ -262,6 +262,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     // compiles a short Turn Brief injected into the reply prompt. The reply model
     // never sees the agent's reasoning or the tool protocol — only the brief.
     agentMode: 'always',                     // 'off' | 'always' | 'armed' (one-shot)
+    agentTask: 'Plan concrete events for the next reply. Check continuity, consult relevant lore, and use tools when they can change the scene.',
     agentProfileId: '',                      // Connection Manager profile for the loop
     innerVoiceProfileId: '',                 // consult_character calls ('' = agent profile)
     expertProfileId: '',                     // consult_expert calls ('' = agent profile)
@@ -503,6 +504,10 @@ function normalizeSettings(settings) {
     // ------------------------------------------------------------------
     // Thinking Agent
     // ------------------------------------------------------------------
+    if (typeof settings.agentTask !== 'string') {
+        settings.agentTask = DEFAULT_SETTINGS.agentTask;
+        changed = true;
+    }
     if (!['off', 'always', 'armed'].includes(settings.agentMode)) {
         settings.agentMode = 'always';
         changed = true;

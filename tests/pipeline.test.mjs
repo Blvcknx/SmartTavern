@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { SourceTextModule, createContext } from 'node:vm';
 
-async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0, realAgent = false, directive = null, clock = null } = {}) {
+async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0, realAgent = false, realStory = false, directive = null, clock = null } = {}) {
     const requests = [];
     const savedChat = [{ is_user: true, name: 'User', mes: 'Hello' }];
     const listeners = new Map();
@@ -15,17 +15,17 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
             show() { return new Promise(resolve => { this.resolve = resolve; Promise.resolve(onPopup(this)).then(result => { if (result !== undefined) this.complete(result); }); }); }
             complete(result) { this.result = result; this.resolve?.(result); }
         },
-        event_types: { GENERATION_STOPPED: 'stop', CHAT_CHANGED: 'chat' },
+        event_types: { GENERATION_STOPPED: 'stop', CHAT_CHANGED: 'chat', MESSAGE_RECEIVED: 'received', CHARACTER_MESSAGE_RENDERED: 'rendered' },
         eventSource: {
             on(type, fn) { if (!listeners.has(type)) listeners.set(type, new Set()); listeners.get(type).add(fn); },
             removeListener(type, fn) { listeners.get(type)?.delete(fn); },
             emit(type, ...args) { for (const fn of [...(listeners.get(type) ?? [])]) fn(...args); },
         },
         extensionSettings: { smarttavern: { genRetries: 0, bootstrapOnFirstMessage: false, promptTailVersion: 1, injectAnchor: 'before-last-user', ...settings }, connectionManager: { profiles: [{ id: 'model', mode: 'cc' }] } },
-        chat: savedChat, chatMetadata: {}, characterId: 0, chatId: 'test-chat', activityEntries: [],
+        chat: savedChat, chatMetadata: {}, characterId: 0, chatId: 'test-chat', activityEntries: [], activityEnds: [],
         characters: [{ name: 'Alice', avatar: 'alice.png' }], name1: 'User', name2: 'Alice',
         saveSettingsDebounced() {}, substituteParams: text => text,
-        saveMetadata() {}, saveMetadataDebounced() {}, saveChat: async () => {}, updateMessageBlock() {},
+        saveMetadata() {}, saveMetadataDebounced() {}, saveChat: async () => {}, updateMessageBlock() {}, addOneMessage(message) { context.renderedMessage = message; },
         ConnectionManagerRequestService: { async sendRequest(id, messages, _maxTokens, custom) {
             requests.push({ id, messages, signal: custom?.signal });
             return respond(messages, requests.length);
@@ -41,7 +41,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         extensions: 'export const getContext = () => context;',
         'system-messages': "export const system_message_types = { NARRATOR: 'narrator' };",
         'instruct-mode': `export const formatInstructModeChat = (name, text, user, system) => '<' + (system ? 'system' : user ? 'user' : 'assistant') + '>' + text + '</turn>\\n'; export const formatInstructModePrompt = () => '<assistant>';`,
-        progress: 'export const activityStart = () => {}; export const activityStatus = () => {}; export const activityEntry = entry => { context.activityEntries.push(entry); }; export const activityFail = () => {}; export const activityEnd = () => {}; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
+        progress: 'export const activityStart = () => {}; export const activityStatus = () => {}; export const activityEntry = entry => { context.activityEntries.push(entry); }; export const activityFail = () => {}; export const activityEnd = options => { context.activityEnds.push(options); }; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
         veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = () => {}; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const armPreVeil = () => {};`,
         // Story Director stub: no chat in these tests carries a story, so the whole
         // feature must stay inert. The no-ops mirror story.js's no-story behavior.
@@ -69,7 +69,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         `;
         for (const name of ['agent', 'agent-tools']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core']) {
+    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', ...(realStory ? ['story', 'story-core'] : [])]) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -80,34 +80,30 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     await pipeline.evaluate();
     const state = modules.get('state').namespace;
     state.loadSettings();
-    return { pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
+    return { story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
 
 const agentSettings = { expansionEnabled: false, agentProfileId: 'model', agentMode: 'always' };
 const agentOptions = h => ({ chat: [...h.savedChat], char: h.context.characters[0], settings: h.state.getSettings() });
-const lockOutcomes = [
-    { min: 1, max: 1, text: 'The pick breaks; the lock stays shut.' },
-    { min: 2, max: 19, text: 'The lock opens noisily.' },
-    { min: 20, max: 20, text: 'The lock opens silently.' },
-];
-const lockRoll = `<tool name="roll_dice">${JSON.stringify({ dice: 'd20', reason: 'Pick the lock', outcomes: lockOutcomes })}</tool>`;
+const lockDifficulty = 'The lock is difficult for Alice; interpret the roll against her limited experience.';
+const lockRoll = `<tool name="roll_dice">${JSON.stringify({ reason: 'Pick the lock', difficulty: lockDifficulty })}</tool>`;
 
-test('dice reject incomplete stakes before rolling and select only a committed consequence', async () => {
+test('agent rolls preserve agent-defined difficulty and assign only extreme outcomes', async () => {
     const h = await harness(agentSettings, undefined, { realAgent: true });
     const ctx = { ...agentOptions(h), toolState: {}, turn: { rolls: [] } };
     const call = args => h.tools.executeToolCall({ name: 'roll_dice', args }, ctx);
-    assert.equal((await call({ dice: 'd20', reason: 'Pick the lock' })).ok, false);
-    assert.equal((await call({ dice: 'd20', reason: 'Pick the lock', outcomes: lockOutcomes.slice(1) })).ok, false);
+    assert.equal((await call({ reason: 'Pick the lock' })).ok, false);
     assert.equal(ctx.turn.rolls.length, 0);
-    const result = await call({ dice: 'd20', reason: 'Pick the lock', outcomes: lockOutcomes });
+    const result = await call({ reason: 'Pick the lock', difficulty: lockDifficulty });
     assert.equal(result.ok, true);
     const record = ctx.turn.rolls[0];
-    const selected = lockOutcomes.find(row => record.total >= row.min && record.total <= row.max);
-    assert.equal(record.outcome, selected.text);
-    assert.ok(result.result.includes(selected.text));
-    assert.equal(record.outcomes.length, 3);
+    assert.equal(record.difficulty, lockDifficulty);
+    assert.equal(record.outcome, record.total === 1 ? 'complete failure' : record.total === 20 ? 'critical success' : '');
+    assert.equal(record.outcomes, undefined);
+    assert.ok(result.result.includes(lockDifficulty));
+    assert.ok(result.result.includes(record.text));
 });
 
 test('binding dice consequences survive Skip and reach enforcement requirements', async () => {
@@ -122,8 +118,9 @@ test('binding dice consequences survive Skip and reach enforcement requirements'
     h.context.agentControls.onSkip();
     const result = await run;
     const outcome = result.turn.rolls[0].outcome;
-    assert.ok(result.brief.includes(outcome));
-    assert.ok(h.pipeline.turnMustList().some(item => item.includes(outcome)));
+    assert.ok(result.brief.includes(lockDifficulty));
+    assert.ok(result.brief.includes(result.turn.rolls[0].text));
+    assert.ok(h.pipeline.turnMustList().some(item => item.includes(outcome || lockDifficulty)));
 });
 
 test('expert consultation uses its chosen profile, receives context and returns advisory data only', async () => {
@@ -1411,6 +1408,7 @@ for (const savePassesAsSwipes of [true, false]) {
         assert.equal(message.swipes[message.swipe_id], message.mes);
         assert.equal(h.requests[1].signal.aborted, true);
         assert.equal(h.pipeline.isRefinementBusy(), false);
+        assert.equal(h.context.activityEnds.at(-1).dismiss, true);
         response.resolve({ content: 'Discarded late output' });
         await new Promise(resolve => setImmediate(resolve));
         assert.equal(message.mes, 'First revision');
@@ -1432,6 +1430,7 @@ test("That's enough during the first pass keeps the original draft", async () =>
     assert.equal((await run).workingDraft, 'Original');
     assert.equal(message.mes, 'Original');
     assert.deepEqual(message.swipes, ['Original']);
+    assert.equal(h.context.activityEnds.at(-1).dismiss, true);
     response.resolve({ content: 'Discarded' });
 });
 
@@ -1498,4 +1497,102 @@ test('cancellation interrupts retry backoff without another provider request', a
     controller.abort(new DOMException('Stopped', 'AbortError'));
     await assert.rejects(run, { name: 'AbortError' });
     assert.equal(h.requests.length, 1);
+});
+
+
+const directorPayload = {
+    beat: { text: 'Alice finds a sealed letter on the desk.', escalations: ['Alice opens the letter.', 'Alice reads the letter aloud.'], fact: 'Alice found a letter.' },
+    chapter_done: true, assessment: 'A new situation is ready.', closing_fact: 'The archive closed.',
+    opening: '*At dawn, a sealed letter waits on the desk. Alice turns toward you.* "Who sent this?"',
+};
+function testStory() {
+    const chapter = { title: 'Archive', situation: 'Alice works at the archive.', goal: 'Find a letter.', exit: 'The archive closes.', clues: '' };
+    return { v: 1, bible: { title: 'Letters', premise: 'A mystery.', setting: 'Archive', tone: 'Quiet', conflict: 'Missing letters', secrets: 'Hidden author', cast: [{ name: 'Alice', role: 'Archivist', wants: 'Answers', secret: 'She knows the author.' }], chapters: [chapter, { ...chapter, title: 'Dawn' }] }, chapterIndex: 0, ledger: [], turnsSinceDelivery: 0 };
+}
+
+test('Chapter End posts and persists a delivered opening; Next chapter only prepares a beat', async () => {
+    for (const mode of ['chapter-end', 'chapter']) {
+        const h = await harness({ storyProfileId: 'model' }, async () => ({ content: JSON.stringify(directorPayload) }), { realStory: true });
+        h.state.setStory(testStory());
+        let saves = 0;
+        h.context.saveChat = async () => { saves++; };
+        const events = [];
+        h.context.eventSource.on('received', id => events.push(['received', id]));
+        h.context.eventSource.on('rendered', (id, type) => events.push([type, id]));
+        const beat = await h.story.advanceStory(mode, 'Set the scene at dawn.');
+        assert.equal(h.state.getStory().chapterIndex, 1);
+        if (mode === 'chapter-end') {
+            assert.equal(h.savedChat.length, 2);
+            assert.equal(h.savedChat[1].mes, directorPayload.opening);
+            assert.equal(h.savedChat[1].is_system, false);
+            assert.equal(h.savedChat[1].name, 'Alice');
+            assert.equal(h.savedChat[1].extra.smarttavernRefined, true);
+            assert.equal(h.context.renderedMessage, h.savedChat[1]);
+            assert.equal(beat.status, 'delivered');
+            assert.equal(beat.deliveredAtMsg, 1);
+            assert.equal(saves, 1);
+            assert.deepEqual(events, [['received', 1], ['first_message', 1]]);
+            assert.ok(h.state.getStory().ledger.includes(directorPayload.beat.fact));
+            assert.ok(h.requests[0].messages.some(m => m.content.includes('complete player-facing opening')));
+        } else {
+            assert.equal(h.savedChat.length, 1);
+            assert.equal(beat.status, 'pending');
+            assert.equal(saves, 0);
+        }
+    }
+});
+
+test('Chapter End appends a sequel arc after the last chapter', async () => {
+    const fixture = testStory();
+    fixture.chapterIndex = 1;
+    const sequel = Array.from({ length: 3 }, (_, i) => ({ ...fixture.bible.chapters[0], title: `Sequel ${i + 1}` }));
+    const h = await harness({ storyProfileId: 'model' }, async () => ({ content: JSON.stringify({ ...directorPayload, new_chapters: sequel }) }), { realStory: true });
+    h.state.setStory(fixture);
+    await h.story.advanceStory('chapter-end');
+    assert.equal(h.state.getStory().chapterIndex, 2);
+    assert.equal(h.state.getStory().bible.chapters.length, 5);
+    assert.equal(h.savedChat[1].mes, directorPayload.opening);
+});
+
+test('Chapter End rejects a missing opening without changing the story or chat', async () => {
+    const h = await harness({ storyProfileId: 'model' }, async () => ({ content: JSON.stringify({ ...directorPayload, opening: '' }) }), { realStory: true });
+    h.state.setStory(testStory());
+    await assert.rejects(h.story.advanceStory('chapter-end'));
+    assert.equal(h.state.getStory().chapterIndex, 0);
+    assert.equal(h.savedChat.length, 1);
+});
+
+test('Chapter End discards a result if the chat changes during generation', async () => {
+    const waiting = deferred();
+    const done = deferred();
+    const h = await harness({ storyProfileId: 'model' }, async () => { waiting.resolve(); return done.promise; }, { realStory: true });
+    h.state.setStory(testStory());
+    const run = h.story.advanceStory('chapter-end');
+    await waiting.promise;
+    h.context.chatId = 'another-chat';
+    done.resolve({ content: JSON.stringify(directorPayload) });
+    assert.equal(await run, null);
+    assert.equal(h.savedChat.length, 1);
+    assert.equal(h.state.getStory().chapterIndex, 0);
+});
+
+test('agent prompt includes the editable task and user-authored chat lore', async () => {
+    const h = await harness({ ...agentSettings, agentTask: 'Focus on the archive mystery.' }, async () => ({ content: '<brief><guidance>Alice checks the records.</guidance></brief>' }), { realAgent: true });
+    h.context.chatMetadata.world_info = 'Existing';
+    await h.agent.runAgentLoop(agentOptions(h));
+    const prompt = h.requests[0].messages.map(m => m.content).join('\n');
+    assert.ok(prompt.includes('Focus on the archive mystery.'));
+    assert.ok(prompt.includes('Existing'));
+    assert.ok(prompt.includes('A user fact.'));
+    assert.ok(prompt.includes('1 -- complete failure'));
+});
+
+test('agent rolls reject modifiers and custom dice', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    for (const dice of ['d20+2', 'd4', '2d20']) {
+        const ctx = { ...agentOptions(h), toolState: {}, turn: { rolls: [] } };
+        const result = await h.tools.executeToolCall({ name: 'roll_dice', args: { dice, reason: 'Pick the lock', difficulty: lockDifficulty } }, ctx);
+        assert.equal(result.ok, false);
+        assert.equal(ctx.turn.rolls.length, 0);
+    }
 });

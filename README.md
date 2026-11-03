@@ -203,11 +203,14 @@ For chats that keep dying because nobody is pushing the story: the **Story** tab
 
 - **Craft story** — one architect call turns the character (card + living profile + recent chat + your seed) into a bible: premise, tone, secrets, a cast with private agendas, and a chapter arc with observable exit conditions.
 - **Next beat** — one director call compiles the next concrete, observable event (max ~45 words) plus two harder escalations and a ≤15-word fact. It also judges whether the chapter's exit condition looks met and says so in a toast.
+- **Chapter End** — closes the chapter and posts a complete new playable situation as a character message, like a greeting. The opening establishes the tone, setting and immediate events while leaving player choices open.
 - **Next chapter** — closes the current chapter (its outcome joins the ledger) and writes the next chapter's opening beat. On the last chapter it appends a 3-chapter sequel arc instead of dead-ending.
 
 The reply model **never sees the bible**: secrets, cast agendas and future chapters exist only in the Director's prompts. Each generation gets a short (~140-word) scene directive appended as the **final** section of the prompt: the story frame, at most five ledger facts, and either the event this reply MUST show (→ beat, or an escalation once you idle for `storyIdleTurns` character replies) or a "keep developing" line once the beat is delivered. With refinement on, a built-in **Directive Enforcement** pass checks the fresh reply against the required event and weaves it in with minimal edits when missing; a pass that shows the event marks the beat delivered and its fact joins the ledger. Swiping or regenerating the message a beat was delivered in re-arms it as pending automatically. Everything (beat text, escalations, premise, chapters, cast) is editable in the tab and autosaves; the read-only **Directive preview** shows exactly what the reply model will receive next. Any story error fails open — the generation proceeds without a directive.
 
 ## Slash commands
+
+The **Agent task** field exposes an editable part of the planning prompt, saved for future turns. The agent sees the available lorebook names and relevant entries from user-authored chat, character and global lorebooks; `memory_search` can retrieve more. User-authored entries remain read-only.
 
 The **Agent** tab configures pre-reply thinking: Always, Armed (one-shot), or Off;
 connection profiles; tool switches; and iteration/time budgets. The agent can roll
@@ -229,17 +232,17 @@ custom deadlines are preserved. **Skip thinking** and Stop remain available.
 Click the generation activity chip to inspect completed calls. Entries show a short
 preview; click a heading to expand its output, or choose **Read full output** for a
 larger reading window. Closing the activity panel keeps the log and expanded entries
-intact. The chip stays available while entries are retained; **Clear log** removes
-them explicitly. Activity is kept in memory until cleared or the page is reloaded.
+intact. The chip hides when refinement finishes or is skipped; other completed activity
+hides after a short idle delay. **Clear log** removes retained entries explicitly. Activity is kept in memory until cleared or the page is reloaded.
 
 The agent has three GM capabilities:
 
-- **Committed dice outcomes:** `roll_dice` requires `outcomes: [{min, max, text}]`
-  covering every possible final total, including modifiers, without gaps or overlaps.
-  The minimum and maximum each need their own single-total range. Code rolls and
-  selects the binding consequence; that consequence reaches the brief, `{{rolls}}`,
-  and reply enforcement without word trimming. Advantage/disadvantage uses the kept
-  d20; multiple dice use their sum. `/smarttavern-roll` remains an informational roll.
+- **Agent dice:** agent rolls use an unmodified d20. Only **1 -- complete failure**
+  and **20 -- critical success** have fixed meanings. The agent declares the difficulty
+  before rolling and interprets results **2-19** itself, then includes concrete
+  consequences in its brief. Code imposes no middle bands or success thresholds.
+  The roll and declared difficulty reach the brief, `{{rolls}}`, and reply enforcement.
+  Advantage/disadvantage uses the kept d20. `/smarttavern-roll` still accepts general dice expressions for informational rolls.
 - **Scene state:** `update_scene` stores one key/value fact with an exact conversation
   quote as evidence. Use keys such as `location`, `time`, `Alice.position`, or
   `Alice.inventory`; `remove: true` removes an obsolete fact. These facts persist in

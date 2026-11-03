@@ -19,7 +19,7 @@ import {
 } from './state.js';
 import { generateWithRetry, withInternalGeneration, isAbortError, throwIfAborted } from './gen.js';
 import { serializeProfile, extractJson } from './profiles.js';
-import { parseDice, rollDice, validateDiceOutcomes, validateToolArgs, looksRefusal, wordTrim, truncate } from './agent-core.js';
+import { parseDice, rollDice, agentRollExtreme, validateToolArgs, looksRefusal, wordTrim, truncate } from './agent-core.js';
 
 // --------------------------------------------------------------------------------------------
 // Chat lorebook helpers (the chat binds exactly ONE book; SmartTavern shares it)
@@ -466,47 +466,41 @@ async function inventNpc(args, ctx) {
 export const TOOL_REGISTRY = [
     {
         name: 'roll_dice',
-        description: 'Roll only uncertain, possible actions. FIRST commit outcomes:[{min,max,text}] covering all FINAL totals (including modifiers), without gaps/overlaps. The minimum and maximum each require their own single-total range. Code selects a BINDING outcome; never reroll or soften it. For d20+2, natural 1/20 correspond to final 3/22. Advantage/disadvantage uses the kept die; multiple dice use the sum.',
-        usage: '<tool name="roll_dice">{"dice":"d4","reason":"pick the lock","outcomes":[{"min":1,"max":1,"text":"The pick breaks; the lock stays shut."},{"min":2,"max":3,"text":"The lock opens noisily."},{"min":4,"max":4,"text":"The lock opens silently."}]}</tool>',
+        description: 'Roll a d20 for an uncertain, possible action. Only the extremes are fixed: 1 -- complete failure; 20 -- critical success. Define the difficulty yourself before rolling, based on the situation, abilities and stakes. Interpret results 2-19 yourself against that difficulty, and put the concrete consequence in your brief. Code does not decide intermediate success, failure or thresholds. The roll is binding; never reroll or soften an extreme.',
+        usage: '<tool name="roll_dice">{"reason":"pick the lock","difficulty":"A rusty lock, difficult for an untrained character; decide whether the result overcomes it."}</tool>',
         inputSchema: {
             type: 'object',
-            required: ['dice', 'reason', 'outcomes'],
+            required: ['reason', 'difficulty'],
             properties: {
-                dice: { type: 'string', minLength: 2, maxLength: 12, description: 'NdM±K, e.g. d20, 2d6+3' },
+                dice: { type: 'string', enum: ['d20', '1d20'], description: 'Optional; always an unmodified d20' },
                 reason: { type: 'string', minLength: 3, maxLength: 140 },
                 mode: { enum: ['advantage', 'disadvantage'], description: 'd20 only' },
-                outcomes: { type: 'array', minItems: 1, items: { type: 'object', properties: {
-                    min: { type: 'number' }, max: { type: 'number' }, text: { type: 'string' },
-                }, required: ['min', 'max', 'text'] } },
+                difficulty: { type: 'string', minLength: 3, maxLength: 1000, description: 'Your assessment of the action difficulty; code does not interpret this text' },
             },
         },
         mode: 'read',
         maxPerTurn: 3,
         enabled: settings => settings.agentToolsEnabled?.roll_dice !== false,
         run(args, ctx) {
-            const dice = parseDice(args.dice);
-            if (!dice) return { ok: false, result: '{"error":"invalid dice expression — use NdM±K (N≤20, 2≤M≤1000), e.g. d20 or 2d6+3"}' };
-            const issue = validateDiceOutcomes(args.dice, args.outcomes);
-            if (issue) return { ok: false, result: JSON.stringify({ error: issue }) };
-            if (args.mode && (dice.count !== 1 || dice.sides !== 20)) return { ok: false, result: '{"error":"advantage/disadvantage requires a single d20"}' };
+            const dice = parseDice(args.dice ?? 'd20');
+            if (!dice || dice.count !== 1 || dice.sides !== 20 || dice.mod !== 0) return { ok: false, result: '{"error":"agent rolls use an unmodified d20: 1 -- complete failure; 20 -- critical success"}' };
             const prior = ctx.turn.rolls.find(record => record.spec === dice.text && record.reason === String(args.reason).trim());
             if (prior) return { ok: true, result: `Already rolled (binding): ${prior.text} → ${prior.outcome}. Do not reroll this action.` };
-            const outcomes = args.outcomes.map(range => ({ min: range.min, max: range.max, text: range.text.trim() }));
-            const roll = rollDice(args.dice, undefined, args.mode);
+            const roll = rollDice('d20', undefined, args.mode);
             if (!roll) return { ok: false, result: '{"error":"the roll failed"}' };
             const record = {
                 spec: dice.text,
                 text: roll.text,
                 total: roll.total,
                 reason: String(args.reason ?? '').trim(),
-                outcomes,
-                outcome: outcomes.find(range => roll.total >= range.min && roll.total <= range.max).text,
+                difficulty: args.difficulty.trim(),
+                outcome: agentRollExtreme(roll.total),
                 natural: roll.kept,
             };
             ctx.turn.rolls.push(record);
             return {
                 ok: true,
-                result: `ROLLED (binding): ${record.text} — "${record.reason}". REQUIRED OUTCOME: ${record.outcome}. This outcome is final; plan the brief around it.`,
+                result: `ROLLED (binding): ${record.text} — "${record.reason}". Your declared difficulty: ${record.difficulty}. ${record.outcome ? `REQUIRED EXTREME: ${record.outcome}.` : "Interpret this result against your declared difficulty; code assigns no outcome to 2-19."} Put the concrete consequence in your brief. The roll is final.`,
             };
         },
     },
@@ -722,7 +716,7 @@ export const TOOL_REGISTRY = [
             throwIfAborted(ctx.signal);
             const hits = await searchMemory(args.query);
             if (!hits.length) return { ok: true, result: 'No matching entries found.' };
-            const lines = hits.map(hit => `- [${hit.book} #${hit.uid}] ${hit.title}: ${truncate(hit.content, 160)}`);
+            const lines = hits.map(hit => `- [${hit.book} #${hit.uid}] ${hit.title}: ${truncate(hit.content, 2000)}`);
             return { ok: true, result: [`Found ${hits.length} matching entr${hits.length === 1 ? 'y' : 'ies'} (best first):`, ...lines].join('\n') };
         },
     },

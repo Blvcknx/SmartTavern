@@ -253,7 +253,7 @@ const BIBLE_SCHEMA = {
     },
 };
 
-function beatJsonSchema({ withNewChapters = false } = {}) {
+function beatJsonSchema({ withNewChapters = false, withOpening = false } = {}) {
     const properties = {
         beat: {
             type: 'object',
@@ -270,6 +270,10 @@ function beatJsonSchema({ withNewChapters = false } = {}) {
         closing_fact: { type: 'string' },
     };
     const required = ['beat', 'chapter_done', 'assessment'];
+    if (withOpening) {
+        properties.opening = { type: 'string' };
+        required.push('opening', 'closing_fact');
+    }
     if (withNewChapters) {
         properties.new_chapters = { type: 'array', items: CHAPTER_SHAPE };
         required.push('new_chapters');
@@ -308,7 +312,7 @@ function biblePromptText({ char, seed, chapterCount, definitions, excerpt }) {
     ].join('\n'));
 }
 
-function directorPromptText(story, { mode, note, isLast, excerpt }) {
+function directorPromptText(story, { mode, note, isLast, excerpt, withOpening = false }) {
     const chapters = story.bible.chapters;
     const index = chapterIndexAt(story);
     const chapter = chapters[index];
@@ -331,6 +335,7 @@ function directorPromptText(story, { mode, note, isLast, excerpt }) {
         `goal: ${chapter?.goal ?? ''}`,
         `exit condition (observable event): ${chapter?.exit ?? ''}`,
         `clues available: ${chapter?.clues ?? ''}`,
+        `Upcoming chapters: ${JSON.stringify(chapters.slice(index + 1))}`,
         '',
         'Ledger of established facts:',
         ledger,
@@ -357,6 +362,13 @@ function directorPromptText(story, { mode, note, isLast, excerpt }) {
             '- "closing_fact": at most 15 words, past tense, the established outcome of the current chapter.',
             '- Then compile the opening beat of the NEXT chapter as "beat".',
         );
+        if (withOpening) {
+            lines.push(
+                'CHAPTER END: also return "opening", a complete player-facing opening message for the NEXT chapter, like a character greeting (roughly 150-300 words).',
+                'Set a fresh playable situation: establish where and when, the tone, what has happened or is happening, and an immediate invitation or problem the player can respond to. Use narration and character dialogue consistent with the recent chat. Show the opening beat in this message.',
+                'Bridge from established events without deciding the player\'s actions, words, feelings or choices. Do not reveal private secrets, future plans, JSON, or Director commentary. Do not claim unplayed player decisions occurred during a time skip.',
+            );
+        }
         if (isLast) {
             lines.push(
                 '',
@@ -372,7 +384,7 @@ function directorPromptText(story, { mode, note, isLast, excerpt }) {
  * validateBeat (word caps, cast mention, fallbacks) or — on a last-chapter advance —
  * when no usable sequel chapters came back. Used as generateWithRetry's `validate`.
  */
-function parseDirectorPayload(raw, { wantsChapters = false, castNames = [] } = {}) {
+function parseDirectorPayload(raw, { wantsChapters = false, castNames = [], withOpening = false } = {}) {
     const obj = extractJson(raw);
     if (!isPlainObject(obj) || !isPlainObject(obj.beat)) return null;
     const beat = {
@@ -387,7 +399,9 @@ function parseDirectorPayload(raw, { wantsChapters = false, castNames = [] } = {
         chapter_done: obj.chapter_done === true,
         assessment: String(obj.assessment ?? '').trim(),
         closing_fact: String(obj.closing_fact ?? '').trim(),
+        opening: typeof obj.opening === 'string' ? obj.opening.trim() : '',
     };
+    if (withOpening && (!payload.opening || !payload.closing_fact)) return null;
     if (wantsChapters) {
         const chapters = (Array.isArray(obj.new_chapters) ? obj.new_chapters : [])
             .map(normalizeChapter).filter(Boolean);
@@ -479,6 +493,8 @@ export async function craftStory({ seed = '', chapters = null } = {}) {
  * a 3-chapter sequel arc instead of a dead end). Both modes reset the idle clock.
  */
 export async function advanceStory(mode = 'beat', note = '') {
+    const withOpening = mode === 'chapter-end';
+    if (withOpening) mode = 'chapter';
     if (storyBusy) {
         toastr.info('The Story Director is already working.', 'SmartTavern');
         return null;
@@ -492,7 +508,7 @@ export async function advanceStory(mode = 'beat', note = '') {
     const context = getContext();
     const isCurrentChat = captureChatScope();
     const control = createGenerationControl();
-    const label = mode === 'chapter' ? 'Next chapter' : 'Next beat';
+    const label = withOpening ? 'Chapter End' : mode === 'chapter' ? 'Next chapter' : 'Next beat';
     storyBusy = true;
     try {
         activityStart({ status: `Story Director · ${label}` });
@@ -502,7 +518,7 @@ export async function advanceStory(mode = 'beat', note = '') {
         const isLast = index >= chapters.length - 1;
         const wantsChapters = mode === 'chapter' && isLast;
         const excerpt = chatExcerpt(context.chat ?? [], settings.chatLookback);
-        const prompt = directorPromptText(story, { mode, note, isLast, excerpt });
+        const prompt = directorPromptText(story, { mode, note, isLast, excerpt, withOpening });
         const castNames = storyCastNames(story);
         activityStatus(`Story director · ${label}`);
         const result = await withInternalGeneration(() => generateWithRetry({
@@ -511,12 +527,12 @@ export async function advanceStory(mode = 'beat', note = '') {
             systemPrompt: DIRECTOR_SYSTEM,
             prompt,
             maxTokens: settings.stepMaxTokens,
-            jsonSchema: beatJsonSchema({ withNewChapters: wantsChapters }),
-            validate: (res) => parseDirectorPayload(String(res?.content ?? ''), { wantsChapters, castNames }) !== null,
+            jsonSchema: beatJsonSchema({ withNewChapters: wantsChapters, withOpening }),
+            validate: (res) => parseDirectorPayload(String(res?.content ?? ''), { wantsChapters, castNames, withOpening }) !== null,
         }));
         throwIfAborted(control.signal);
         const raw = String(result?.content ?? '');
-        const payload = parseDirectorPayload(raw, { wantsChapters, castNames });
+        const payload = parseDirectorPayload(raw, { wantsChapters, castNames, withOpening });
         if (!payload) throw new Error('The model did not return a usable beat');
         if (!isCurrentChat() || getStory() !== story) {
             activityEnd({ ok: true, summary: 'Story result discarded — chat changed' });
@@ -540,7 +556,37 @@ export async function advanceStory(mode = 'beat', note = '') {
             deliveredAtMsg: null,
         };
         story.turnsSinceDelivery = 0;
-        setStory(story);
+        if (withOpening) {
+            const message = {
+                name: context.name2 || resolveTargetChar(context.chat)?.name || 'Narrator',
+                is_user: false,
+                is_system: false,
+                send_date: new Date().toISOString(),
+                mes: payload.opening,
+                extra: { smarttavernChapterOpening: true, smarttavernRefined: true },
+                swipe_id: 0,
+                swipes: [payload.opening],
+            };
+            const messageId = context.chat.length;
+            context.chat.push(message);
+            story.beat.status = 'delivered';
+            story.beat.deliveredAtMsg = messageId;
+            pushFact(story.ledger, story.beat.fact);
+            setStory(story);
+            resetStoryGenerationState();
+            const events = context.event_types ?? context.eventTypes;
+            context.addOneMessage(message);
+            await context.saveChat();
+            if (isCurrentChat()) {
+                await context.eventSource.emit(events.MESSAGE_RECEIVED, messageId, 'chapter_opening');
+                if (isCurrentChat()) await context.eventSource.emit(events.CHARACTER_MESSAGE_RENDERED, messageId, 'first_message');
+            }
+        }
+        else setStory(story);
+        if (!isCurrentChat()) {
+            activityEnd({ ok: true, summary: 'Chapter opening saved' });
+            return null;
+        }
         lastAssessment = { text: payload.assessment, chapterDone: payload.chapter_done, at: Date.now() };
         activityEntry({
             title: `${label} · ${wordCount(payload.beat.text)} words`,

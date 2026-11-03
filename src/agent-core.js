@@ -259,34 +259,18 @@ export function rollDice(spec, rng = defaultRng, mode = null) {
 // from tool records, never from the agent's own text)
 // --------------------------------------------------------------------------------------------
 
-/** Validate a committed table against FINAL totals, including any modifier. */
-export function validateDiceOutcomes(spec, outcomes) {
-    const dice = parseDice(spec);
-    if (!dice) return 'Invalid dice expression.';
-    if (!Array.isArray(outcomes) || !outcomes.length) return 'Provide outcomes: [{min, max, text}] covering every possible final total.';
-    const sorted = [...outcomes].sort((a, b) => a?.min - b?.min);
-    let next = dice.count + dice.mod;
-    const highest = dice.count * dice.sides + dice.mod;
-    if (sorted[0]?.min !== next || sorted[0]?.max !== next
-        || sorted.at(-1)?.min !== highest || sorted.at(-1)?.max !== highest) {
-        return `Define the minimum (${next}) and maximum (${highest}) outcomes as separate single-total ranges.`;
-    }
-    for (const range of sorted) {
-        if (!isPlainObject(range) || !Number.isInteger(range.min) || !Number.isInteger(range.max)
-            || range.min !== next || range.max < range.min || range.max > highest
-            || typeof range.text !== 'string' || !range.text.trim()) {
-            return `Outcome ranges must cover ${dice.count + dice.mod} through ${highest} exactly, without gaps or overlaps, and each needs non-empty text.`;
-        }
-        next = range.max + 1;
-    }
-    return next === highest + 1 ? null : `Outcome ranges must include the highest possible total (${highest}).`;
+// Only the d20 extremes have a built-in meaning. The agent interprets 2-19.
+export function agentRollExtreme(total) {
+    if (total === 1) return 'complete failure';
+    if (total === 20) return 'critical success';
+    return '';
 }
 
 /** The dice line(s) shared by the brief and the {{rolls}} macro. */
 export function rollsMacroText(rolls) {
     const list = Array.isArray(rolls) ? rolls : [];
     return list
-        .map(roll => `${roll.text}${roll.reason ? ` — "${roll.reason}"` : ''}${roll.outcome ? ` → ${roll.outcome}` : ''}`)
+        .map(roll => `${roll.text}${roll.reason ? ` — "${roll.reason}"` : ''}${roll.difficulty ? ` [difficulty: ${roll.difficulty}]` : ''}${roll.outcome ? ` → ${roll.outcome}` : ''}`)
         .join('; ');
 }
 

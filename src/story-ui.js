@@ -106,6 +106,7 @@ function renderStoryTab() {
         <div class="smarttavern_row_actions">
             <a id="smarttavern_story_beat" class="menu_button smarttavern_busy_guard" title="Compile the next concrete event (one Director call, sees the live chat)"><i class="fa-solid fa-forward"></i><span>Next beat</span></a>
             <a id="smarttavern_story_chapter" class="menu_button smarttavern_busy_guard" title="Close the current chapter and write the opening beat of the next"><i class="fa-solid fa-flag-checkered"></i><span>Next chapter</span></a>
+            <a id="smarttavern_story_chapter_end" class="menu_button smarttavern_busy_guard" title="End this chapter and post a new playable situation as a character message"><i class="fa-solid fa-book-open"></i><span>Chapter End</span></a>
             <a id="smarttavern_story_reset" class="menu_button smarttavern_busy_guard" title="Delete the story for this chat"><i class="fa-solid fa-trash"></i><span>Reset</span></a>
         </div>
         <div class="smarttavern_bio_field">
@@ -270,6 +271,17 @@ export function wireStoryTab($root) {
         } catch (error) {
             console.error('[SmartTavern] next chapter failed', error);
             toastr.error(`Next chapter failed — ${error?.message ?? error}`, 'SmartTavern');
+        }
+        renderStoryTab();
+    });
+
+    $panel.on('click', '#smarttavern_story_chapter_end, .smarttavern_chapter_end', async () => {
+        const note = String($storyRoot().find('#smarttavern_story_note').val() ?? '').trim();
+        try {
+            await advanceStory('chapter-end', note);
+        } catch (error) {
+            console.error('[SmartTavern] Chapter End failed', error);
+            toastr.error(`Chapter End failed — ${error?.message ?? error}`, 'SmartTavern');
         }
         renderStoryTab();
     });

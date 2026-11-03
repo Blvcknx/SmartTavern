@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import {
     wordCount, wordTrim, truncate,
     looksRefusal, parseAgentResponse,
-    parseDice, rollDice, validateDiceOutcomes, rollsMacroText, compileBrief,
+    parseDice, rollDice, agentRollExtreme, rollsMacroText, compileBrief,
     buildScratchpad, validateToolArgs, toolsAllowedForIteration,
 } from '../src/agent-core.js';
 
@@ -14,23 +14,16 @@ import {
 // parseAgentResponse
 // --------------------------------------------------------------------------------------------
 
-test('dice outcome tables cover all totals and explicitly commit both extremes', () => {
-    const table = [
-        { min: 1, max: 1, text: 'Pick breaks.' },
-        { min: 2, max: 3, text: 'Lock opens noisily.' },
-        { min: 4, max: 4, text: 'Lock opens silently.' },
-    ];
-    assert.equal(validateDiceOutcomes('d4', table), null);
-    assert.equal(validateDiceOutcomes('d4+2', table.map(row => ({ ...row, min: row.min + 2, max: row.max + 2 }))), null);
-    assert.equal(validateDiceOutcomes('2d4-3', [
-        { min: -1, max: -1, text: 'Minimum.' }, { min: 0, max: 4, text: 'Middle.' }, { min: 5, max: 5, text: 'Maximum.' },
-    ]), null);
-    for (const invalid of [undefined, [], [null], [{ min: 1, max: 4, text: 'Anything.' }],
-        table.slice(0, 2), [table[0], { min: 3, max: 3, text: 'Gap.' }, table[2]],
-        [table[0], { min: 1, max: 3, text: 'Overlap.' }, table[2]],
-        table.map(row => ({ ...row, text: '' })),
-        [table[0], { min: 2, max: 2.5, text: 'Fraction.' }, table[2]],
-    ]) assert.ok(validateDiceOutcomes('d4', invalid));
+test('only d20 extremes have a code-defined outcome', () => {
+    assert.equal(agentRollExtreme(1), 'complete failure');
+    assert.equal(agentRollExtreme(20), 'critical success');
+    for (let total = 2; total < 20; total++) assert.equal(agentRollExtreme(total), '');
+});
+
+test('agent-defined difficulty survives brief trimming and the rolls macro', () => {
+    const roll = { text: 'd20 = 12', reason: 'Open the lock', difficulty: 'An easy lock for Alice; 12 is sufficient.', outcome: '' };
+    assert.ok(rollsMacroText([roll]).includes(roll.difficulty));
+    assert.ok(compileBrief({ rolls: [roll] }, { maxWords: 40 }).includes(roll.difficulty));
 });
 
 test('committed dice consequences survive brief trimming and appear in the rolls macro', () => {

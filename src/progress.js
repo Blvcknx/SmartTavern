@@ -104,13 +104,13 @@ function hide() {
     emitState();
 }
 
-/** Retained entries keep the chip available for reopening until explicitly cleared. */
+/** Retain the log without keeping a finished run over the chat UI. */
 function scheduleIdleHide() {
     if (idleTimer) {
         clearTimeout(idleTimer);
         idleTimer = null;
     }
-    if (runCount > 0 || expanded || errorPending || $log?.children().length || !$root?.hasClass('show')) return;
+    if (runCount > 0 || expanded || !$root?.hasClass('show')) return;
     idleTimer = setTimeout(hide, IDLE_HIDE_MS);
 }
 
@@ -178,7 +178,7 @@ function emitState() {
 function applyFloatingState() {
     if (!$root) return;
     if (!floatingAllowed()) hide();
-    else if (runCount > 0 || $log.children().length) show();
+    else if (runCount > 0) show();
 }
 
 // --------------------------------------------------------------------------------------------
@@ -288,7 +288,7 @@ export function activityFail(message) {
 }
 
 /** Closes a tracked run: spinner stops; the chip shows the summary, then idles away. */
-export function activityEnd({ ok = true, summary = '' } = {}) {
+export function activityEnd({ ok = true, summary = '', dismiss = false } = {}) {
     build();
     runCount = Math.max(0, runCount - 1);
     setCurrent(null);
@@ -296,6 +296,7 @@ export function activityEnd({ ok = true, summary = '' } = {}) {
     if (!ok) errorPending = true;
     if (runCount === 0) stopTicker();
     render();
+    if (dismiss && runCount === 0) hide();
     emitState();
 }
 

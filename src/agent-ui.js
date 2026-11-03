@@ -84,6 +84,7 @@ export function renderAgentTab() {
 
         <div class="smarttavern_row_actions">
             <a id="smarttavern_agent_arm" class="menu_button smarttavern_busy_guard" title="Run the thinking agent once on the next reply, then disarm"><i class="fa-solid fa-bolt"></i><span>Think next reply</span></a>
+            <a class="menu_button smarttavern_busy_guard smarttavern_chapter_end" title="Ask the Story Director to end the chapter and post a new playable situation"><i class="fa-solid fa-book-open"></i><span>Chapter End</span></a>
         </div>
 
         <label>Mode
@@ -92,6 +93,11 @@ export function renderAgentTab() {
                 <option value="armed"${settings.agentMode === 'armed' ? ' selected' : ''}>Armed — only when triggered</option>
                 <option value="off"${settings.agentMode === 'off' ? ' selected' : ''}>Off</option>
             </select>
+        </label>
+
+        <label>Agent task (editable prompt section)
+            <textarea id="smarttavern_agentTask" class="text_pole" rows="4" placeholder="What should the agent focus on before each reply?">${escapeHtml(settings.agentTask ?? '')}</textarea>
+            <small>Saved for future turns. The agent keeps its tool protocol and prepares a brief for the reply model.</small>
         </label>
 
         <label title="Connection Manager profile for the agent loop; empty uses the active connection">Agent connection profile
@@ -183,6 +189,11 @@ export function wireAgentTab($rootPanel) {
         return;
     }
     wired = true;
+
+    $panel.on('input', '#smarttavern_agentTask', function () {
+        getSettings().agentTask = String(this.value ?? '');
+        saveSettings();
+    });
 
     $panel.on('change', '#smarttavern_agentMode', function () {
         getSettings().agentMode = ['always', 'armed', 'off'].includes(this.value) ? this.value : 'always';

@@ -70,7 +70,7 @@ const DIRECTIVE_ENFORCEMENT_PROMPT = [
     '{{draft}}',
     '',
     'If every event is contained: output <audit>PASS</audit> only.',
-    'If any is missing: output only operation tags. Prefer <replace id="N"><find>exact original text</find><with>replacement text</with></replace> for small changes, or weave the missing event(s) in with <edit id="N">...</edit> (full replacement text for that paragraph) and/or <insert after="N">...</insert> tags, editing as few paragraphs as possible and placing the event(s) in the first half. Match voice and format. Dice results are binding: the reply must reflect their outcome (a low roll fails, a high roll succeeds). Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
+    'If any is missing: output only operation tags. Prefer <replace id="N"><find>exact original text</find><with>replacement text</with></replace> for small changes, or weave the missing event(s) in with <edit id="N">...</edit> (full replacement text for that paragraph) and/or <insert after="N">...</insert> tags, editing as few paragraphs as possible and placing the event(s) in the first half. Match voice and format. Dice results are binding: the reply must reflect the agent\'s interpretation and declared difficulty; only d20 extremes are fixed (1 -- complete failure; 20 -- critical success). Delete nothing meaningful. Never add actions, words or feelings for {{user}}.',
 ].join('\n');
 
 // Characters whose bootstrap already failed this session — no retry spam per generation.
@@ -246,7 +246,7 @@ export function turnMustList(storyMust = null) {
     for (const roll of agent.rolls) {
         items.push(roll.outcome
             ? `Binding dice outcome (${roll.text}): ${roll.outcome}`
-            : `the outcome of the dice roll (${roll.spec ?? ''}${roll.spec ? ' ' : ''}${roll.text}) is reflected in what happens`);
+            : `the outcome of the dice roll (${roll.spec ?? ''}${roll.spec ? ' ' : ''}${roll.text}${roll.difficulty ? `; agent-defined difficulty: ${roll.difficulty}` : ''}) is reflected in what happens according to the agent's interpretation`);
     }
     return items.filter(Boolean);
 }
@@ -1130,7 +1130,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         // (busy, already refined, no fresh reply, empty draft) must never leave the
         // message blurred. No-op when no veil is active for the id.
         else if (!dryRun) dismissVeil(messageId);
-        activityEnd({ ok: !failed, summary });
+        activityEnd({ ok: !failed, summary, dismiss: true });
         refinementBusy = false;
     }
 }
