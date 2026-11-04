@@ -284,7 +284,7 @@ function memoryGate(ctx) {
     assertToolCurrent(ctx);
     if (ctx.dryRun) return '{"error":"memory writes are unavailable during a dry run"}';
     const settings = ctx.settings;
-    if (!settings.agentToolsEnabled?.memory) return '{"error":"memory tools are disabled by the user"}';
+    if (settings.agentToolsEnabled?.memory === false) return '{"error":"memory tools are disabled by the user"}';
     if (settings.agentMemoryMode === 'off') return '{"error":"memory writes are disabled (agentMemoryMode is off)"}';
     const cap = clampInt(settings.agentMemoryWritesPerTurn, 0, 10, 3);
     if ((ctx.turn.memoryWrites ?? 0) >= cap) {
@@ -768,7 +768,7 @@ export const TOOL_REGISTRY = [
             throwIfAborted(ctx.signal);
             const hits = await searchMemory(args.query);
             if (!hits.length) return { ok: true, result: 'No matching entries found.' };
-            const lines = hits.map(hit => `- [${hit.book} #${hit.uid}] ${hit.title}: ${truncate(hit.content, 2000)}`);
+            const lines = hits.map(hit => `- [${hit.book} #${hit.uid}] ${hit.title}: ${hit.content}`);
             return { ok: true, result: [`Found ${hits.length} matching entr${hits.length === 1 ? 'y' : 'ies'} (best first):`, ...lines].join('\n') };
         },
     },
@@ -910,10 +910,28 @@ export function toolEnabled(name, settings = getSettings()) {
 }
 
 /** One-line catalog of the tools available this turn, for the agent prompt. */
-export function toolCatalog(settings = getSettings(), { isReplay = false } = {}) {
+export function availableTools(settings = getSettings(), { dryRun = false, toolState = {}, turn = {}, toolsOn = true } = {}) {
+    if (!toolsOn) return [];
+    return TOOL_REGISTRY.filter(tool => {
+        if (!toolEnabled(tool.name, settings) || (dryRun && tool.mode === 'write')) return false;
+        const cap = typeof tool.maxPerTurn === 'function' ? tool.maxPerTurn(settings) : tool.maxPerTurn;
+        if ((toolState[tool.name] ?? 0) >= cap) return false;
+        if (/^memory_(?:create|update|delete)$/.test(tool.name)
+            && (turn.memoryWrites ?? 0) >= clampInt(settings.agentMemoryWritesPerTurn, 0, 10, 3)) return false;
+        return true;
+    });
+}
+
+// Turn-local receipts; a later successful write invalidates that subsystem's receipt.
+const writeReceipts = new WeakMap();
+function writeSignature(name, args) {
+    return JSON.stringify([name, Object.fromEntries(Object.entries(args ?? {}).sort(([a], [b]) => a.localeCompare(b)))]);
+}
+
+export function toolCatalog(settings = getSettings(), options = {}) {
+    const { isReplay = false } = options;
     const lines = [];
-    for (const tool of TOOL_REGISTRY) {
-        if (!toolEnabled(tool.name, settings)) continue;
+    for (const tool of availableTools(settings, options)) {
         const argList = Object.entries(tool.inputSchema?.properties ?? {})
             .map(([key, rule]) => `${key}${(tool.inputSchema?.required ?? []).includes(key) ? '' : '?'}:${rule.enum ? rule.enum.join('|') : (rule.type ?? 'any')}`)
             .join(', ');
@@ -940,10 +958,20 @@ export async function executeToolCall(call, ctx) {
     if (!tool) return wrap({ ok: false, result: `{"error":"unknown tool \\"${name}\\" — use one from the catalog"}` });
     if (call.parseError) return wrap({ ok: false, result: `{"error":"${call.parseError}"}` });
     if (!toolEnabled(name, ctx.settings)) return wrap({ ok: false, result: '{"error":"this tool is disabled"}' });
+    const subsystem = name === 'update_scene' ? 'scene' : /^memory_(create|update|delete)$/.test(name) ? 'memory' : null;
+    const receipts = writeReceipts.get(ctx.turn) ?? {};
+    writeReceipts.set(ctx.turn, receipts);
+    const signature = subsystem ? writeSignature(name, call.args) : null;
+    if (subsystem && receipts[subsystem]?.signature === signature) {
+        return wrap({ ...receipts[subsystem].outcome, reused: true });
+    }
     const count = ctx.toolState[name] ?? 0;
     const cap = typeof tool.maxPerTurn === 'function' ? tool.maxPerTurn(ctx.settings) : tool.maxPerTurn;
     if (Number.isFinite(cap) && count >= cap) {
         return wrap({ ok: false, result: `{"error":"per-turn limit (${cap}) reached for ${name}"}` });
+    }
+    if (!availableTools(ctx.settings, ctx).some(candidate => candidate.name === name)) {
+        return wrap({ ok: false, result: '{"error":"tool is no longer available; use the current catalog or finish with a brief"}' });
     }
     if (name === 'roll_dice' && typeof call.args?.dice === 'string') {
         call.args.dice = call.args.dice.toLowerCase();
@@ -952,7 +980,10 @@ export async function executeToolCall(call, ctx) {
     if (issues.length) return wrap({ ok: false, result: `{"error":"${issues.join(' ').replace(/"/g, "'")}"}` });
     try {
         ctx.toolState[name] = count + 1;
+        const memoryWritesBefore = ctx.turn.memoryWrites ?? 0;
         const outcome = await tool.run(call.args ?? {}, ctx);
+        if ((ctx.turn.memoryWrites ?? 0) !== memoryWritesBefore) delete receipts.memory;
+        if (subsystem && outcome?.ok === true) receipts[subsystem] = { signature, outcome };
         return wrap({ ok: outcome?.ok !== false, result: String(outcome?.result ?? ''), interactive: tool.mode === 'interactive' || undefined });
     } catch (error) {
         if (isAbortError(error) || ctx.signal?.aborted) throw error;

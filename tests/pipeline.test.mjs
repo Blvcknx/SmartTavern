@@ -1614,6 +1614,161 @@ function testStory() {
     return { v: 1, bible: { title: 'Letters', premise: 'A mystery.', setting: 'Archive', tone: 'Quiet', conflict: 'Missing letters', secrets: 'Hidden author', cast: [{ name: 'Alice', role: 'Archivist', wants: 'Answers', secret: 'She knows the author.' }], chapters: [chapter, { ...chapter, title: 'Dawn' }] }, chapterIndex: 0, ledger: [], turnsSinceDelivery: 0 };
 }
 
+test('Chapter End repairs metadata with field feedback and posts once', async () => {
+    const invalid = { ...directorPayload, beat: { ...directorPayload.beat, text: 'Dawn breaks over the archive.', fact: 'word '.repeat(16), escalations: [] }, opening: '', closing_fact: '' };
+    const h = await harness({ storyProfileId: 'model', genRetries: 1, genRetryDelayMs: 0 }, async (_messages, index) => ({ content: JSON.stringify(index === 1 ? invalid : directorPayload) }), { realStory: true });
+    h.state.setStory(testStory());
+    await h.story.advanceStory('chapter-end');
+    assert.equal(h.requests.length, 2);
+    const repair = JSON.stringify(h.requests[1].messages);
+    for (const text of ['cast member', '15 words', 'Two escalation', 'opening must', 'closing_fact must', 'COMPLETE corrected JSON', 'untrusted data']) assert.ok(repair.includes(text), text);
+    assert.ok(repair.includes('Current chapter'));
+    assert.equal(h.savedChat.length, 2);
+    assert.equal(h.savedChat[1].mes, directorPayload.opening);
+    assert.equal(h.state.getStory().chapterIndex, 1);
+});
+
+test('Chapter End diagnostics cover malformed JSON, missing beat and sequel chapters without mutation', async () => {
+    for (const [content, expected, last] of [
+        ['{broken', 'valid JSON object', false],
+        [JSON.stringify({ text: 'Alice arrives.' }), 'nested object', false],
+        [JSON.stringify({ ...directorPayload, beat: { ...directorPayload.beat, text: 'Alice ' + 'word '.repeat(45) } }), '45 words', false],
+        [JSON.stringify(directorPayload), 'new_chapters', true],
+    ]) {
+        const h = await harness({ storyProfileId: 'model', genRetries: 1, genRetryDelayMs: 0 }, async () => ({ content }), { realStory: true });
+        const story = testStory();
+        if (last) story.chapterIndex = 1;
+        h.state.setStory(story);
+        const before = JSON.stringify(h.state.getStory());
+        await assert.rejects(h.story.advanceStory('chapter-end'), error => error.message.includes(expected));
+        assert.equal(JSON.stringify(h.state.getStory()), before);
+        assert.equal(h.savedChat.length, 1);
+        assert.equal(h.requests.length, 2);
+    }
+});
+
+test('validation feedback supports message-array prompts without mutating caller options', async () => {
+    const h = await harness({ genRetries: 1, genRetryDelayMs: 0 }, async (_messages, index) => ({ content: index === 1 ? 'bad JSON' : '{"ok":true}' }));
+    const prompt = [{ role: 'user', content: 'Original task' }];
+    await h.gen.generateWithRetry({ profileId: 'model', prompt, validationIssues: result => result.content.startsWith('{') ? [] : ['Invalid JSON'] });
+    assert.equal(prompt.length, 1);
+    assert.ok(JSON.stringify(h.requests[1].messages).includes('Invalid JSON'));
+});
+
+test('available tools reflect settings, dry runs, per-tool limits and shared memory allowance', async () => {
+    const h = await harness({ ...agentSettings, agentMemoryMode: 'auto', agentMemoryWritesPerTurn: 1, agentToolsEnabled: { consult_expert: false } }, undefined, { realAgent: true });
+    const settings = h.state.getSettings();
+    const names = options => h.tools.availableTools(settings, options).map(tool => tool.name);
+    assert.ok(!names({}).includes('consult_expert'));
+    assert.ok(!names({ toolState: { memory_search: 3 } }).includes('memory_search'));
+    for (const name of ['memory_create', 'memory_update', 'memory_delete']) {
+        assert.ok(!names({ dryRun: true }).includes(name));
+        assert.ok(!names({ turn: { memoryWrites: 1 } }).includes(name));
+    }
+    assert.ok(names({ turn: { memoryWrites: 1 } }).includes('memory_search'));
+    assert.equal(names({ toolsOn: false }).length, 0);
+});
+
+test('agent refreshes catalogs, scene and lore between iterations and uses brief-only final protocol', async () => {
+    const memory = { title: 'Alice promise', keys: ['Alice'], content: 'Alice promised to return at dawn.' };
+    const h = await harness({ ...agentSettings, agentMemoryMode: 'auto', agentMemoryWritesPerTurn: 1, agentMaxIterations: 4, agentMaxToolCalls: 12 }, async (_messages, index) => ({ content: index === 1
+        ? `<tool name="memory_create">${JSON.stringify(memory)}</tool>\n<tool name="update_scene">{"key":"location","value":"archive"}</tool>`
+        : index === 2 ? '<tool name="memory_search">{"query":"Alice"}</tool>'
+            : index === 3 ? '<tool name="memory_search">{"query":"dawn"}</tool>' : '<brief><guidance>Alice waits.</guidance></brief>' }), { realAgent: true });
+    await h.agent.runAgentLoop(agentOptions(h));
+    const second = h.requests[1].messages;
+    assert.ok(!second[0].content.includes('- memory tools'));
+    const current = second.find(message => message.role === 'user').content;
+    assert.ok(!current.split('OUTPUT RULES')[0].includes('memory_create('));
+    assert.ok(current.includes(memory.content));
+    assert.ok(current.includes('"location":"archive"'));
+    const final = h.requests.at(-1).messages;
+    assert.ok(!final[0].content.includes('roll_dice'));
+    assert.ok(!final.find(message => message.role === 'user').content.includes('<tool name="tool_name">'));
+});
+
+test('memory write receipts avoid duplicate persistence and allow intervening changes', async () => {
+    const h = await harness({ ...agentSettings, agentMemoryMode: 'auto', agentMemoryWritesPerTurn: 10 }, undefined, { realAgent: true });
+    const ctx = { ...agentOptions(h), toolState: {}, turn: { memoryWrites: 0 } };
+    const create = { name: 'memory_create', args: { title: 'Alice', keys: ['Alice'], content: 'Alice promised to return at dawn.' } };
+    assert.equal((await h.tools.executeToolCall(create, ctx)).ok, true);
+    const repeat = await h.tools.executeToolCall(create, ctx);
+    assert.equal(repeat.reused, true);
+    assert.equal(ctx.turn.memoryWrites, 1);
+    assert.equal(h.tools.memoryLog().length, 1);
+    const book = h.context.chatMetadata.world_info;
+    const update = content => h.tools.executeToolCall({ name: 'memory_update', args: { id: `${book} #0`, content } }, ctx);
+    assert.equal((await update('Alice returned at dawn.')).ok, true);
+    assert.equal((await update('Alice left at dusk.')).ok, true);
+    const reverted = await update('Alice returned at dawn.');
+    assert.equal(reverted.ok, true);
+    assert.equal(reverted.reused, undefined);
+    assert.equal(ctx.turn.memoryWrites, 4);
+    assert.equal(h.world.books[book].entries[0].content, 'Alice returned at dawn.');
+});
+
+test('scene receipts reuse successes, retry failures and invalidate on subsequent scene writes', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    const ctx = { ...agentOptions(h), toolState: {}, turn: {} };
+    const update = value => h.tools.executeToolCall({ name: 'update_scene', args: { key: 'location', value } }, ctx);
+    assert.equal((await update('archive')).ok, true);
+    assert.equal((await update('archive')).reused, true);
+    assert.equal(ctx.toolState.update_scene, 1);
+    await update('courtyard');
+    assert.equal((await update('archive')).reused, undefined);
+    assert.equal(h.tools.getSceneState().location, 'archive');
+    const bad = { name: 'memory_create', args: { title: 'missing fields' } };
+    assert.equal((await h.tools.executeToolCall(bad, ctx)).ok, false);
+    assert.equal((await h.tools.executeToolCall(bad, ctx)).reused, undefined);
+});
+
+test('batch execution rechecks shared and global budgets', async () => {
+    for (const globalCap of [1, 6]) {
+        const h = await harness({ ...agentSettings, agentMemoryMode: 'auto', agentMemoryWritesPerTurn: 1, agentMaxToolCalls: globalCap }, async (_messages, index) => ({ content: index === 1
+            ? ['first', 'second'].map(title => `<tool name="memory_create">${JSON.stringify({ title, keys: ['Alice'], content: `Alice recorded the ${title} promise.` })}</tool>`).join('\n')
+            : '<brief><guidance>Alice waits.</guidance></brief>' }), { realAgent: true });
+        await h.agent.runAgentLoop(agentOptions(h));
+        assert.equal(h.tools.memoryLog().length, 1);
+        const transcript = h.agent.getLastTranscript();
+        assert.ok(transcript.some(entry => String(entry.text).includes(globalCap === 1 ? 'budget exhausted' : 'no longer available')));
+        const prompt = h.requests[1].messages.find(message => message.role === 'user').content;
+        assert.ok(!prompt.split('TOOL HISTORY')[0].includes('memory_create('));
+    }
+});
+
+test('duplicate confirmed memory writes prompt only once even after write allowance is exhausted', async () => {
+    let popups = 0;
+    const h = await harness({ ...agentSettings, agentMemoryMode: 'confirm', agentMemoryWritesPerTurn: 1 }, undefined, { realAgent: true, onPopup: () => { popups++; return 1; } });
+    const ctx = { ...agentOptions(h), toolState: {}, turn: { memoryWrites: 0 } };
+    const call = { name: 'memory_create', args: { title: 'Alice', keys: ['Alice'], content: 'Alice promised to return at dawn.' } };
+    assert.equal((await h.tools.executeToolCall(call, ctx)).ok, true);
+    assert.equal((await h.tools.executeToolCall(call, ctx)).reused, true);
+    assert.equal(popups, 1);
+    assert.equal(ctx.turn.memoryWrites, 1);
+});
+
+test('memory search preserves the complete entry through the next agent iteration', async () => {
+    const long = 'Alice detail '.repeat(250) + 'END OF MEMORY';
+    const h = await harness(agentSettings, async (_messages, index) => ({ content: index === 1 ? '<tool name="memory_search">{"query":"Alice"}</tool>' : '<brief><guidance>Alice remembers.</guidance></brief>' }), { realAgent: true });
+    h.context.chatMetadata.world_info = 'Existing';
+    h.world.books.Existing.entries[0].content = long;
+    await h.agent.runAgentLoop(agentOptions(h));
+    const prompt = h.requests[1].messages.find(message => message.role === 'user').content;
+    assert.ok(prompt.slice(prompt.indexOf('TOOL HISTORY')).includes(long));
+});
+
+test('disabled tools and dry-run writes have no system recommendation or catalog entry', async () => {
+    const h = await harness({ ...agentSettings, agentMemoryMode: 'auto', agentToolsEnabled: { consult_expert: false, consult_character: false, memory: false } }, async () => ({ content: '<brief><guidance>Alice waits.</guidance></brief>' }), { realAgent: true });
+    await h.agent.runAgentLoop({ ...agentOptions(h), dryRun: true });
+    const messages = h.requests[0].messages;
+    const system = messages[0].content;
+    const catalog = messages.find(message => message.role === 'user').content.split('OUTPUT RULES')[0];
+    for (const name of ['consult_expert', 'consult_character', 'memory_search', 'memory_create', 'update_scene']) {
+        assert.ok(!system.includes(name), name);
+        assert.ok(!catalog.includes(`${name}(`), name);
+    }
+});
+
 test('Chapter End posts and persists a delivered opening; Next chapter only prepares a beat', async () => {
     for (const mode of ['chapter-end', 'chapter']) {
         const h = await harness({ storyProfileId: 'model' }, async () => ({ content: JSON.stringify(directorPayload) }), { realStory: true });

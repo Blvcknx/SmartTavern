@@ -320,7 +320,7 @@ test('rollsMacroText: joins rolls with reasons', () => {
 // buildScratchpad
 // --------------------------------------------------------------------------------------------
 
-test('buildScratchpad: compact tool records and the complete last thought', () => {
+test('buildScratchpad: complete memory records and last thought', () => {
     const long = 'x'.repeat(2000);
     const pad = buildScratchpad({
         records: [
@@ -330,8 +330,8 @@ test('buildScratchpad: compact tool records and the complete last thought', () =
         lastThink: 'thought '.repeat(100).trim(),
     });
     assert.ok(pad.includes('TOOL HISTORY'));
-    assert.ok(pad.includes('- memory_search('));
-    assert.ok(pad.includes('…'));
+    assert.ok(pad.includes('- COMPLETED memory_search('));
+    assert.ok(pad.includes(long));
     assert.ok(pad.includes('found 1'));
     assert.ok(pad.includes('YOUR LAST THOUGHT'));
     assert.ok(pad.includes(`YOUR LAST THOUGHT (for continuity only): ${'thought '.repeat(100).trim()}`));

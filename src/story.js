@@ -348,10 +348,11 @@ function directorPromptText(story, { mode, note, isLast, excerpt, withOpening = 
     }
     lines.push(
         '',
-        'Compile the next story beat:',
-        '- "text": ONE concrete observable event performed by a named cast member (or the world) — an arrival, an object, a line of dialogue, a discovery. 1-2 sentences, at most ~45 words. No abstractions ("tension rises" is invalid). It must not state any secret (plant a clue instead). It must never decide {{user}}\'s actions or feelings.',
-        '- "escalations": exactly two strings — harder fallback versions of the same event for when the player idles.',
-        '- "fact": at most 15 words, past tense, what will be true once the beat has happened.',
+        'Return one JSON object with a nested "beat": {"text": string, "escalations": [string, string], "fact": string}, plus top-level "chapter_done" (boolean) and "assessment" (string).',
+        `The beat text must explicitly name at least one cast member: ${story.bible.cast.map(member => member.name).join(', ') || '(no cast-name requirement)'}.`,
+        '- "beat.text": ONE concrete observable event involving a named cast member — an arrival, an object, a line of dialogue, a discovery. 1-2 sentences, at most 45 words. No abstractions ("tension rises" is invalid). It must not state any secret (plant a clue instead). It must never decide {{user}}\'s actions or feelings.',
+        '- "beat.escalations": exactly two strings — harder fallback versions of the same event for when the player idles.',
+        '- "beat.fact": at most 15 words, past tense, what will be true once the beat has happened.',
         '- "chapter_done": true only if the chapter\'s exit condition is observably met in the conversation above.',
         '- "assessment": one line on where the story stands.',
     );
@@ -380,20 +381,19 @@ function directorPromptText(story, { mode, note, isLast, excerpt, withOpening = 
 }
 
 /**
- * Parses and validates a Director payload. Returns null when the beat fails
- * validateBeat (word caps, cast mention, fallbacks) or — on a last-chapter advance —
- * when no usable sequel chapters came back. Used as generateWithRetry's `validate`.
+ * Normalize a Director response and explain every validation failure for repair.
  */
 function parseDirectorPayload(raw, { wantsChapters = false, castNames = [], withOpening = false } = {}) {
     const obj = extractJson(raw);
-    if (!isPlainObject(obj) || !isPlainObject(obj.beat)) return null;
+    if (!isPlainObject(obj)) return { payload: null, issues: ['Response must contain a valid JSON object.'] };
+    if (!isPlainObject(obj.beat)) return { payload: null, issues: ['beat must be a nested object containing text, escalations and fact.'] };
     const beat = {
         text: String(obj.beat.text ?? '').trim(),
         escalations: (Array.isArray(obj.beat.escalations) ? obj.beat.escalations : [])
             .map(e => String(e ?? '').trim()).filter(Boolean),
         fact: String(obj.beat.fact ?? '').trim(),
     };
-    if (validateBeat(beat, { castNames }).length) return null;
+    const issues = validateBeat(beat, { castNames }).map(issue => `beat: ${issue}`);
     const payload = {
         beat,
         chapter_done: obj.chapter_done === true,
@@ -401,14 +401,17 @@ function parseDirectorPayload(raw, { wantsChapters = false, castNames = [], with
         closing_fact: String(obj.closing_fact ?? '').trim(),
         opening: typeof obj.opening === 'string' ? obj.opening.trim() : '',
     };
-    if (withOpening && (!payload.opening || !payload.closing_fact)) return null;
+    if (typeof obj.chapter_done !== 'boolean') issues.push('chapter_done must be a boolean.');
+    if (!payload.assessment) issues.push('assessment must be a non-empty string.');
+    if (withOpening && !payload.opening) issues.push('opening must be a non-empty player-facing opening message.');
+    if (withOpening && !payload.closing_fact) issues.push('closing_fact must be a non-empty established outcome.');
     if (wantsChapters) {
         const chapters = (Array.isArray(obj.new_chapters) ? obj.new_chapters : [])
             .map(normalizeChapter).filter(Boolean);
-        if (!chapters.length) return null;
+        if (!chapters.length) issues.push('new_chapters must contain usable sequel chapters.');
         payload.new_chapters = chapters;
     }
-    return payload;
+    return { payload: issues.length ? null : payload, issues };
 }
 
 // --------------------------------------------------------------------------------------------
@@ -528,11 +531,11 @@ export async function advanceStory(mode = 'beat', note = '') {
             prompt,
             maxTokens: settings.stepMaxTokens,
             jsonSchema: beatJsonSchema({ withNewChapters: wantsChapters, withOpening }),
-            validate: (res) => parseDirectorPayload(String(res?.content ?? ''), { wantsChapters, castNames, withOpening }) !== null,
+            validationIssues: (res) => parseDirectorPayload(String(res?.content ?? ''), { wantsChapters, castNames, withOpening }).issues,
         }));
         throwIfAborted(control.signal);
         const raw = String(result?.content ?? '');
-        const payload = parseDirectorPayload(raw, { wantsChapters, castNames, withOpening });
+        const { payload } = parseDirectorPayload(raw, { wantsChapters, castNames, withOpening });
         if (!payload) throw new Error('The model did not return a usable beat');
         if (!isCurrentChat() || getStory() !== story) {
             activityEnd({ ok: true, summary: 'Story result discarded — chat changed' });
