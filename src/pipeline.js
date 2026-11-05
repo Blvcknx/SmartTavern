@@ -31,9 +31,10 @@ import {
     recordedDirective, compileStoryDirective,
 } from './story.js';
 import {
-    agentActiveForTurn, runAgentLoop, resetAgentTurn, agentTurnRequirements, getTurnBrief,
+    agentActiveForTurn, runAgentLoop, resetAgentTurn, agentTurnRequirements, getTurnBrief, consumeAgentArm,
 } from './agent.js';
 import { rollsMacroText } from './agent-core.js';
+import { planExpansion } from './planner.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
 
@@ -188,6 +189,8 @@ function recordLastRun(result, pipeline, source) {
         agentRan: Boolean(result.agentRan),
         brief: result.brief ?? '',
         agentTranscript: result.agentTranscript ?? null,
+        planner: result.planner ?? null,
+        effectiveSteps: result.effectiveSteps ?? [],
         surfacedRulings: result.surfacedRulings ?? [],
         source,
         at: Date.now(),
@@ -471,7 +474,7 @@ async function runSteps({ char, profile, chat, settings, signal }) {
                 .map(previous => [previous.name, stepOutputs[previous.name]]));
             const resolve = makeMacroResolver({ char, profile, chat, stepOutputs: earlierOutputs, settings, stepsList: steps, step });
             const expanded = expandMacros(step.prompt, resolve);
-            const text = substituteParamsSafe(expanded);
+            const text = substituteParamsSafe(step.generated ? `${step.sharedContext}\n\n[TASK]\n${expanded}` : expanded);
             const result = await withInternalGeneration(() => generateWithRetry({
                 signal,
                 profileId: step.profileId || '',
@@ -526,7 +529,7 @@ async function runSteps({ char, profile, chat, settings, signal }) {
 export async function runPipeline({ chat = null, inject = true, bootstrap = true, type = 'normal' } = {}) {
     const context = getContext();
     const isCurrentChat = captureChatScope();
-    const settings = getSettings();
+    let settings = getSettings();
     if (!settings.enabled) return null;
     if (type === 'quiet' || type === 'impersonate') return null;
     if (isInternalGeneration()) return null;
@@ -541,7 +544,8 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
     const directive = prepareStoryDirective({ type, mutate: inject });
     // The thinking agent is its own gate too: it runs (and injects its brief) even
     // when expansion is disabled and no story exists.
-    const agentWanted = agentActiveForTurn(settings);
+    const plannerMode = settings.agentEngine !== 'legacy';
+    const agentWanted = !plannerMode && agentActiveForTurn(settings);
     if (!settings.expansionEnabled && !directive && !agentWanted) return null;
 
     if (inject) {
@@ -581,6 +585,15 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         });
 
         const expand = settings.expansionEnabled !== false;
+        let planner = null;
+        if (expand && plannerMode) {
+            const active = agentActiveForTurn(settings);
+            if (active && inject && settings.agentMode === 'armed') consumeAgentArm();
+            const planned = await planExpansion({ char, profile, chat: arr, settings, directive, signal: control.signal, active });
+            planner = planned.record;
+            settings = { ...settings, steps: planned.steps };
+            if (!isCurrentChat()) return null;
+        }
         let stepOutputs = Object.create(null);
         let stepStats = [];
         if (expand) {
@@ -652,6 +665,9 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         for (const section of turnSections) injectionText = injectionText.split(section).join('').trim();
         injectionText = [injectionText, ...turnSections].filter(Boolean).join('\n\n');
         const agentRecord = {
+            planner,
+            effectiveSteps: (Array.isArray(settings.steps) ? settings.steps : []).filter(Boolean)
+                .map(({ name, prompt, generated }) => ({ name, prompt, generated: Boolean(generated) })),
             agentRan: Boolean(agentResult),
             brief: briefText,
             agentTranscript: agentResult?.transcript ?? null,
@@ -867,7 +883,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
 
     const arr = context.chat ?? [];
     const message = Number.isInteger(messageId) ? arr[messageId] : null;
-    if (!message || message.is_user || message.is_system || message[EPHEMERAL_FLAG] || message.is_hidden) return null;
+    if (!message || message.is_user || message.is_system || message[EPHEMERAL_FLAG] || message.is_hidden || message.extra?.smarttavernNarration) return null;
     const originalDraft = String(message.mes ?? '').trim();
     if (!originalDraft) return null;
     // Refined once already: swipe views and re-renders must not refine again.

@@ -257,10 +257,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
         'Use these assessments to guide the upcoming reply: account for the current physical state, motivations, and relevant constraints. Treat assessments as working interpretations; the latest explicit conversation evidence takes precedence. Continue the scene as {{char}} in response to {{user}}. Keep these notes out of the visible reply; do not summarize or repeat them.',
     ].join('\n'),
     profileUpdateProfileId: '',
-    // Thinking Agent: a pre-reply agent reasons across cheap LLM calls with local
-    // tools (dice, character consult, ask-user, NPC intro, chat-lorebook memory) and
-    // compiles a short Turn Brief injected into the reply prompt. The reply model
-    // never sees the agent's reasoning or the tool protocol — only the brief.
+    // Planner adds temporary context tasks before expansion. Legacy retains the
+    // original tool loop and Turn Brief; its settings and per-chat data are preserved.
+    agentEngine: 'planner',                  // 'planner' | 'legacy'; legacy data is retained
+    plannerTask: 'Add expansion prompts only for important context missing from the existing blocks. Prefer no additions when they already cover this turn.',
     agentMode: 'always',                     // 'off' | 'always' | 'armed' (one-shot)
     agentTask: 'Plan concrete events for the next reply. Check continuity, consult relevant lore, and use tools when they can change the scene.',
     agentProfileId: '',                      // Connection Manager profile for the loop
@@ -513,6 +513,14 @@ function normalizeSettings(settings) {
     // ------------------------------------------------------------------
     // Thinking Agent
     // ------------------------------------------------------------------
+    if (!['planner', 'legacy'].includes(settings.agentEngine)) {
+        settings.agentEngine = 'planner';
+        changed = true;
+    }
+    if (typeof settings.plannerTask !== 'string') {
+        settings.plannerTask = DEFAULT_SETTINGS.plannerTask;
+        changed = true;
+    }
     if (typeof settings.agentTask !== 'string') {
         settings.agentTask = DEFAULT_SETTINGS.agentTask;
         changed = true;

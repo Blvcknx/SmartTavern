@@ -167,7 +167,7 @@ function registerSlashCommands() {
         { name: 'smarttavern-beat', help: 'Compile the next story beat (<steering note>)', run: (arg) => runStoryBeat(arg) },
         { name: 'smarttavern-chapter', help: 'Close the current chapter and write the opening beat of the next', run: () => runStoryChapter() },
         { name: 'smarttavern-story', help: 'Show the story directive the reply model will receive', run: () => showStoryDirective() },
-        { name: 'smarttavern-think', help: 'Arm the thinking agent for the next reply (one-shot)', run: (_arg) => { armAgent(); toastr.info('SmartTavern will think before the next reply.', 'SmartTavern'); } },
+        { name: 'smarttavern-think', help: 'Arm the selected agent engine for the next reply (one-shot; requires Armed mode)', run: (_arg) => { armAgent(); toastr.info('SmartTavern will run the selected agent before the next reply.', 'SmartTavern'); } },
         { name: 'smarttavern-ruling', help: 'Ask the character oracle a behavioral question and save the ruling (<question>)', run: (arg) => runManualRuling(arg) },
         { name: 'smarttavern-roll', help: 'Roll dice now (informational — NOT binding, unlike the agent\'s roll_dice)', run: (arg) => runManualRoll(arg) },
         { name: 'smarttavern-memory', help: 'List the agent-owned lorebook entries of this chat', run: (_arg) => listAgentMemory() },

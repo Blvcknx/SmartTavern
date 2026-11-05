@@ -82,6 +82,11 @@ export function isAgentArmed() {
     return armed;
 }
 
+/** Planner and legacy share one-shot activation, without sharing turn records. */
+export function consumeAgentArm() {
+    armed = false;
+}
+
 export function isAgentBusy() {
     return agentBusy;
 }

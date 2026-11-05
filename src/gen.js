@@ -189,9 +189,10 @@ export function getConnectionProfile(id) {
  * @param {object|null} [options.jsonSchema] `{ name, description?, strict?, value }`; `value` is the JSON schema
  * @param {AbortSignal|null} [options.signal] Cancels queued calls, retries and supported transports
  * @param {boolean} [options.checkOutput=true] Disable generic sanity filters when the caller reviews output itself
+ * @param {boolean} [options.recoverContext=false] Return context-limit errors to the caller before profile fallback
  * @returns {Promise<{content: string, reasoning: string}>}
  */
-export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true } = {}) {
+export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true, recoverContext = false } = {}) {
     throwIfAborted(signal);
     const context = getContext();
     const profile = profileId ? getConnectionProfile(profileId) : null;
@@ -213,6 +214,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
                 warn(`Profiled request returned ${degenerate}; falling back to the active connection.`);
             } catch (error) {
                 if (signal?.aborted || isAbortError(error)) throw error;
+                if (recoverContext && isContextLimitError(error)) throw error;
                 warn('Profiled request via Connection Manager failed; falling back to the active connection.', error);
             }
         } else {
@@ -288,6 +290,17 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
         content: String(result?.content ?? ''),
         reasoning: String(result?.reasoning ?? ''),
     };
+}
+
+/** Connection Manager wraps provider errors in Error.cause. */
+export function isContextLimitError(error) {
+    const seen = new Set();
+    while (error && !seen.has(error)) {
+        seen.add(error);
+        if (/context[_ -]?(?:length|window|size|limit)|maximum context|too many (?:input )?tokens|prompt (?:is )?too long|input.{0,30}(?:too long|token limit)/i.test(String(error.message ?? error))) return true;
+        error = error.cause;
+    }
+    return false;
 }
 
 function flattenMessages(prompt) {

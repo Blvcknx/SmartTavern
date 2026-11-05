@@ -163,6 +163,7 @@ export function markStoryBeatDelivered(messageId) {
  */
 export function onStoryCharacterReply(messageId) {
     try {
+        if (getContext().chat?.[messageId]?.extra?.smarttavernNarration) return;
         const settings = getSettings();
         if (settings.enabled === false || settings.storyEnabled === false) return;
         if (!directiveInjected) return;

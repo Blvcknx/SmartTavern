@@ -5,6 +5,7 @@ import { getContext } from '../../../../extensions.js';
 import { getSettings, charKey, resolveTargetChar, resolveMemberByMessageName, log, warn } from './state.js';
 import { updateProfile } from './profiles.js';
 import { openPanel, promptForGuide } from './panel.js';
+import { openNarrationDialog } from './narration.js';
 
 const LONG_PRESS_MS = 550;
 const LONG_PRESS_SLOP_PX = 10;
@@ -28,6 +29,7 @@ function floatingDisabled() {
 
 function applyFloatingMode() {
     $('#smarttavern_wand_button').toggle(!floatingDisabled());
+    $('#smarttavern_scene_button').toggle(!floatingDisabled());
     hideMenu();
 }
 
@@ -48,6 +50,9 @@ function addWandButton() {
         </div>`);
     item.on('click', () => openPanel());
     $menu.append(item);
+    const scene = $('<div id="smarttavern_scene_button" class="list-group-item flex-container flexGap5"><div class="fa-solid fa-feather extensionsMenuExtensionButton"></div><span>SmartTavern: Introduce scene…</span></div>');
+    scene.on('click', () => openNarrationDialog());
+    $menu.append(scene);
 }
 
 // --------------------------------------------------------------------------------------------

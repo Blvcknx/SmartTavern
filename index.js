@@ -81,7 +81,7 @@ function onMessageReceived(messageId) {
         const arr = context.chat ?? [];
         const message = Number.isInteger(messageId) ? arr[messageId] : arr[arr.length - 1];
         if (!message) return;
-        if (message.is_user || message.is_system || message.smarttavern_ephemeral) return;
+        if (message.is_user || message.is_system || message.smarttavern_ephemeral || message.extra?.smarttavernNarration) return;
         // Story Director: optimistic beat delivery (refinement off) or the idle clock tick.
         onStoryCharacterReply(Number.isInteger(messageId) ? messageId : arr.length - 1);
         const settings = getSettings();
@@ -99,6 +99,7 @@ async function onCharacterMessageRendered(messageId, type) {
         const context = getContext();
         const settings = getSettings();
         if (!settings.enabled || !settings.refinementEnabled) return;
+        if (context.chat?.[messageId]?.extra?.smarttavernNarration) return;
         // Only freshly GENERATED replies are refined — never a character greeting
         // ('first_message' fires when a new chat starts or a card is re-created) and
         // never messages that are merely re-rendered (chat loads, scrollback).

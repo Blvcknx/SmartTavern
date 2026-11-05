@@ -4,12 +4,12 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { SourceTextModule, createContext } from 'node:vm';
 
-async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0, realAgent = false, realStory = false, directive = null, clock = null } = {}) {
+async function harness(settings = {}, respond = async () => ({ content: 'GENERATED ASSESSMENT' }), { veiled = false, onPopup = () => 0, realAgent = false, realStory = false, directive = null, clock = null, planner = false } = {}) {
     const requests = [];
     const savedChat = [{ is_user: true, name: 'User', mes: 'Hello' }];
     const listeners = new Map();
     const context = {
-        POPUP_TYPE: { CONFIRM: 1 }, POPUP_RESULT: { AFFIRMATIVE: 1, CANCELLED: 0, CUSTOM1: 1001 },
+        POPUP_TYPE: { CONFIRM: 1, TEXT: 2 }, POPUP_RESULT: { AFFIRMATIVE: 1, CANCELLED: 0, CUSTOM1: 1001 },
         Popup: class {
             constructor(content, _type, _input, options) { this.content = content; this.options = options; }
             show() { return new Promise(resolve => { this.resolve = resolve; Promise.resolve(onPopup(this)).then(result => { if (result !== undefined) this.complete(result); }); }); }
@@ -21,7 +21,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
             removeListener(type, fn) { listeners.get(type)?.delete(fn); },
             emit(type, ...args) { for (const fn of [...(listeners.get(type) ?? [])]) fn(...args); },
         },
-        extensionSettings: { smarttavern: { genRetries: 0, bootstrapOnFirstMessage: false, promptTailVersion: 1, injectAnchor: 'before-last-user', ...settings }, connectionManager: { profiles: [{ id: 'model', mode: 'cc' }] } },
+        extensionSettings: { smarttavern: { agentEngine: planner ? 'planner' : 'legacy', genRetries: 0, bootstrapOnFirstMessage: false, promptTailVersion: 1, injectAnchor: 'before-last-user', ...settings }, connectionManager: { profiles: [{ id: 'model', mode: 'cc' }] } },
         chat: savedChat, chatMetadata: {}, characterId: 0, chatId: 'test-chat', activityEntries: [], activityEnds: [],
         characters: [{ name: 'Alice', avatar: 'alice.png' }], name1: 'User', name2: 'Alice',
         saveSettingsDebounced() {}, substituteParams: text => text,
@@ -34,7 +34,12 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     };
     const sandbox = createContext({ context, AbortController, DOMException, setTimeout, clearTimeout, structuredClone, crypto: globalThis.crypto, console: { log() {}, warn() {} }, toastr: { warning() {}, info() {}, success() {} },
         ...(clock ? { Date: class extends Date { static now() { return clock.now; } } } : {}),
-        document: { dispatchEvent() {}, createElement() { return { children: [], append(...children) { this.children.push(...children); } }; } }, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
+        document: { dispatchEvent() {}, createElement(tagName) { return {
+            tagName, children: [], handlers: {}, attributes: {},
+            append(...children) { this.children.push(...children); },
+            setAttribute(name, value) { this.attributes[name] = value; },
+            addEventListener(type, handler) { this.handlers[type] = handler; },
+        }; } }, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
     });
     const modules = new Map();
     const sources = {
@@ -45,10 +50,10 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = () => {}; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const armPreVeil = () => {};`,
         // Story Director stub: no chat in these tests carries a story, so the whole
         // feature must stay inert. The no-ops mirror story.js's no-story behavior.
-        story: `export const prepareStoryDirective = () => (${JSON.stringify(directive)}); export const storyMacroContext = value => value; export const recordedDirective = () => null; export const compileStoryDirective = () => null; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};`,
+        story: `export const previewStoryDirective = () => (${JSON.stringify(directive)}); export const prepareStoryDirective = () => (${JSON.stringify(directive)}); export const storyMacroContext = value => value; export const recordedDirective = () => null; export const compileStoryDirective = () => null; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};`,
         // Thinking agent stub: these tests exercise the non-agent path (the default
         // agentMode is 'always', so the stub gate must stay closed explicitly).
-        agent: 'export const getTurnBrief = () => ""; export const agentActiveForTurn = () => false; export const runAgentLoop = async () => null; export const resetAgentTurn = () => {}; export const agentTurnRequirements = () => ({ must: [], rolls: [] }); export const armAgent = () => {}; export const clearAgentSession = () => {};',
+        agent: 'export const consumeAgentArm = () => {}; export const getTurnBrief = () => ""; export const agentActiveForTurn = () => false; export const runAgentLoop = async () => null; export const resetAgentTurn = () => {}; export const agentTurnRequirements = () => ({ must: [], rolls: [] }); export const armAgent = () => {}; export const clearAgentSession = () => {};',
     };
     if (realAgent) {
         sources.progress += ' export const activityAgentControls = (controls = {}) => { context.agentControls = controls; };';
@@ -69,7 +74,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         `;
         for (const name of ['agent', 'agent-tools', 'rulings', 'ruling-core']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', ...(realStory ? ['story', 'story-core'] : [])]) {
+    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'narration', ...(realStory ? ['story', 'story-core'] : [])]) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -78,9 +83,12 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     const pipeline = modules.get('pipeline');
     await pipeline.link(specifier => modules.get(specifier.split('/').at(-1).replace('.js', '')));
     await pipeline.evaluate();
+    const narration = modules.get('narration');
+    await narration.link(specifier => modules.get(specifier.split('/').at(-1).replace('.js', '')));
+    await narration.evaluate();
     const state = modules.get('state').namespace;
     state.loadSettings();
-    return { story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, rulings: modules.get('rulings')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
+    return { narration: narration.namespace, planner: modules.get('planner').namespace, story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, rulings: modules.get('rulings')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
@@ -89,6 +97,247 @@ const agentSettings = { expansionEnabled: false, agentProfileId: 'model', agentM
 const agentOptions = h => ({ chat: [...h.savedChat], char: h.context.characters[0], settings: h.state.getSettings() });
 const lockDifficulty = 'The lock is difficult for Alice; interpret the roll against her limited experience.';
 const lockRoll = `<tool name="roll_dice">${JSON.stringify({ reason: 'Pick the lock', difficulty: lockDifficulty })}</tool>`;
+
+test('planner runs before expansion, preserves settings, and injects temporary dependent output', async () => {
+    const h = await harness({ agentProfileId: 'model', steps: [step('Original', 'Assess the original context.')], injectAnchor: 'prompt-end' }, async (messages, index) => {
+        const prompt = messages.map(message => message.content).join('\n');
+        if (index === 1) {
+            assert.match(prompt, /## Expansion: Original\nAssess the original context\./);
+            assert.match(prompt, /User: Hello/);
+            return { content: '## Expansion: Missing context\nUse {{step:Original}} to assess a concrete information gap.' };
+        }
+        if (index === 2) return { content: 'ORIGINAL ASSESSMENT' };
+        assert.match(prompt, /ORIGINAL ASSESSMENT/);
+        assert.match(prompt, /CHARACTER CARD/);
+        return { content: 'TEMPORARY ASSESSMENT' };
+    }, { planner: true, realAgent: true });
+    const before = JSON.stringify(h.state.getSettings().steps);
+    h.state.getChatStore();
+    const metadata = JSON.stringify(h.context.chatMetadata);
+    const result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.equal(h.requests.length, 3);
+    assert.match(result.injectionText, /TEMPORARY ASSESSMENT/);
+    assert.equal(result.agentRan, false);
+    assert.equal(result.brief, '');
+    assert.equal(result.planner.additions[0].name, 'Missing context');
+    assert.equal(h.pipeline.getLastRunResults().expansion.effectiveSteps.length, 2);
+    assert.equal(JSON.stringify(h.state.getSettings().steps), before);
+    assert.equal(JSON.stringify(h.context.chatMetadata), metadata);
+    assert.equal(h.savedChat.length, 1);
+});
+
+test('planner caps configured blocks at five, preserves overflow, and makes no planning call when full', async () => {
+    const steps = Array.from({ length: 7 }, (_, index) => step(`Block ${index}`, `Prompt ${index}`));
+    const h = await harness({ agentProfileId: 'model', steps }, undefined, { planner: true, realAgent: true });
+    const result = await h.pipeline.runPipeline({ inject: false });
+    assert.equal(h.requests.length, 5);
+    assert.equal(result.stepStats.length, 5);
+    assert.equal(result.planner.ran, false);
+    assert.match(result.planner.notices[0], /first five/);
+    assert.equal(h.state.getSettings().steps.length, 7);
+    assert.equal(h.savedChat.length, 1);
+});
+
+for (const response of ['NO ADDITIONS', 'This is not a block.', '## Expansion: Original\nA duplicate.']) {
+    test(`planner handles ${response.slice(0, 25)} without format-repair calls`, async () => {
+        const h = await harness({ agentProfileId: 'model', steps: [step('Original', 'Original prompt')] },
+            async (_messages, index) => ({ content: index === 1 ? response : 'EXISTING OUTPUT' }), { planner: true, realAgent: true });
+        const result = await h.pipeline.runPipeline({ inject: false });
+        assert.equal(h.requests.length, 2);
+        assert.equal(result.planner.additions.length, 0);
+        assert.match(result.injectionText, /EXISTING OUTPUT/);
+    });
+}
+
+test('planner dry runs preserve one-shot activation; real runs consume it', async () => {
+    const h = await harness({ agentMode: 'armed', agentProfileId: 'model', steps: [] }, async () => ({ content: 'NO ADDITIONS' }), { planner: true, realAgent: true });
+    h.agent.armAgent();
+    await h.pipeline.runPipeline({ inject: false });
+    assert.equal(h.agent.isAgentArmed(), true);
+    await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.equal(h.agent.isAgentArmed(), false);
+    await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.equal(h.requests.length, 2);
+});
+
+test('planner stays inactive when expansion is disabled and Legacy remains selectable after reload', async () => {
+    const h = await harness({ expansionEnabled: false, agentProfileId: 'model' }, undefined, { planner: true, realAgent: true });
+    assert.equal(await h.pipeline.runPipeline(), null);
+    assert.equal(h.requests.length, 0);
+    const settings = h.state.getSettings();
+    delete settings.agentEngine;
+    h.state.loadSettings();
+    assert.equal(settings.agentEngine, 'planner');
+    settings.agentEngine = 'legacy';
+    h.state.loadSettings();
+    assert.equal(settings.agentEngine, 'legacy');
+});
+
+test('planner exceptions fall back to configured blocks', async () => {
+    const h = await harness({ steps: [step('Original', 'Keep this prompt')], agentProfileId: 'model' }, undefined, { planner: true, realAgent: true });
+    h.context.ConnectionManagerRequestService.sendRequest = async (_id, messages) => {
+        if (messages[0].content.includes('You design optional')) throw new Error('Offline');
+        return { content: 'EXISTING OUTPUT' };
+    };
+    h.context.generateRaw = async () => { throw new Error('Offline'); };
+    const result = await h.pipeline.runPipeline({ inject: false });
+    assert.match(result.planner.error, /Offline/);
+    assert.match(result.injectionText, /EXISTING OUTPUT/);
+});
+
+test('agent context budgeting removes oldest messages and context overflow retries only the selected connection', async () => {
+    const h = await harness({ agentProfileId: 'model' }, async (_messages, index) => {
+        if (index === 1) throw new Error('API request failed', { cause: new Error('maximum context length exceeded') });
+        return { content: 'NO ADDITIONS' };
+    });
+    h.context.extensionSettings.connectionManager.profiles[0].contextSize = 1800;
+    const chat = Array.from({ length: 24 }, (_, index) => ({ name: 'Alice', mes: `MESSAGE-${index} ` + 'x'.repeat(200) }));
+    const notices = [];
+    const result = await h.planner.generateAgentText({ systemPrompt: 'SYSTEM', fixed: 'FIXED', chat, profileId: 'model', maxTokens: 100, onNotice: notice => notices.push(notice) });
+    assert.equal(h.requests.length, 2);
+    assert.ok(notices.length >= 2);
+    const first = h.requests[0].messages.at(-1).content;
+    const second = h.requests[1].messages.at(-1).content;
+    assert.ok(!first.includes('MESSAGE-0 '));
+    assert.ok(second.length < first.length);
+    assert.match(second, /MESSAGE-23 /);
+    assert.match(second, /FIXED/);
+    assert.equal(result.text, 'NO ADDITIONS');
+});
+
+test('agent budgeting uses the selected saved preset rather than active connection settings', async () => {
+    const h = await harness({}, async () => ({ content: 'NO ADDITIONS' }));
+    h.context.extensionSettings.connectionManager.profiles[0].preset = 'Small model';
+    h.context.mainApi = 'openai';
+    h.context.chatCompletionSettings = { openai_max_context: 100000 };
+    h.context.getPresetManager = api => {
+        assert.equal(api, 'openai');
+        return { getCompletionPresetByName(name) { assert.equal(name, 'Small model'); return { openai_max_context: 1000 }; } };
+    };
+    const result = await h.planner.generateAgentText({ systemPrompt: 'System', fixed: 'Fixed', profileId: 'model', maxTokens: 100,
+        chat: Array.from({ length: 24 }, (_, index) => ({ mes: `MESSAGE-${index} ` + 'x'.repeat(200) })) });
+    assert.ok(result.history.length < 24);
+    assert.match(result.history.at(-1), /MESSAGE-23/);
+});
+
+test('context-limit recovery stops after four attempts without rewriting fixed instructions', async () => {
+    const h = await harness({}, async () => { throw new Error('context_length_exceeded'); });
+    await assert.rejects(h.planner.generateAgentText({ systemPrompt: 'System', fixed: 'Keep block definitions', profileId: 'model', maxTokens: 100,
+        chat: [{ mes: 'x'.repeat(1000) }] }), /context_length_exceeded/);
+    assert.equal(h.requests.length, 4);
+    for (const request of h.requests) assert.match(request.messages.at(-1).content, /Keep block definitions/);
+});
+
+test('scene dialog retains the request after failure and allows retry without duplicate dialogs', async () => {
+    let popup;
+    const shown = deferred();
+    const h = await harness({ agentProfileId: 'model' }, async (_messages, index) => {
+        if (index === 1) throw new Error('Offline');
+        return { content: 'The visitor waits outside.' };
+    }, { onPopup(value) { popup = value; shown.resolve(); return undefined; } });
+    h.context.generateRaw = async () => { throw new Error('Offline'); };
+    const dialog = h.narration.openNarrationDialog();
+    await shown.promise;
+    assert.equal(await h.narration.openNarrationDialog(), undefined);
+    const [, input, status, button] = popup.content.children;
+    input.value = 'Introduce a visitor';
+    await button.handlers.click();
+    assert.equal(input.value, 'Introduce a visitor');
+    assert.match(status.textContent, /Offline/);
+    assert.equal(button.disabled, false);
+    assert.equal(h.savedChat.length, 1);
+    await button.handlers.click();
+    await dialog;
+    assert.equal(h.savedChat.length, 2);
+    assert.equal(h.savedChat[1].mes, 'The visitor waits outside.');
+});
+
+test('closing the scene dialog aborts the pending write', async () => {
+    let popup;
+    const shown = deferred();
+    const started = deferred();
+    const pending = deferred();
+    const h = await harness({ agentProfileId: 'model' }, async () => { started.resolve(); return pending.promise; },
+        { onPopup(value) { popup = value; shown.resolve(); return undefined; } });
+    const dialog = h.narration.openNarrationDialog();
+    await shown.promise;
+    const [, input, , button] = popup.content.children;
+    input.value = 'Time skip';
+    const click = button.handlers.click();
+    await started.promise;
+    popup.options.onClosing();
+    popup.complete(0);
+    await dialog;
+    pending.resolve({ content: 'Discard this scene.' });
+    await click;
+    assert.equal(h.savedChat.length, 1);
+});
+
+for (const engine of ['planner', 'legacy']) {
+    test(`quick narration appends once without refinement or story mutations in ${engine} mode`, async () => {
+        const h = await harness({ agentEngine: engine, agentProfileId: 'model' }, async () => ({ content: '<think>private</think>Three days later, a stranger knocks.' }), { realStory: true });
+        h.state.setStory(testStory());
+        const before = JSON.stringify(h.state.getStory());
+        let saves = 0;
+        h.context.saveChat = async () => { saves++; };
+        h.context.eventSource.on('received', id => h.story.onStoryCharacterReply(id));
+        h.pipeline.markFreshGeneration();
+        h.context.eventSource.on('rendered', id => { void h.pipeline.runRefinementPipeline(id); });
+        const message = await h.narration.writeQuickNarration('Skip a few days');
+        assert.equal(h.requests.length, 1);
+        assert.equal(saves, 1);
+        assert.equal(h.savedChat.length, 2);
+        assert.equal(message.mes, 'Three days later, a stranger knocks.');
+        assert.equal(message.extra.smarttavernNarration, true);
+        assert.equal(await h.pipeline.runRefinementPipeline(1, { dryRun: true }), null);
+        assert.equal(JSON.stringify(h.state.getStory()), before);
+        assert.ok(!h.savedChat.some(message => message.mes === 'Skip a few days'));
+        const prompt = h.requests[0].messages.at(-1).content;
+        assert.match(prompt, /Skip a few days/);
+        assert.ok(!prompt.includes('Hidden author'));
+    });
+}
+
+for (const change of ['advance', 'edit', 'chat', 'stop']) {
+    test(`quick narration discards pending output after ${change}`, async () => {
+        const pending = deferred();
+        const started = deferred();
+        const h = await harness({ agentProfileId: 'model' }, async () => { started.resolve(); return pending.promise; });
+        const run = h.narration.writeQuickNarration('Move the scene forward');
+        const rejection = assert.rejects(run, /conversation changed|cancelled/i);
+        await started.promise;
+        if (change === 'advance') h.savedChat.push({ mes: 'New message', is_user: true });
+        if (change === 'edit') h.savedChat[0].mes = 'Edited';
+        if (change === 'chat') h.context.eventSource.emit('chat');
+        if (change === 'stop') h.context.eventSource.emit('stop');
+        pending.resolve({ content: 'A scene that must be discarded.' });
+        await rejection;
+        assert.ok(!h.savedChat.some(message => message.extra?.smarttavernNarration));
+    });
+}
+
+test('quick narration prevents duplicate submissions and rolls back failed saves', async () => {
+    const pending = deferred();
+    const started = deferred();
+    const h = await harness({ agentProfileId: 'model' }, async () => { started.resolve(); return pending.promise; });
+    const run = h.narration.writeQuickNarration('Introduce a visitor');
+    await started.promise;
+    await assert.rejects(h.narration.writeQuickNarration('Duplicate visitor'), /already running/);
+    h.context.saveChat = async () => { throw new Error('Save failed'); };
+    const rejection = assert.rejects(run, /Save failed/);
+    pending.resolve({ content: 'A visitor knocks.' });
+    await rejection;
+    assert.equal(h.savedChat.length, 1);
+    assert.equal(h.context.renderedMessage, undefined);
+});
+
+test('a failing message listener cannot turn committed narration into a retryable failure', async () => {
+    const h = await harness({ agentProfileId: 'model' }, async () => ({ content: 'A visitor knocks.' }));
+    h.context.eventSource.on('received', () => { throw new Error('Third-party listener failed'); });
+    const message = await h.narration.writeQuickNarration('Introduce a visitor');
+    assert.equal(h.savedChat.length, 2);
+    assert.equal(message.mes, 'A visitor knocks.');
+});
 
 test('agent rolls preserve agent-defined difficulty and assign only extreme outcomes', async () => {
     const h = await harness(agentSettings, undefined, { realAgent: true });

@@ -289,7 +289,7 @@ function buildPanelHtml() {
         <div class="smarttavern_panel_tabs">
             <a class="smarttavern_tab_button" data-tab="profile" title="Living bio of the current character"><i class="fa-solid fa-user-pen"></i><span>Profile</span></a>
             <a class="smarttavern_tab_button" data-tab="story" title="Story Director — scenario, chapters and per-turn beats"><i class="fa-solid fa-clapperboard"></i><span>Story</span></a>
-            <a class="smarttavern_tab_button" data-tab="agent" title="Thinking Agent — tools, Turn Brief, memory"><i class="fa-solid fa-compass"></i><span>Agent</span></a>
+            <a class="smarttavern_tab_button" data-tab="agent" title="Expansion planner, quick narration, and legacy agent"><i class="fa-solid fa-compass"></i><span>Agent</span></a>
             <a class="smarttavern_tab_button" data-tab="steps" title="Pipeline steps"><i class="fa-solid fa-diagram-project"></i><span>Steps</span></a>
             <a class="smarttavern_tab_button" data-tab="schema" title="Profile schema fields"><i class="fa-solid fa-list-check"></i><span>Schema</span></a>
             <a class="smarttavern_tab_button" data-tab="results" title="Latest pipeline run"><i class="fa-solid fa-square-poll-horizontal"></i><span>Results</span></a>
@@ -1289,6 +1289,14 @@ function renderRunResult(body, result, pipeline) {
         appendSection(body, 'Turn Brief (thinking agent — injected before the directive)', result.brief || '(nothing at stake — no brief this turn)');
     } else if (result.brief) {
         appendSection(body, 'Turn Brief', result.brief);
+    }
+    if (result.planner) {
+        const plan = result.planner;
+        appendSection(body, 'Expansion planner', [
+            plan.ran ? `${plan.additions.length} temporary block(s) added.` : 'No planning call (inactive or no free slots).',
+            ...plan.notices,
+            ...plan.additions.map(block => `## Expansion: ${block.name}\n${block.prompt}`),
+        ].join('\n\n'));
     }
     if (Array.isArray(result.surfacedRulings) && result.surfacedRulings.length) {
         appendSection(

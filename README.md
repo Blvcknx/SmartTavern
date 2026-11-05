@@ -208,7 +208,21 @@ For chats that keep dying because nobody is pushing the story: the **Story** tab
 
 The reply model **never sees the bible**: secrets, cast agendas and future chapters exist only in the Director's prompts. Each generation gets a short (~140-word) scene directive appended as the **final** section of the prompt: the story frame, at most five ledger facts, and either the event this reply MUST show (→ beat, or an escalation once you idle for `storyIdleTurns` character replies) or a "keep developing" line once the beat is delivered. With refinement on, a built-in **Directive Enforcement** pass checks the fresh reply against the required event and weaves it in with minimal edits when missing; a pass that shows the event marks the beat delivered and its fact joins the ledger. Swiping or regenerating the message a beat was delivered in re-arms it as pending automatically. Everything (beat text, escalations, premise, chapters, cast) is editable in the tab and autosaves; the read-only **Directive preview** shows exactly what the reply model will receive next. Any story error fails open — the generation proceeds without a directive.
 
-## Slash commands
+## Expansion planner and quick narration
+
+The **Agent** tab defaults to **Planner** for new and upgraded installations. It makes one planning call before expansion, reading your existing block names/prompts, the character card and living profile, the current compiled story directive, and up to **24 recent visible messages**. Oldest messages are removed when the input exceeds the connection's context budget. Context-limit errors can trigger up to three shorter-history retries.
+
+The planner adds temporary prompts only for important missing context. **Zero additions is a valid result.** At most **five expansion blocks total** run in Planner mode: enabled, nonempty saved blocks take priority, then additions fill any remaining slots. If more than five saved blocks are enabled, only the first five run and a notice appears in Results/activity. Saved prompts are never rewritten or deleted. Refinement remains entirely user-configured and has no new limit.
+
+Generated prompts use the agent connection and normal expansion token budget. They receive shared character, story, and recent-chat context automatically. Independent blocks can run in parallel; `{{step:Earlier Block}}` and `{{steps}}` retain their dependency semantics. Results shows the accepted prompts and any planner failures or truncation notices. Malformed plans fall back to saved blocks, without a format-repair loop. The writing model receives expansion outputs, not planner reasoning or a Turn Brief.
+
+**Always**, **Armed**, and **Off** control planning. Armed mode is triggered with **Plan next reply** or `/smarttavern-think`; dry runs do not consume the armed flag. Planning requires expansion to be enabled. Use **Planner task** to guide which information gaps deserve attention.
+
+**Extensions (magic wand) → SmartTavern: Introduce scene…** accepts a request such as “skip a few days and introduce an unexpected visitor.” **Write scene** makes a direct prose call using the agent connection and appends a narrator message. It bypasses expansion and refinement, leaves player choices open, and does not advance Story Director's chapter, beat, or ledger. Cancel while it runs, or retry in the same dialog after a failure. Pending scenes are discarded if the conversation changes. This action works in either agent engine, including when automatic planning is off.
+
+Select **Legacy** in the Agent tab to restore the original tool agent. Its settings, memories, scene state, and rulings remain available; switching engines does not erase them. The sections below describe Legacy behavior.
+
+## Legacy agent and slash commands
 
 The **Agent task** field exposes an editable part of the planning prompt, saved for future turns. The agent sees the available lorebook names and relevant entries from user-authored chat, character and global lorebooks; `memory_search` can retrieve more. User-authored entries remain read-only.
 

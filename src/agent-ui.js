@@ -16,6 +16,7 @@ import {
     consultOracleManual, isRulingBusy,
 } from './rulings.js';
 import { profileOptionsHtml } from './panel.js';
+import { openNarrationDialog } from './narration.js';
 
 const htmlEscapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
@@ -172,6 +173,30 @@ export function renderAgentTab() {
     const $root = $agentRoot();
     if (!$root.length) return;
     const settings = getSettings();
+    const engineHtml = `<label>Agent engine
+        <select id="smarttavern_agentEngine">
+            <option value="planner"${settings.agentEngine !== 'legacy' ? ' selected' : ''}>Planner — add useful expansion context</option>
+            <option value="legacy"${settings.agentEngine === 'legacy' ? ' selected' : ''}>Legacy — tools and Turn Brief</option>
+        </select></label>`;
+    if (settings.agentEngine !== 'legacy') {
+        $root.html(`${engineHtml}
+            <div class="smarttavern_hint">Before expansion, the planner reads the existing prompts and up to 24 recent messages. It adds temporary blocks only when important context is missing. At most five expansion blocks run in total; your saved prompts stay unchanged. Independent blocks can run in parallel. See Results for accepted prompts and notices.</div>
+            <div class="smarttavern_story_status" id="smarttavern_agent_status">${escapeHtml(agentStatusLine(settings))}</div>
+            <label>Activation<select id="smarttavern_agentMode">
+                <option value="always"${settings.agentMode === 'always' ? ' selected' : ''}>Always — plan before expansion</option>
+                <option value="armed"${settings.agentMode === 'armed' ? ' selected' : ''}>Armed — only when triggered</option>
+                <option value="off"${settings.agentMode === 'off' ? ' selected' : ''}>Off</option>
+            </select></label>
+            <div class="smarttavern_row_actions">
+                <a id="smarttavern_agent_arm" class="menu_button smarttavern_busy_guard">Plan next reply</a>
+                <a id="smarttavern_introduce_scene" class="menu_button smarttavern_busy_guard">Introduce scene…</a>
+            </div>
+            <label>Planner task<textarea id="smarttavern_plannerTask" class="text_pole" rows="4">${escapeHtml(settings.plannerTask)}</textarea></label>
+            <label>Agent connection profile<select id="smarttavern_agentProfileId" class="smarttavern_profile_select">${profileOptionsHtml(settings.agentProfileId ?? '')}</select></label>
+            <label>Planner / scene max output tokens<input id="smarttavern_agentAuxMaxTokens" type="number" min="1" max="100000" value="${settings.agentAuxMaxTokens}"></label>
+            <div class="smarttavern_hint">Expansion must be enabled for planning. The scene action writes narration immediately, without expansion or refinement, and does not advance Story Director.</div>`);
+        return;
+    }
     const brief = getLastBrief();
     const transcript = getLastTranscript();
 
@@ -193,7 +218,7 @@ export function renderAgentTab() {
             </div>`).reverse().join('')
         : '<div class="smarttavern_hint">No agent memory changes in this chat yet.</div>';
 
-    $root.html(`
+    $root.html(`${engineHtml}
         <div class="smarttavern_hint">
             Before every reply a thinking agent plans the turn: cheap LLM iterations with local
             tools (dice, consultations, scene state, ask-user, NPC intro, chat-lorebook memory), finished
@@ -204,6 +229,7 @@ export function renderAgentTab() {
         <div class="smarttavern_story_status" id="smarttavern_agent_status">${escapeHtml(agentStatusLine(settings))}</div>
 
         <div class="smarttavern_row_actions">
+            <a id="smarttavern_introduce_scene" class="menu_button smarttavern_busy_guard">Introduce scene…</a>
             <a id="smarttavern_agent_arm" class="menu_button smarttavern_busy_guard" title="Run the thinking agent once on the next reply, then disarm"><i class="fa-solid fa-bolt"></i><span>Think next reply</span></a>
             <a class="menu_button smarttavern_busy_guard smarttavern_chapter_end" title="Ask the Story Director to end the chapter and post a new playable situation"><i class="fa-solid fa-book-open"></i><span>Chapter End</span></a>
         </div>
@@ -310,7 +336,7 @@ export function renderAgentTab() {
 }
 
 function agentStatusLine(settings) {
-    const parts = [`mode: ${settings.agentMode}`];
+    const parts = [`engine: ${settings.agentEngine}`, `mode: ${settings.agentMode}`];
     if (settings.agentMode === 'armed') parts.push(isAgentArmed() ? 'armed — the next reply will think' : 'idle — arm below or /smarttavern-think');
     if (isAgentBusy()) parts.push('thinking right now…');
     const tools = TOOL_REGISTRY.filter(tool => toolEnabled(tool.name, settings)).length;
@@ -330,6 +356,17 @@ export function wireAgentTab($rootPanel) {
         return;
     }
     wired = true;
+
+    $panel.on('change', '#smarttavern_agentEngine', function () {
+        getSettings().agentEngine = this.value === 'legacy' ? 'legacy' : 'planner';
+        saveSettings();
+        renderAgentTab();
+    });
+    $panel.on('input', '#smarttavern_plannerTask', function () {
+        getSettings().plannerTask = String(this.value ?? '');
+        saveSettings();
+    });
+    $panel.on('click', '#smarttavern_introduce_scene', () => openNarrationDialog());
 
     $panel.on('input', '#smarttavern_agentTask', function () {
         getSettings().agentTask = String(this.value ?? '');
@@ -484,7 +521,7 @@ export function wireAgentTab($rootPanel) {
 
     $panel.on('click', '#smarttavern_agent_arm', () => {
         armAgent();
-        toastr.info('SmartTavern will think before the next reply.', 'SmartTavern');
+        toastr.info('SmartTavern will run the selected agent before the next reply.', 'SmartTavern');
         refreshAgentStatus();
     });
 
