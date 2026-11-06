@@ -113,7 +113,34 @@
     margin: 4px 0;
 }
 
-/* Steps tab: section titles that separate the expansion steps from the refinement passes. */
+/* Keep workflow navigation available even when a long step list is scrolled. */
+#smarttavern_panel .smarttavern_workflow_switch {
+    position: sticky;
+    top: -8px;
+    z-index: 1;
+    display: flex;
+    gap: 6px;
+    padding: 6px 0;
+    background: var(--SmartThemeBlurTintColor);
+}
+
+#smarttavern_panel .smarttavern_workflow_switch button {
+    flex: 1;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+}
+
+#smarttavern_panel .smarttavern_workflow_switch button[aria-pressed="true"] {
+    color: var(--SmartThemeQuoteColor);
+    border-color: var(--SmartThemeQuoteColor);
+}
+
+#smarttavern_panel .smarttavern_workflow[hidden] {
+    display: none;
+}
+
+/* Steps tab: workflow section titles. */
 .smarttavern_steps_section_title {
     display: flex;
     align-items: center;

@@ -269,6 +269,7 @@ function renderActiveTab() {
 
 function autoGrowAll() {
     $panel().find('.smarttavern_step_prompt, .smarttavern_bio_value, .smarttavern_guide_value, .smarttavern_story_textarea').each(function () {
+        if (!$(this).is(':visible')) return;
         this.style.height = 'auto';
         this.style.height = `${this.scrollHeight}px`;
     });
@@ -336,12 +337,17 @@ function buildPanelHtml() {
             </div>
 
             <div class="smarttavern_tab_panel" data-tab="steps">
+                <div class="smarttavern_workflow_switch" role="group" aria-label="Step workflow">
+                    <button type="button" class="menu_button" data-workflow="expansion" aria-controls="smarttavern_expansion_workflow" aria-pressed="true">Expansion</button>
+                    <button type="button" class="menu_button" data-workflow="refinement" aria-controls="smarttavern_refinement_workflow" aria-pressed="false">Refinement</button>
+                </div>
                 <div class="smarttavern_hint">
                     Two independent pipelines run together: <b>expansion</b> steps generate context
                     that is injected into the reply prompt before generation; <b>refinement</b> passes
                     audit and edit the fresh reply after it. Each enabled entry is an isolated LLM call.
                 </div>
 
+                <div id="smarttavern_expansion_workflow" class="smarttavern_workflow">
                 <div class="smarttavern_steps_section_title"><i class="fa-solid fa-diagram-project"></i><span>Expansion steps — pre-reply context</span></div>
                 <div class="smarttavern_hint">
                     Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{field:Name}}, {{chat}},
@@ -350,7 +356,7 @@ function buildPanelHtml() {
                     its own Connection Manager profile; the lookback sets this step's {{chat}} history
                     (0 = none, empty = global default). Per-block roles apply to history injection
                     positions; prompt-end mode uses the tail role in Settings. Click a card header to
-                    collapse it.
+                    expand or collapse it. Cards start folded.
                 </div>
                 <div id="smarttavern_steps"></div>
                 <div class="smarttavern_row_actions">
@@ -358,8 +364,9 @@ function buildPanelHtml() {
                     <a id="smarttavern_restore_expansion_steps" class="menu_button" title="Replace the expansion list with the default preset (Physical / Mental Condition) — refinement passes are untouched"><i class="fa-solid fa-rotate-left"></i><span>Expansion preset</span></a>
                 </div>
 
-                <hr>
+                </div>
 
+                <div id="smarttavern_refinement_workflow" class="smarttavern_workflow" hidden>
                 <div class="smarttavern_steps_section_title"><i class="fa-solid fa-user-pen"></i><span>Refinement passes — post-reply editing</span></div>
                 <div class="smarttavern_hint">
                     Passes run strictly in order against the fresh reply: each receives the current draft
@@ -372,6 +379,7 @@ function buildPanelHtml() {
                 <div class="smarttavern_row_actions">
                     <a id="smarttavern_add_refinement_step" class="menu_button"><i class="fa-solid fa-plus"></i><span>Add refinement pass</span></a>
                     <a id="smarttavern_restore_refinement_steps" class="menu_button" title="Replace the refinement list with the default 3-pass preset (Body / Character / Prose) — expansion steps are untouched"><i class="fa-solid fa-rotate-left"></i><span>Refinement preset</span></a>
+                </div>
                 </div>
             </div>
 
@@ -554,6 +562,10 @@ function buildPanel() {
 
     $panel().on('click', '.smarttavern_tab_button', function () {
         switchTab(String($(this).data('tab') ?? ''));
+    });
+    $panel().on('click', '.smarttavern_workflow_switch [data-workflow]', function () {
+        switchStepWorkflow(String($(this).data('workflow')));
+        $panel().find('.smarttavern_panel_body').scrollTop(0);
     });
     $panel().find('.smarttavern_panel_close').on('click', () => closePanel());
 
@@ -943,6 +955,17 @@ function moveArrayItem(array, index, delta, onFinish) {
 // Step editor (Steps tab)
 // --------------------------------------------------------------------------------------------
 
+function switchStepWorkflow(workflow, persist = true) {
+    const selected = workflow === 'refinement' ? 'refinement' : 'expansion';
+    $panel().find('.smarttavern_workflow_switch [data-workflow]').each(function () {
+        $(this).attr('aria-pressed', String($(this).data('workflow') === selected));
+    });
+    $panel().find('#smarttavern_expansion_workflow').prop('hidden', selected !== 'expansion');
+    $panel().find('#smarttavern_refinement_workflow').prop('hidden', selected !== 'refinement');
+    if (persist) persistUi({ stepsWorkflow: selected });
+    autoGrowAll();
+}
+
 function renderStepEditor() {
     const settings = getSettings();
     renderStepCards(
@@ -956,6 +979,7 @@ function renderStepEditor() {
         { refinement: true },
     );
     refreshProfileSelects();
+    switchStepWorkflow(settings.ui?.stepsWorkflow, false);
 }
 
 /** Renders one pipeline's editable step cards into `container`. */
@@ -968,7 +992,7 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
         const role = STEP_ROLES.includes(step.role) ? step.role : 'assistant';
         const editMode = step.editMode === 'surgical' ? 'surgical' : 'full';
         const card = $(`
-            <div class="smarttavern_step_card">
+            <div class="smarttavern_step_card collapsed">
                 <div class="smarttavern_step_header">
                     <div class="smarttavern_step_chevron fa-solid fa-chevron-down" title="Collapse / expand"></div>
                     <label class="checkbox" title="Include this step in the pipeline">
@@ -1030,6 +1054,7 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
         card.find('.smarttavern_step_header').on('click', (event) => {
             if ($(event.target).closest('input, select, label, a, .menu_button').length) return;
             card.toggleClass('collapsed');
+            autoGrowAll();
         });
         card.find('.smarttavern_step_enabled').on('change', function () {
             steps[index].enabled = /** @type {HTMLInputElement} */ (this).checked;
