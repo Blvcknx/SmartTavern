@@ -35,6 +35,7 @@ import {
 } from './agent.js';
 import { rollsMacroText } from './agent-core.js';
 import { planExpansion } from './planner.js';
+import { askPlannerUser, userAnswersContext } from './user-context.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
 
@@ -456,7 +457,7 @@ export function injectEphemeral(chatArr, text, settings, role = 'assistant', ind
 // Pipeline
 // --------------------------------------------------------------------------------------------
 
-async function runSteps({ char, profile, chat, settings, signal }) {
+async function runSteps({ char, profile, chat, settings, signal, dryRun = false, type = 'normal' }) {
     const stepOutputs = Object.create(null);
     const steps = (Array.isArray(settings.steps) ? settings.steps : [])
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
@@ -474,7 +475,18 @@ async function runSteps({ char, profile, chat, settings, signal }) {
                 .map(previous => [previous.name, stepOutputs[previous.name]]));
             const resolve = makeMacroResolver({ char, profile, chat, stepOutputs: earlierOutputs, settings, stepsList: steps, step });
             const expanded = expandMacros(step.prompt, resolve);
-            const text = substituteParamsSafe(step.generated ? `${step.sharedContext}\n\n[TASK]\n${expanded}` : expanded);
+            if (step.kind === 'user') {
+                const output = await askPlannerUser(substituteParamsSafe(expanded), { signal, dryRun,
+                    replay: ['swipe', 'regenerate', 'continue'].includes(type) });
+                stepOutputs[step.name] = output;
+                stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, skipped: !output };
+                activityStepState(index, output ? 'done' : 'skipped');
+                activityEntry({ title: `User context · ${label}`, text: output || 'No answer supplied; continue without assumptions.', tone: 'info' });
+                return;
+            }
+            const userContext = settings.agentEngine !== 'legacy' ? userAnswersContext() : '';
+            const text = substituteParamsSafe([step.generated ? `${step.sharedContext}\n\n[TASK]\n${expanded}` : expanded,
+                userContext].filter(Boolean).join('\n\n'));
             const result = await withInternalGeneration(() => generateWithRetry({
                 signal,
                 profileId: step.profileId || '',
@@ -500,15 +512,15 @@ async function runSteps({ char, profile, chat, settings, signal }) {
             activityFail(`Step "${label}" failed — ${error?.message ?? error}`);
         }
     };
-    // Only explicit macro dependencies impose ordering. {{steps}} needs all earlier
-    // outputs. Forward references stay empty, matching sequential execution.
+    // Explicit macro dependencies and earlier user questions impose ordering.
+    // {{steps}} needs all earlier outputs. Forward references stay empty.
     const tasks = [];
     steps.forEach((step, index) => {
         const macros = [...String(step.prompt).matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)]
             .map(match => match[1].trim().toLowerCase());
         const dependencies = steps.slice(0, index).flatMap((previous, previousIndex) => {
             const name = String(previous.name ?? '').trim().toLowerCase();
-            const depends = settings.stepExecution === 'sequential' || macros.includes('steps')
+            const depends = settings.stepExecution === 'sequential' || previous.kind === 'user' || macros.includes('steps')
                 || name === String(step.name ?? '').trim().toLowerCase()
                 || macros.some(macro => macro.startsWith('step:') && macro.slice(5).trim() === name);
             return depends ? [tasks[previousIndex]] : [];
@@ -597,7 +609,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         let stepOutputs = Object.create(null);
         let stepStats = [];
         if (expand) {
-            ({ stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings, signal: control.signal }));
+            ({ stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings, signal: control.signal, dryRun: isDryRun, type }));
         } else {
             activitySteps({ names: [] }); // no expansion chips to show
         }
@@ -661,13 +673,14 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         }
         // Templates may reference these macros anywhere. Relocate their complete
         // sections so the directive is still last and the brief directly precedes it.
-        const turnSections = [briefText, directive?.text ?? ''].filter(Boolean);
+        const savedUserContext = expand && plannerMode ? userAnswersContext() : '';
+        const turnSections = [savedUserContext, briefText, directive?.text ?? ''].filter(Boolean);
         for (const section of turnSections) injectionText = injectionText.split(section).join('').trim();
         injectionText = [injectionText, ...turnSections].filter(Boolean).join('\n\n');
         const agentRecord = {
             planner,
             effectiveSteps: (Array.isArray(settings.steps) ? settings.steps : []).filter(Boolean)
-                .map(({ name, prompt, generated }) => ({ name, prompt, generated: Boolean(generated) })),
+                .map(({ name, prompt, generated, kind }) => ({ name, prompt, generated: Boolean(generated), ...(kind ? { kind } : {}) })),
             agentRan: Boolean(agentResult),
             brief: briefText,
             agentTranscript: agentResult?.transcript ?? null,
@@ -692,6 +705,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             .map(block => ({ ...block, text: turnSections.reduce((text, section) => text.split(section).join(''), block.text).trim() }))
             .filter(block => block.text);
         const blockRole = STEP_ROLES.includes(settings.tailRole) ? settings.tailRole : 'assistant';
+        if (savedUserContext) blocks.push({ text: savedUserContext, role: blockRole });
         // Turn Brief first, then the directive — history anchors keep the same relative
         // order as the prompt-end tail (expansion outputs → brief → directive last).
         if (briefText && !blocks.some(block => block.text.includes(briefText))) {

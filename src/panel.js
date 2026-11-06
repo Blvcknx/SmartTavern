@@ -1295,7 +1295,7 @@ function renderRunResult(body, result, pipeline) {
         appendSection(body, 'Expansion planner', [
             plan.ran ? `${plan.additions.length} temporary block(s) added.` : 'No planning call (inactive or no free slots).',
             ...plan.notices,
-            ...plan.additions.map(block => `## Expansion: ${block.name}\n${block.prompt}`),
+            ...plan.additions.map(block => `## ${block.kind === 'user' ? 'User' : 'Expansion'}: ${block.name}\n${block.prompt}`),
         ].join('\n\n'));
     }
     if (Array.isArray(result.surfacedRulings) && result.surfacedRulings.length) {

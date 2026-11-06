@@ -2,6 +2,25 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseExpansionPlan, configuredBlocks, recentMessages, fitHistory } from '../src/planner-core.js';
 
+test('plain user headings share expansion validation, dependencies, and block budget', () => {
+    const result = parseExpansionPlan(`## User: Destination
+Where do you want to travel?
+## Expansion: Route
+Use {{step:Destination}} to assess the route.
+## User: destination
+Duplicate question.
+## User: Empty
+## Expansion: Weather
+Assess the weather.`);
+    assert.deepEqual(result.additions, [
+        { name: 'Destination', prompt: 'Where do you want to travel?', kind: 'user' },
+        { name: 'Route', prompt: 'Use {{step:Destination}} to assess the route.' },
+        { name: 'Weather', prompt: 'Assess the weather.' },
+    ]);
+    assert.equal(result.issues.length, 2);
+    assert.equal(parseExpansionPlan('## User: Choice\nWhich way?', Array(5).fill({ name: 'Saved' })).additions.length, 0);
+});
+
 test('planner text contract accepts headings and fences without JSON', () => {
     const result = parseExpansionPlan('```markdown\nSome preamble.\n  ##   Expansion : Weather  \nDescribe the weather.\n\n## Expansion: Travel\nUse {{step:Weather}} to assess travel.\n```');
     assert.deepEqual(result.additions, [

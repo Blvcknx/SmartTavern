@@ -9,11 +9,11 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     const savedChat = [{ is_user: true, name: 'User', mes: 'Hello' }];
     const listeners = new Map();
     const context = {
-        POPUP_TYPE: { CONFIRM: 1, TEXT: 2 }, POPUP_RESULT: { AFFIRMATIVE: 1, CANCELLED: 0, CUSTOM1: 1001 },
+        POPUP_TYPE: { CONFIRM: 1, TEXT: 2, INPUT: 3 }, POPUP_RESULT: { AFFIRMATIVE: 1, CANCELLED: 0, CUSTOM1: 1001 },
         Popup: class {
             constructor(content, _type, _input, options) { this.content = content; this.options = options; }
             show() { return new Promise(resolve => { this.resolve = resolve; Promise.resolve(onPopup(this)).then(result => { if (result !== undefined) this.complete(result); }); }); }
-            complete(result) { this.result = result; this.resolve?.(result); }
+            complete(result) { this.result = result; this.resolve?.(this.value ?? result); }
         },
         event_types: { GENERATION_STOPPED: 'stop', CHAT_CHANGED: 'chat', MESSAGE_RECEIVED: 'received', CHARACTER_MESSAGE_RENDERED: 'rendered' },
         eventSource: {
@@ -74,7 +74,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         `;
         for (const name of ['agent', 'agent-tools', 'rulings', 'ruling-core']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'narration', ...(realStory ? ['story', 'story-core'] : [])]) {
+    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'user-context', 'narration', ...(realStory ? ['story', 'story-core'] : [])]) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -97,6 +97,74 @@ const agentSettings = { expansionEnabled: false, agentProfileId: 'model', agentM
 const agentOptions = h => ({ chat: [...h.savedChat], char: h.context.characters[0], settings: h.state.getSettings() });
 const lockDifficulty = 'The lock is difficult for Alice; interpret the roll against her limited experience.';
 const lockRoll = `<tool name="roll_dice">${JSON.stringify({ reason: 'Pick the lock', difficulty: lockDifficulty })}</tool>`;
+
+test('planner user blocks save answers, feed dependent assessments, survive reload, and stay chat-local', async () => {
+    let popups = 0;
+    const h = await harness({ agentProfileId: 'model', steps: [], injectAnchor: 'prompt-end' }, async (messages, index) => {
+        if (index === 1) return { content: '## User: Destination\nWhere do you want to go?\n## Expansion: Route\nPlan travel using {{step:Destination}}.' };
+        assert.match(messages.map(message => message.content).join('\n'), /Answer: The harbor/);
+        return { content: 'Use the harbor road.' };
+    }, { planner: true, realAgent: true, onPopup: popup => {
+        popups++;
+        assert.equal(popup.options.okButton, 'Submit');
+        assert.equal(popup.options.cancelButton, 'Skip');
+        popup.value = ' The harbor ';
+        return 1;
+    } });
+    const result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.equal(popups, 1);
+    assert.equal(h.requests.length, 2); // The question never calls a model.
+    assert.match(result.stepOutputs.Destination, /Question: Where do you want to go\?\nAnswer: The harbor/);
+    assert.match(result.injectionText, /USER CONTEXT/);
+    assert.match(result.injectionText, /The harbor/);
+    const reloaded = await harness({ agentProfileId: 'model', steps: [], injectAnchor: 'before-last-user' }, async messages => {
+        assert.match(messages.map(message => message.content).join('\n'), /Answer: The harbor/);
+        return { content: '## User: Reused destination\nWhere do you want to go?' };
+    }, { planner: true, realAgent: true, onPopup: () => { throw new Error('Must reuse saved answer'); } });
+    reloaded.context.chatMetadata = JSON.parse(JSON.stringify(h.context.chatMetadata));
+    const history = [...reloaded.savedChat];
+    const reused = await reloaded.pipeline.runPipeline({ chat: history });
+    assert.match(reused.stepOutputs['Reused destination'], /The harbor/);
+    assert.match(history.map(message => message.mes).join('\n'), /USER CONTEXT/);
+    reloaded.context.chatMetadata = {};
+    assert.equal(reloaded.state.getChatStore().userAnswers, undefined);
+});
+
+test('skipped user questions do not save answers and dependent blocks still run', async () => {
+    const h = await harness({ agentProfileId: 'model', steps: [] }, async (_messages, index) => ({ content: index === 1
+        ? '## User: Choice\nWhich way?\n## Expansion: Options\nAssess options. {{step:Choice}}' : 'Keep options open.' }),
+    { planner: true, realAgent: true, onPopup: () => 0 });
+    const result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.equal(result.stepOutputs.Choice, '');
+    assert.equal(result.stepOutputs.Options, 'Keep options open.');
+    assert.equal(h.state.getChatStore().userAnswers, undefined);
+});
+
+for (const type of ['dry', 'swipe', 'regenerate', 'continue']) {
+    test(`planner user questions never open or persist during ${type}`, async () => {
+        const h = await harness({ agentProfileId: 'model', steps: [] }, async () => ({ content: '## User: Choice\nWhich way?' }),
+            { planner: true, realAgent: true, onPopup: () => { throw new Error('Unexpected question'); } });
+        const result = await h.pipeline.runPipeline({ chat: [...h.savedChat], inject: type !== 'dry', type });
+        assert.equal(result.stepOutputs.Choice, '');
+        assert.equal(h.state.getChatStore().userAnswers, undefined);
+    });
+}
+
+for (const event of ['stop', 'chat']) {
+    test(`planner closes pending questions on ${event} without saving`, async () => {
+        let opened;
+        const ready = new Promise(resolve => { opened = resolve; });
+        let popup;
+        const h = await harness({ agentProfileId: 'model', steps: [] }, async () => ({ content: '## User: Choice\nWhich way?' }),
+            { planner: true, realAgent: true, onPopup: instance => { popup = instance; opened(); } });
+        const pending = h.pipeline.runPipeline({ chat: [...h.savedChat] });
+        await ready;
+        h.context.eventSource.emit(event);
+        assert.equal(await pending, null);
+        assert.equal(popup.result, 0);
+        assert.equal(h.state.getChatStore().userAnswers, undefined);
+    });
+}
 
 test('planner runs before expansion, preserves settings, and injects temporary dependent output', async () => {
     const h = await harness({ agentProfileId: 'model', steps: [step('Original', 'Assess the original context.')], injectAnchor: 'prompt-end' }, async (messages, index) => {

@@ -180,7 +180,7 @@ export function renderAgentTab() {
         </select></label>`;
     if (settings.agentEngine !== 'legacy') {
         $root.html(`${engineHtml}
-            <div class="smarttavern_hint">Before expansion, the planner reads the existing prompts and up to 24 recent messages. It adds temporary blocks only when important context is missing. At most five expansion blocks run in total; your saved prompts stay unchanged. Independent blocks can run in parallel. See Results for accepted prompts and notices.</div>
+            <div class="smarttavern_hint">Before expansion, the planner reads existing prompts, saved user answers, and up to 24 recent messages. It can add context prompts or ask you a question with Submit / Skip. Answers are saved only in this chat and reused on later turns. At most five blocks run in total; your saved prompts stay unchanged. Independent blocks can run in parallel. Dry runs and swipes never open questions. See Results for accepted prompts and notices.</div>
             <div class="smarttavern_story_status" id="smarttavern_agent_status">${escapeHtml(agentStatusLine(settings))}</div>
             <label>Activation<select id="smarttavern_agentMode">
                 <option value="always"${settings.agentMode === 'always' ? ' selected' : ''}>Always — plan before expansion</option>
