@@ -141,6 +141,8 @@ An empty result or exhausted generation error pauses refinement with **Retry pas
 
 **Skip pass** is also available while a request is running, in the veil and the expanded activity log. **That's enough** ends the whole refinement run. Global Stop and chat changes cancel pending rejection and review windows.
 
+Each refinement pass streams progress to the activity display and the reply veil: **Waiting for the provider**, **Reasoning** when thinking tokens arrive, **Audit** when audit output arrives, and **Rewriting reply** when edit operations or revised prose arrive. Stages follow observable output, so a pass may skip stages (for example, a clean audit needs no rewrite). Providers that hide reasoning or buffer their response remain on Waiting until visible output arrives. Retries and connection fallback reset the status to Waiting.
+
 ### Step prompt macros
 
 | Macro | Resolves to |

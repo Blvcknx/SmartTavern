@@ -192,9 +192,10 @@ export function getConnectionProfile(id) {
  * @param {boolean} [options.recoverContext=false] Return context-limit errors to the caller before profile fallback
  * @param {object|null} [options.sampling=null] Step-owned sampling; disables preset/instruct imports
  * @param {boolean|null} [options.reasoning=null] Step thinking switch; null preserves non-step behavior
+ * @param {function|null} [options.onProgress=null] Requests streaming and receives cumulative {content, reasoning} snapshots; empty snapshots mark a new request
  * @returns {Promise<{content: string, reasoning: string}>}
  */
-export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true, recoverContext = false, sampling = null, reasoning = null } = {}) {
+export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true, recoverContext = false, sampling = null, reasoning = null, onProgress = null } = {}) {
     throwIfAborted(signal);
     const context = getContext();
     const profile = profileId ? getConnectionProfile(profileId) : null;
@@ -207,7 +208,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         const service = getServiceFromContext() ?? await loadServiceFallback();
         if (service && typeof service.sendRequest === 'function') {
             try {
-                const result = await abortable(generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning }), signal);
+                const result = await abortable(generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning, onProgress }), signal);
                 // A technically successful request can still return garbage (sampling
                 // collapse, reasoning corruption). Treat that like a failure so the
                 // active connection gets a chance before any retry logic kicks in.
@@ -226,7 +227,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
     }
 
     if (sampling !== null) {
-        return abortable(generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning }), signal);
+        return abortable(generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning, onProgress }), signal);
     }
     const request = activeQueue.then(async () => {
         throwIfAborted(signal);
@@ -305,7 +306,7 @@ async function withReasoningRequest(send, payload, { reasoning, chat, source, mo
     }
 }
 
-async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning }) {
+async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning, onProgress }) {
     throwIfAborted(signal);
     const isChatCompletion = (profile.mode ?? 'cc') === 'cc';
     let payloadPrompt;
@@ -337,19 +338,23 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
         payloadPrompt = text;
     }
 
-    let result = await withReasoningRequest(overrides => service.sendRequest(profile.id, payloadPrompt, maxTokens, {
-        stream: false,
-        signal,
-        extractData: true,
-        includePreset: sampling === null,
-        includeInstruct: sampling === null,
-    }, overrides), overridePayload, { reasoning, chat: isChatCompletion, source, model: profile.model,
+    const result = await withReasoningRequest(overrides => {
+        onProgress?.({ content: '', reasoning: '' });
+        return service.sendRequest(profile.id, payloadPrompt, maxTokens, {
+            stream: typeof onProgress === 'function',
+            signal,
+            extractData: true,
+            includePreset: sampling === null,
+            includeInstruct: sampling === null,
+        }, overrides);
+    }, overridePayload, { reasoning, chat: isChatCompletion, source, model: profile.model,
         key: JSON.stringify([profile.id, profile.api, profile.model, profile['api-url']]), signal });
 
-    // If the service returns a stream factory despite the non-streaming request,
-    // awaiting sendRequest only waits for the headers. Consume its cumulative
-    // snapshots through completion
-    // before running any output checks (including on a manually retried pass).
+    return consumeResponse(result, signal, onProgress);
+}
+
+/** ST stream factories yield cumulative snapshots, not token deltas. */
+async function consumeResponse(result, signal, onProgress) {
     if (typeof result === 'function') result = result();
     if (result && typeof result[Symbol.asyncIterator] === 'function') {
         let content = '';
@@ -358,6 +363,7 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
             throwIfAborted(signal);
             content = String(chunk?.text ?? chunk?.content ?? content);
             reasoning = String(chunk?.state?.reasoning ?? chunk?.reasoning ?? reasoning);
+            onProgress?.({ content, reasoning });
         }
         result = { content, reasoning };
     }
@@ -369,7 +375,7 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
 }
 
 /** Use only active connection routing, never its generation preset or raw settings. */
-async function generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning }) {
+async function generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning, onProgress }) {
     throwIfAborted(signal);
     const chat = context.mainApi === 'openai';
     const text = context.mainApi === 'textgenerationwebui';
@@ -378,7 +384,7 @@ async function generateIsolatedActive(context, { systemPrompt, prompt, maxTokens
         throw new Error('Isolated step sampling needs a saved Connection Manager profile or an active Chat/Text Completion connection with request-service support.');
     }
     const settings = chat ? context.chatCompletionSettings ?? {} : context.textCompletionSettings ?? {};
-    const payload = { stream: false, max_tokens: maxTokens, ...samplingPayload(sampling, chat, settings.chat_completion_source) };
+    const payload = { stream: typeof onProgress === 'function', max_tokens: maxTokens, ...samplingPayload(sampling, chat, settings.chat_completion_source) };
     if (chat) {
         // Explicit allowlist: connection endpoints/auth only, no sampling, prompts,
         // reasoning effort, prefill, stop strings, or global custom request body.
@@ -398,11 +404,13 @@ async function generateIsolatedActive(context, { systemPrompt, prompt, maxTokens
         payload.prompt = [systemPrompt, flattenMessages(prompt)].filter(Boolean).join('\n\n');
         if (jsonSchema) payload.prompt += `\n\nRespond with ONLY JSON conforming to:\n${JSON.stringify(jsonSchema.value ?? jsonSchema)}`;
     }
-    const result = await withReasoningRequest(request => service.processRequest(request, {}, true, signal), payload,
+    const result = await withReasoningRequest(request => {
+        onProgress?.({ content: '', reasoning: '' });
+        return service.processRequest(request, {}, true, signal);
+    }, payload,
         { reasoning, chat, source: settings.chat_completion_source, model: payload.model,
             key: JSON.stringify(['active', settings.chat_completion_source, payload.model, payload.custom_url, payload.reverse_proxy]), signal });
-    throwIfAborted(signal);
-    return { content: String(result?.content ?? ''), reasoning: String(result?.reasoning ?? '') };
+    return consumeResponse(result, signal, onProgress);
 }
 
 /** Connection Manager wraps provider errors in Error.cause. */

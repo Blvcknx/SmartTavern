@@ -22,7 +22,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
             emit(type, ...args) { for (const fn of [...(listeners.get(type) ?? [])]) fn(...args); },
         },
         extensionSettings: { smarttavern: { agentEngine: planner ? 'planner' : 'legacy', genRetries: 0, bootstrapOnFirstMessage: false, promptTailVersion: 1, injectAnchor: 'before-last-user', ...settings }, connectionManager: { profiles: [{ id: 'model', mode: 'cc' }] } },
-        chat: savedChat, chatMetadata: {}, characterId: 0, chatId: 'test-chat', activityEntries: [], activityEnds: [],
+        chat: savedChat, chatMetadata: {}, characterId: 0, chatId: 'test-chat', activityEntries: [], activityEnds: [], activityStatuses: [], veilStatuses: [],
         characters: [{ name: 'Alice', avatar: 'alice.png' }], name1: 'User', name2: 'Alice',
         saveSettingsDebounced() {}, substituteParams: text => text,
         saveMetadata() {}, saveMetadataDebounced() {}, saveChat: async () => {}, updateMessageBlock() {}, addOneMessage(message) { context.renderedMessage = message; },
@@ -50,8 +50,8 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         extensions: 'export const getContext = () => context;',
         'system-messages': "export const system_message_types = { NARRATOR: 'narrator' };",
         'instruct-mode': `export const formatInstructModeChat = (name, text, user, system) => '<' + (system ? 'system' : user ? 'user' : 'assistant') + '>' + text + '</turn>\\n'; export const formatInstructModePrompt = () => '<assistant>';`,
-        progress: 'export const activityStart = () => {}; export const activityStatus = () => {}; export const activityEntry = entry => { context.activityEntries.push(entry); }; export const activityFail = () => {}; export const activityEnd = options => { context.activityEnds.push(options); }; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
-        veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = () => {}; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const armPreVeil = () => {};`,
+        progress: 'export const activityStart = () => {}; export const activityStatus = status => { context.activityStatuses.push(status); }; export const activityEntry = entry => { context.activityEntries.push(entry); }; export const activityFail = () => {}; export const activityEnd = options => { context.activityEnds.push(options); }; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
+        veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = (_id, status) => { context.veilStatuses.push(status); }; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const armPreVeil = () => {};`,
         // Story Director stub: no chat in these tests carries a story, so the whole
         // feature must stay inert. The no-ops mirror story.js's no-story behavior.
         story: `export const previewStoryDirective = () => (${JSON.stringify(directive)}); export const prepareStoryDirective = () => (${JSON.stringify(directive)}); export const storyMacroContext = value => value; export const recordedDirective = () => null; export const compileStoryDirective = () => null; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};`,
@@ -1394,6 +1394,58 @@ test('refinement accepts repeated non-empty output without generic degeneration 
     assert.equal(h.requests.length, 1);
 });
 
+test('refinement streams observable phases to both displays on saved and active connections', async () => {
+    for (const profileId of ['model', '']) {
+        const respond = async () => async function* () {
+            yield { text: '', state: { reasoning: 'Checking continuity' } };
+            yield { text: '<audit>Change needed</audit>', state: { reasoning: 'Checking continuity' } };
+            yield { text: '<audit>Change needed</audit><revised_reply>Edited reply</revised_reply>' };
+        };
+        const h = await harness({ refinementSteps: [{ ...step('Edit', '{{draft}}'), profileId, reasoning: true }] }, respond, { veiled: true });
+        h.context.ChatCompletionService.processRequest = async payload => {
+            h.requests.push({ payload });
+            return respond();
+        };
+        h.savedChat.push({ name: 'Alice', mes: proseDraft });
+        h.pipeline.markFreshGeneration();
+        const result = await h.pipeline.runRefinementPipeline(1);
+        assert.equal(result.workingDraft, 'Edited reply');
+        const expected = ['Waiting for the provider', 'Reasoning', 'Audit', 'Rewriting reply']
+            .map(phase => `Pass 1/1 · Edit · ${phase}`);
+        assert.deepEqual(h.context.veilStatuses, expected);
+        for (const status of expected) assert.ok(h.context.activityStatuses.includes(status));
+        assert.equal(profileId ? h.requests[0].custom.stream : h.requests[0].payload.stream, true);
+    }
+});
+
+test('buffered refinement responses do not invent reasoning or audit progress', async () => {
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: '<audit>PASS</audit>', reasoning: 'Hidden until complete' }));
+    h.savedChat.push({ name: 'Alice', mes: proseDraft });
+    h.pipeline.markFreshGeneration();
+    const result = await h.pipeline.runRefinementPipeline(1);
+    assert.equal(result.workingDraft, proseDraft);
+    assert.deepEqual(h.context.veilStatuses, ['Pass 1/1 · Edit · Waiting for the provider']);
+});
+
+test('cancelled streams cannot report late progress', async () => {
+    const streaming = deferred(), finish = deferred();
+    const h = await harness({}, async () => async function* () {
+        yield { text: '', state: { reasoning: 'Thinking' } };
+        streaming.resolve();
+        await finish.promise;
+        yield { text: '<revised_reply>Late reply</revised_reply>' };
+    });
+    const controller = new AbortController();
+    const snapshots = [];
+    const run = h.gen.generateVia({ profileId: 'model', signal: controller.signal, onProgress: snapshot => snapshots.push(snapshot) });
+    await streaming.promise;
+    controller.abort(new DOMException('Stopped', 'AbortError'));
+    await assert.rejects(run, { name: 'AbortError' });
+    finish.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(snapshots.length, 2);
+});
+
 test('a retried pass waits for the full streamed reply before checking partial output', async () => {
     const streaming = deferred(), finish = deferred();
     const revised = proseDraft.replace('quietly', 'softly');
@@ -1424,6 +1476,8 @@ test('a retried pass waits for the full streamed reply before checking partial o
     assert.equal(popups, 1);
     assert.equal(message.mes, revised);
     assert.equal(result.stepStats[0].attempts, 2);
+    const waiting = 'Pass 1/1 · Edit · Waiting for the provider';
+    assert.equal(h.context.veilStatuses.filter(status => status === waiting).length, 2);
 });
 
 test('a streamed profiled request can be cancelled while waiting for more tokens', async () => {

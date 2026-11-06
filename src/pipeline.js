@@ -22,7 +22,7 @@ import { system_message_types } from '../../../../system-messages.js';
 import { generateWithRetry, withInternalGeneration, isInternalGeneration, createGenerationControl, isAbortError, throwIfAborted, withInterceptorScope } from './gen.js';
 import { bootstrapProfile, serializeProfile } from './profiles.js';
 import { activityStart, activityStatus, activityEntry, activityFail, activityEnd, activitySteps, activityStepState, activityRefinementControls } from './progress.js';
-import { refinementIssues, hasRefinedPayload, parseDraftEdits, editIssues, applyDraftEdits, numberedDraft, paragraphBlocks, stripThinkBlocks } from './refinement-checks.js';
+import { refinementPhase, refinementIssues, hasRefinedPayload, parseDraftEdits, editIssues, applyDraftEdits, numberedDraft, paragraphBlocks, stripThinkBlocks } from './refinement-checks.js';
 import { applyVeil, setVeilStep, setVeilStatus, revealVeil, dismissVeil, armPreVeil } from './veil.js';
 import { stagePromptTail, clearPromptTail } from './tail.js';
 import {
@@ -979,9 +979,17 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
             if (!isCurrentDraft()) return null;
             const step = steps[index];
             const label = step.name || 'Unnamed pass';
-            activityStatus(`Pass ${index + 1}/${steps.length} · ${label}`);
+            let phase = '';
+            const reportProgress = snapshot => {
+                if (passControl.signal.aborted || !isCurrentDraft()) return;
+                const next = refinementPhase(snapshot);
+                if (next === phase) return;
+                phase = next;
+                const status = `Pass ${index + 1}/${steps.length} · ${label} · ${phase}`;
+                activityStatus(status);
+                setVeilStatus(messageId, status);
+            };
             activityStepState(index, 'running');
-            setVeilStatus(messageId, `Pass ${index + 1}/${steps.length} · ${label}`);
             setVeilStep(messageId, index, 'running');
             const startedAt = Date.now();
             const currentDraft = workingDraft;
@@ -1014,6 +1022,8 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                 let attempts = 0;
                 while (true) {
                     attempts++;
+                    phase = '';
+                    reportProgress({});
                     output = '';
                     extracted = currentDraft;
                     let issues;
@@ -1027,6 +1037,7 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
                             prompt: text,
                             maxTokens: settings.stepMaxTokens,
                             checkOutput: false,
+                            onProgress: reportProgress,
                         }));
                         throwIfAborted(passControl.signal);
                         if (!isCurrentDraft()) return null;

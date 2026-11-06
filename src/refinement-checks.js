@@ -1,4 +1,18 @@
-import { parseDraftEdits, editIssues } from './refinement-edits.js';
+import { parseDraftEdits, editIssues, stripThinkBlocks } from './refinement-edits.js';
+
+/** Infer only observable work from cumulative provider output; never from a timer. */
+export function refinementPhase({ content = '', reasoning = '' } = {}) {
+    const raw = String(content);
+    const visible = stripThinkBlocks(raw).replace(/^\s*(?:```|~~~)[^\n]*\n/, '').trim();
+    // An edit can follow an audit in the same response. Ignore quoted edit tags
+    // inside the audit itself when deciding whether rewriting has started.
+    const afterAudit = visible.replace(/<audit\b[^>]*>[\s\S]*?(?:<\/audit\s*>|$)/gi, '').trim();
+    if (/<(?:replace|edit|delete|insert|revised_reply|final_reply|p)\b/i.test(afterAudit)) return 'Rewriting reply';
+    if (afterAudit && !/^<[^>]*$/.test(afterAudit)) return 'Rewriting reply';
+    if (/<audit\b/i.test(visible)) return 'Audit';
+    if (String(reasoning).trim() || /<think\b/i.test(raw)) return 'Reasoning';
+    return 'Waiting for the provider';
+}
 
 // Surgical refinement helpers re-exported for one-stop importing in the pipeline.
 export {
