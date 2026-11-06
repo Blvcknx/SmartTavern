@@ -1,5 +1,19 @@
 /* SmartTavern extension styles */
 
+/* Match editable inputs to ST's textareas without changing compact field sizes
+   or interfering with native checkbox, range, and file controls. */
+:is(#smarttavern_settings, #smarttavern_panel) input:is([type="text"], [type="number"], [type="search"]) {
+    background-color: var(--black30a);
+    color: var(--SmartThemeBodyColor);
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+}
+
+:is(#smarttavern_settings, #smarttavern_panel) input:is([type="text"], [type="number"], [type="search"])::placeholder {
+    color: var(--SmartThemeEmColor);
+    opacity: 0.7;
+}
+
 #smarttavern_settings .smarttavern_hint {
     opacity: 0.75;
     font-size: 0.9em;
