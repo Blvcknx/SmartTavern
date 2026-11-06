@@ -991,6 +991,10 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
                         value="${step.lookback ?? ''}" placeholder="Global"
                         title="Messages of chat history for {{chat}} in this step (0 = none, empty = global default)">
                     <select class="smarttavern_step_profile smarttavern_profile_select" title="Connection profile for this step"></select>
+                    <label class="checkbox smarttavern_step_reasoning_label" title="On requests maximum reasoning, retrying with high if unsupported. Off requests disabled thinking. Some models cannot turn thinking off. Chat Completion connections only.">
+                        <input class="smarttavern_step_reasoning" type="checkbox" ${step.reasoning === true ? 'checked' : ''}>
+                        <span>Reasoning</span>
+                    </label>
                     <span class="smarttavern_missing_profile smarttavern_step_profile_badge" title="The pinned connection profile no longer exists — this step falls back to the active connection"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
                     <div class="smarttavern_row_actions">
                         <a class="menu_button menu_button_icon smarttavern_step_up" title="Move up"><i class="fa-solid fa-arrow-up"></i></a>
@@ -1044,8 +1048,23 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
             saveSettings();
         });
         card.find('.smarttavern_step_profile').data('stStep', step);
+        const updateReasoningControl = () => {
+            const profile = listConnectionProfiles().find(profile => profile.id === steps[index].profileId);
+            const supported = profile ? (profile.mode ?? 'cc') === 'cc' : getContext().mainApi === 'openai';
+            card.find('.smarttavern_step_reasoning').prop('disabled', !supported);
+            card.find('.smarttavern_step_reasoning_label').attr('title', supported
+                ? 'On: maximum effort, with high as fallback. Off: disable reasoning. Models that require thinking cannot honor Off.'
+                : 'This Text Completion connection does not expose a reliable reasoning switch. Use a Chat Completion connection to control thinking.');
+        };
+        updateReasoningControl();
+        card.find('.smarttavern_step_profile').data('stUpdateReasoning', updateReasoningControl);
+        card.find('.smarttavern_step_reasoning').on('change', function () {
+            steps[index].reasoning = this.checked;
+            saveSettings();
+        });
         card.find('.smarttavern_step_profile').on('change', function () {
             steps[index].profileId = String(/** @type {HTMLSelectElement} */ (this).value ?? '');
+            updateReasoningControl();
             saveSettings();
         });
         card.find('.smarttavern_step_role').on('change', function () {
@@ -1128,6 +1147,7 @@ export function refreshProfileSelects() {
     $panel().find('.smarttavern_step_profile').each(function () {
         const step = $(this).data('stStep');
         refresh(this, step?.profileId ?? '');
+        $(this).data('stUpdateReasoning')?.();
         updateBadge($(this).closest('.smarttavern_step_card').find('.smarttavern_step_profile_badge'), step?.profileId ?? '');
     });
 }

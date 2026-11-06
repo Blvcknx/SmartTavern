@@ -97,6 +97,89 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
 
+test('reasoning retries rejected maximum on the same profile and remembers high per model', async () => {
+    const h = await harness({}, async () => {
+        if (h.requests.at(-1).overrides.reasoning_effort === 'max') {
+            throw new Error('API request failed', { cause: new Error('Invalid reasoning_effort max; supported values: low, medium, high') });
+        }
+        return { content: 'Edited' };
+    });
+    const options = { profileId: 'model', prompt: 'Edit', sampling: {}, reasoning: true };
+    await h.gen.generateVia(options);
+    await h.gen.generateVia(options);
+    assert.deepEqual(h.requests.map(request => request.overrides.reasoning_effort), ['max', 'high', 'high']);
+    assert.ok(h.requests.every(request => request.id === 'model' && request.overrides.include_reasoning === true));
+    h.context.extensionSettings.connectionManager.profiles[0].model = 'different-model';
+    await h.gen.generateVia(options);
+    assert.deepEqual(h.requests.slice(-2).map(request => request.overrides.reasoning_effort), ['max', 'high']);
+});
+
+test('reasoning switch is independent per pipeline and defaults to off', async () => {
+    const h = await harness({ steps: [{ ...step('Assess', 'TASK'), reasoning: true }], refinementSteps: [step('Edit', '{{draft}}')] },
+        async () => ({ content: '<audit>PASS</audit>' }));
+    await h.pipeline.runPipeline({ inject: false });
+    h.savedChat.push({ name: 'Alice', mes: 'Draft' });
+    h.pipeline.markFreshGeneration();
+    await h.pipeline.runRefinementPipeline(1);
+    assert.equal(h.requests[0].overrides.reasoning_effort, 'max');
+    assert.equal(h.requests[1].overrides.reasoning_effort, 'none');
+});
+
+test('reasoning maximum is not retried for auth errors or cancellation', async () => {
+    for (const error of [new Error('Unauthorized API key'), new DOMException('Stopped', 'AbortError')]) {
+        const h = await harness({}, async () => { throw error; });
+        h.context.ChatCompletionService.processRequest = async () => { throw error; };
+        await assert.rejects(h.gen.generateVia({ profileId: 'model', prompt: 'Edit', sampling: {}, reasoning: true }));
+        assert.equal(h.requests.length, 1);
+    }
+});
+
+test('rejected reasoning off stays off and surfaces without fallback or generation retries', async () => {
+    const h = await harness({ genRetries: 3 }, async () => { throw new Error('reasoning_effort none is not supported by this model'); });
+    h.context.ChatCompletionService.processRequest = async () => { throw new Error('Unexpected fallback'); };
+    await assert.rejects(h.gen.generateWithRetry({ profileId: 'model', prompt: 'Edit', sampling: {}, reasoning: false }), /Reasoning Off was rejected/);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests[0].overrides.reasoning_effort, 'none');
+});
+
+test('provider adapters receive actual disable commands, not only hidden-thought flags', async () => {
+    for (const [source, model, expected] of [ ['openai', 'gpt-5.4', 'none'], ['openrouter', 'vendor/model', 'none'],
+        ['claude', 'claude-sonnet-4-5', 'auto'], ['makersuite', 'gemini-2.5-flash', 'min'] ]) {
+        const h = await harness();
+        h.context.CONNECT_API_MAP = { provider: { source } };
+        Object.assign(h.context.extensionSettings.connectionManager.profiles[0], { api: 'provider', model });
+        await h.gen.generateVia({ profileId: 'model', prompt: 'Edit', sampling: {}, reasoning: false });
+        assert.equal(h.requests[0].overrides.reasoning_effort, expected);
+        assert.equal(h.requests[0].overrides.include_reasoning, false);
+    }
+});
+
+test('custom active connections explicitly forward effort and retain it on max-to-high retry', async () => {
+    const h = await harness();
+    h.context.chatCompletionSettings.chat_completion_source = 'custom';
+    const payloads = [];
+    h.context.ChatCompletionService.processRequest = async payload => {
+        payloads.push(payload);
+        assert.equal(JSON.parse(payload.custom_include_body).reasoning_effort, payload.reasoning_effort);
+        if (payload.reasoning_effort === 'max') throw new Error('Invalid reasoning_effort; max is unsupported');
+        return { content: 'Edited' };
+    };
+    await h.gen.generateVia({ prompt: 'Edit', sampling: {}, reasoning: true });
+    assert.deepEqual(payloads.map(payload => payload.reasoning_effort), ['max', 'high']);
+    await h.gen.generateVia({ prompt: 'Edit', sampling: {}, reasoning: false });
+    assert.equal(payloads.at(-1).reasoning_effort, 'none');
+});
+
+test('known adapters that cannot turn reasoning off fail explicitly rather than substituting low', async () => {
+    for (const [source, model] of [['makersuite', 'gemini-2.5-pro'], ['claude', 'claude-opus-4-6'], ['openai', 'gpt-6.1-sol']]) {
+        const h = await harness();
+        h.context.CONNECT_API_MAP = { provider: { source } };
+        Object.assign(h.context.extensionSettings.connectionManager.profiles[0], { api: 'provider', model });
+        await assert.rejects(h.gen.generateVia({ profileId: 'model', sampling: {}, reasoning: false }), error => error.reasoningControl === true);
+        assert.equal(h.requests.length, 0);
+    }
+});
+
 test('expansion and refinement send independent sampling without importing profile presets or instruct settings', async () => {
     const expansion = { ...step('Assess', 'TASK'), sampling: { temperature: 0.25, repetition_penalty: 1.15, presence_penalty: -0.3, frequency_penalty: 0.4 } };
     const refinement = { ...step('Edit', '{{draft}}'), sampling: { temperature: 0.1 } };
@@ -110,8 +193,8 @@ test('expansion and refinement send independent sampling without importing profi
         assert.equal(request.custom.includePreset, false);
         assert.equal(request.custom.includeInstruct, false);
     }
-    assert.deepEqual({ ...h.requests[0].overrides }, expansion.sampling);
-    assert.deepEqual({ ...h.requests[1].overrides }, { temperature: 0.1, repetition_penalty: 1, presence_penalty: 0, frequency_penalty: 0 });
+    assert.deepEqual({ ...h.requests[0].overrides }, { ...expansion.sampling, include_reasoning: false, reasoning_effort: 'none' });
+    assert.deepEqual({ ...h.requests[1].overrides }, { temperature: 0.1, repetition_penalty: 1, presence_penalty: 0, frequency_penalty: 0, include_reasoning: false, reasoning_effort: 'none' });
     // Non-step calls preserve their existing preset behavior.
     await h.gen.generateVia({ profileId: 'model', prompt: 'Maintenance' });
     assert.equal(h.requests[2].custom.includePreset, true);

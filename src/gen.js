@@ -191,9 +191,10 @@ export function getConnectionProfile(id) {
  * @param {boolean} [options.checkOutput=true] Disable generic sanity filters when the caller reviews output itself
  * @param {boolean} [options.recoverContext=false] Return context-limit errors to the caller before profile fallback
  * @param {object|null} [options.sampling=null] Step-owned sampling; disables preset/instruct imports
+ * @param {boolean|null} [options.reasoning=null] Step thinking switch; null preserves non-step behavior
  * @returns {Promise<{content: string, reasoning: string}>}
  */
-export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true, recoverContext = false, sampling = null } = {}) {
+export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true, recoverContext = false, sampling = null, reasoning = null } = {}) {
     throwIfAborted(signal);
     const context = getContext();
     const profile = profileId ? getConnectionProfile(profileId) : null;
@@ -206,7 +207,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         const service = getServiceFromContext() ?? await loadServiceFallback();
         if (service && typeof service.sendRequest === 'function') {
             try {
-                const result = await abortable(generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling }), signal);
+                const result = await abortable(generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning }), signal);
                 // A technically successful request can still return garbage (sampling
                 // collapse, reasoning corruption). Treat that like a failure so the
                 // active connection gets a chance before any retry logic kicks in.
@@ -215,6 +216,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
                 warn(`Profiled request returned ${degenerate}; falling back to the active connection.`);
             } catch (error) {
                 if (signal?.aborted || isAbortError(error)) throw error;
+                if (error?.reasoningControl) throw error;
                 if (recoverContext && isContextLimitError(error)) throw error;
                 warn('Profiled request via Connection Manager failed; falling back to the active connection.', error);
             }
@@ -224,7 +226,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
     }
 
     if (sampling !== null) {
-        return abortable(generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling }), signal);
+        return abortable(generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning }), signal);
     }
     const request = activeQueue.then(async () => {
         throwIfAborted(signal);
@@ -244,7 +246,66 @@ function samplingPayload(sampling, isChatCompletion, source) {
     return values;
 }
 
-async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling }) {
+const reasoningEfforts = new Map();
+
+function reasoningError(message) {
+    const error = new Error(message);
+    error.reasoningControl = true;
+    return error;
+}
+
+function rejectedReasoning(error) {
+    const seen = new Set();
+    let message = '';
+    while (error && !seen.has(error)) {
+        seen.add(error);
+        message += ` ${error.message ?? error}`;
+        error = error.cause;
+    }
+    return /reasoning|thinking|effort/i.test(message) && /unsupported|not support|invalid|not allowed|must be|allowed values|supported values/i.test(message);
+}
+
+/** Keep retries on the same connection; never equate hiding thoughts with disabling them. */
+async function withReasoningRequest(send, payload, { reasoning, chat, source, model = '', key, signal }) {
+    if (reasoning === null || !chat) return send(payload);
+    const google = ['makersuite', 'vertexai'].includes(source);
+    const claude = source === 'claude';
+    if (!reasoning && google && /gemini-3|pro|flash-lite/i.test(model)) {
+        throw reasoningError('Reasoning Off cannot be honored for this Gemini model through this SillyTavern adapter. Enable Reasoning or choose a model that supports disabling thinking.');
+    }
+    if (!reasoning && claude && /opus-4-[6-9]|sonnet-4-[6-9]|claude-[5-9]|fable/i.test(model)) {
+        throw reasoningError('This SillyTavern adapter cannot explicitly disable adaptive Claude thinking. Enable Reasoning or choose a model that supports disabling thinking.');
+    }
+    if (!reasoning && /(?:^|\/)(?:gpt-5\.3-chat-latest|gpt-6-astra|gpt-6\.1-sol)(?:$|[-/])/i.test(model)) {
+        throw reasoningError('This model requires reasoning and cannot honor Reasoning Off. Enable Reasoning or select a model with a non-thinking mode.');
+    }
+    const effort = reasoning ? reasoningEfforts.get(key) ?? 'max' : claude ? 'auto' : google ? 'min' : 'none';
+    const requestFor = effort => ({ ...payload, include_reasoning: reasoning, reasoning_effort: effort,
+        // ST forwards effort automatically only for a fixed list of OpenAI model
+        // names. Custom compatible endpoints need it explicitly in their body.
+        ...(source === 'custom' ? { custom_include_body: JSON.stringify({ reasoning_effort: effort }) } : {}) });
+    const request = requestFor(effort);
+    // OpenAI reasoning modes reject temperature, regardless of the saved control.
+    if (reasoning && ['openai', 'custom'].includes(source) && /^(?:gpt-[5-9]|o[134])/i.test(model)) delete request.temperature;
+    throwIfAborted(signal);
+    try {
+        return await send(request);
+    } catch (error) {
+        if (signal?.aborted || isAbortError(error)) throw error;
+        if (!rejectedReasoning(error)) throw error;
+        if (!reasoning) throw reasoningError(`Reasoning Off was rejected by the provider: ${error.message}. Choose a model that supports disabled thinking.`);
+        if (effort !== 'max') throw error;
+        activityEntry({ title: 'Maximum reasoning unsupported — retrying with high', tone: 'info' });
+        throwIfAborted(signal);
+        const highRequest = requestFor('high');
+        if (!Object.hasOwn(request, 'temperature')) delete highRequest.temperature;
+        const result = await send(highRequest);
+        reasoningEfforts.set(key, 'high');
+        return result;
+    }
+}
+
+async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning }) {
     throwIfAborted(signal);
     const isChatCompletion = (profile.mode ?? 'cc') === 'cc';
     let payloadPrompt;
@@ -276,13 +337,14 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
         payloadPrompt = text;
     }
 
-    let result = await service.sendRequest(profile.id, payloadPrompt, maxTokens, {
+    let result = await withReasoningRequest(overrides => service.sendRequest(profile.id, payloadPrompt, maxTokens, {
         stream: false,
         signal,
         extractData: true,
         includePreset: sampling === null,
         includeInstruct: sampling === null,
-    }, overridePayload);
+    }, overrides), overridePayload, { reasoning, chat: isChatCompletion, source, model: profile.model,
+        key: JSON.stringify([profile.id, profile.api, profile.model, profile['api-url']]), signal });
 
     // If the service returns a stream factory despite the non-streaming request,
     // awaiting sendRequest only waits for the headers. Consume its cumulative
@@ -307,7 +369,7 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
 }
 
 /** Use only active connection routing, never its generation preset or raw settings. */
-async function generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling }) {
+async function generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning }) {
     throwIfAborted(signal);
     const chat = context.mainApi === 'openai';
     const text = context.mainApi === 'textgenerationwebui';
@@ -336,7 +398,9 @@ async function generateIsolatedActive(context, { systemPrompt, prompt, maxTokens
         payload.prompt = [systemPrompt, flattenMessages(prompt)].filter(Boolean).join('\n\n');
         if (jsonSchema) payload.prompt += `\n\nRespond with ONLY JSON conforming to:\n${JSON.stringify(jsonSchema.value ?? jsonSchema)}`;
     }
-    const result = await service.processRequest(payload, {}, true, signal);
+    const result = await withReasoningRequest(request => service.processRequest(request, {}, true, signal), payload,
+        { reasoning, chat, source: settings.chat_completion_source, model: payload.model,
+            key: JSON.stringify(['active', settings.chat_completion_source, payload.model, payload.custom_url, payload.reverse_proxy]), signal });
     throwIfAborted(signal);
     return { content: String(result?.content ?? ''), reasoning: String(result?.reasoning ?? '') };
 }
@@ -447,6 +511,7 @@ export async function generateWithRetry(options = {}) {
             result = await generateVia({ ...options, prompt });
         } catch (error) {
             if (options.signal?.aborted || isAbortError(error)) throw error;
+            if (error?.reasoningControl) throw error;
             warn(`internal generation attempt ${attempt}/${attempts} failed`, error);
             if (attempt === attempts) throw error;
             activityEntry({ title: `Attempt ${attempt}/${attempts} failed — retrying`, text: String(error?.message ?? error), tone: 'info' });

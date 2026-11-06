@@ -123,10 +123,15 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Refinement passes | Same cards minus the role selector (passes are strictly sequential and work on the draft), plus an **Edit mode** select: **Surgical edits** (default) or **Full rewrite**. Defaults: **Body & Spatial Awareness** → **Character & Psychological Authenticity** → **Prose & Wording Polish** |
 | Step execution | Expansion only: parallel where independent (default), or sequential. `{{step:Name}}` waits for that earlier step; `{{steps}}` waits for all earlier steps. Refinement passes are always strictly sequential. Isolated step requests can overlap without changing ST's global generation settings. |
 | Step sampling | Button below each expansion/refinement prompt: temperature, repetition penalty, presence penalty, frequency penalty. Values are saved per step and preserved when duplicating. These replace preset sampling for step calls; supported controls depend on the API/model. |
+| Step reasoning | Checkbox beside each expansion/refinement connection selector, **off by default**. On requests maximum effort through the provider adapter. If that value is explicitly rejected, retry on the same connection with high and remember the successful choice for that connection/model until reload. Off requests disabled thinking, rather than merely hiding thoughts. Models/adapters that cannot disable thinking report an error; Off is never silently replaced with low effort. The checkbox is unavailable for Text Completion connections. |
 | Block role | Expansion steps only: role of each generated output when using a history anchor; prompt-end mode uses the global tail role. Refinement passes have no role selector. |
 | Profile updater connection profile | Saved Connection Manager profile used by bootstrap/update/rebuild |
 | Disable floating UI | Master switch for the floating panel, avatar context menu and wand-menu button |
 | Run expansion / Run refinement (Results tab) | Dry run each pipeline: expansion runs its steps without injecting; refinement previews what the passes would change about the last character reply, saving nothing |
+
+### Reasoning control
+
+Reasoning is separate from the XML editing contract: a model can think before producing edit tags. On may increase latency substantially. Native Claude and Gemini use ST's effort-to-thinking-budget mapping; some models require reasoning or their adapter cannot explicitly disable it. Custom OpenAI-compatible endpoints receive an explicit `reasoning_effort` body field. Unsupported Off requests surface for review instead of retrying with thinking enabled. OpenAI reasoning modes omit incompatible temperature settings without changing the saved control. Planner, profile maintenance and other non-step calls retain their existing behavior.
 
 ### Refinement guardrails
 
