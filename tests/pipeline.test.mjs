@@ -26,8 +26,12 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         characters: [{ name: 'Alice', avatar: 'alice.png' }], name1: 'User', name2: 'Alice',
         saveSettingsDebounced() {}, substituteParams: text => text,
         saveMetadata() {}, saveMetadataDebounced() {}, saveChat: async () => {}, updateMessageBlock() {}, addOneMessage(message) { context.renderedMessage = message; },
-        ConnectionManagerRequestService: { async sendRequest(id, messages, _maxTokens, custom) {
-            requests.push({ id, messages, maxTokens: _maxTokens, signal: custom?.signal });
+        mainApi: 'openai', chatCompletionSettings: { chat_completion_source: 'openai' }, getChatCompletionModel: () => 'active-model',
+        ChatCompletionService: { async processRequest(payload, options, extract, signal) {
+            return { content: await context.generateRaw({ prompt: payload.messages, responseLength: payload.max_tokens, signal }) };
+        } },
+        ConnectionManagerRequestService: { async sendRequest(id, messages, _maxTokens, custom, overrides) {
+            requests.push({ id, messages, maxTokens: _maxTokens, signal: custom?.signal, custom, overrides });
             return respond(messages, requests.length);
         } },
         generateRaw: async options => { requests.push(options); return 'ACTIVE OUTPUT'; },
@@ -92,6 +96,74 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
+
+test('expansion and refinement send independent sampling without importing profile presets or instruct settings', async () => {
+    const expansion = { ...step('Assess', 'TASK'), sampling: { temperature: 0.25, repetition_penalty: 1.15, presence_penalty: -0.3, frequency_penalty: 0.4 } };
+    const refinement = { ...step('Edit', '{{draft}}'), sampling: { temperature: 0.1 } };
+    const h = await harness({ steps: [expansion], refinementSteps: [refinement] }, async () => ({ content: '<audit>PASS</audit>' }));
+    await h.pipeline.runPipeline({ inject: false });
+    h.savedChat.push({ name: 'Alice', mes: 'The draft.' });
+    h.pipeline.markFreshGeneration();
+    await h.pipeline.runRefinementPipeline(1);
+    assert.equal(h.requests.length, 2);
+    for (const request of h.requests) {
+        assert.equal(request.custom.includePreset, false);
+        assert.equal(request.custom.includeInstruct, false);
+    }
+    assert.deepEqual({ ...h.requests[0].overrides }, expansion.sampling);
+    assert.deepEqual({ ...h.requests[1].overrides }, { temperature: 0.1, repetition_penalty: 1, presence_penalty: 0, frequency_penalty: 0 });
+    // Non-step calls preserve their existing preset behavior.
+    await h.gen.generateVia({ profileId: 'model', prompt: 'Maintenance' });
+    assert.equal(h.requests[2].custom.includePreset, true);
+});
+
+test('isolated fallback copies only active routing and keeps the step sampling', async () => {
+    const h = await harness({}, async () => { throw new Error('Pinned connection offline'); });
+    h.context.chatCompletionSettings = { chat_completion_source: 'openai', custom_url: 'https://example.invalid',
+        temperature: 1.9, top_p: 0.01, reasoning_effort: 'high', assistant_prefill: 'Unwanted prefill', prompts: ['Unwanted instructions'] };
+    let payload;
+    h.context.ChatCompletionService.processRequest = async (data, options) => {
+        payload = data;
+        assert.deepEqual(Object.keys(options), []);
+        return { content: 'Edited' };
+    };
+    const result = await h.gen.generateVia({ profileId: 'model', systemPrompt: 'Editor', prompt: 'Draft', sampling: { temperature: 0.2 } });
+    assert.equal(result.content, 'Edited');
+    assert.equal(payload.model, 'active-model');
+    assert.equal(payload.custom_url, 'https://example.invalid');
+    assert.equal(payload.temperature, 0.2);
+    for (const key of ['top_p', 'reasoning_effort', 'assistant_prefill', 'prompts', 'repetition_penalty']) assert.equal(key in payload, false);
+    assert.deepEqual(Array.from(payload.messages, message => ({ ...message })), [{ role: 'system', content: 'Editor' }, { role: 'user', content: 'Draft' }]);
+});
+
+test('text-completion steps map penalties and normalize malformed sampling without importing presets', async () => {
+    const h = await harness();
+    h.context.extensionSettings.connectionManager.profiles[0].mode = 'tc';
+    await h.gen.generateVia({ profileId: 'model', prompt: 'Task', sampling: { temperature: NaN, repetition_penalty: 1.2, presence_penalty: -99, frequency_penalty: 'bad' } });
+    const request = h.requests[0];
+    assert.equal(request.custom.includePreset, false);
+    assert.deepEqual({ ...request.overrides }, { temperature: 0.7, repetition_penalty: 1.2, presence_penalty: -2, frequency_penalty: 0, rep_pen: 1.2, repeat_penalty: 1.2 });
+});
+
+test('active text completion uses connection routing and step sampling without global settings', async () => {
+    const h = await harness();
+    h.context.mainApi = 'textgenerationwebui';
+    h.context.textCompletionSettings = { type: 'ooba', server_urls: { ooba: 'http://localhost:5000' }, temp: 1.8, top_k: 12, grammar_string: 'unwanted' };
+    h.context.getTextGenModel = () => 'text-model';
+    h.context.TextCompletionService = { async processRequest(payload, options) {
+        assert.deepEqual(Object.keys(options), []);
+        assert.equal(payload.api_type, 'ooba');
+        assert.equal(payload.api_server, 'http://localhost:5000');
+        assert.equal(payload.model, 'text-model');
+        assert.equal(payload.temperature, 0.4);
+        assert.equal(payload.prompt, 'Editor\n\nDraft');
+        assert.equal('grammar_string' in payload, false);
+        assert.equal('top_k' in payload, false);
+        return { content: 'Revised' };
+    } };
+    const result = await h.gen.generateVia({ systemPrompt: 'Editor', prompt: 'Draft', sampling: { temperature: 0.4 } });
+    assert.equal(result.content, 'Revised');
+});
 
 const agentSettings = { expansionEnabled: false, agentProfileId: 'model', agentMode: 'always' };
 const agentOptions = h => ({ chat: [...h.savedChat], char: h.context.characters[0], settings: h.state.getSettings() });
@@ -1606,7 +1678,7 @@ test('active fallback requests serialize shared generateRaw state', async () => 
         running--;
         return 'ACTIVE OUTPUT';
     };
-    await h.pipeline.runPipeline({ inject: false });
+    await Promise.all([h.gen.generateVia({ prompt: 'A' }), h.gen.generateVia({ prompt: 'B' })]);
     assert.equal(maximum, 1);
     assert.equal(h.requests.length, 0);
 });
@@ -1793,7 +1865,7 @@ test('wrapped abort errors never fall back or retry', async () => {
     assert.equal(active, 0);
 });
 
-test('Stop cancels expansion, queued active requests and dependent steps', async () => {
+test('Stop cancels isolated active expansion and dependent steps', async () => {
     const started = deferred(), response = deferred();
     const h = await harness({ genRetries: 2, steps: [step('A', 'A'), step('B', 'B'), step('C', '{{step:A}}')] });
     h.state.getSettings().steps.forEach(s => { s.profileId = ''; });
@@ -1806,7 +1878,7 @@ test('Stop cancels expansion, queued active requests and dependent steps', async
     assert.equal(await run, null);
     response.resolve('Late output');
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(calls, 1);
+    assert.equal(calls, 2); // Independent isolated requests need no shared-settings queue.
     assert.equal(core.length, 1);
 });
 

@@ -2,7 +2,7 @@
 // Connection Manager) with fallback to the active connection, plus a reentrancy guard
 // so our internal LLM calls never trigger the pipeline itself.
 import { getContext } from '../../../../extensions.js';
-import { getSettings, clampInt, warn } from './state.js';
+import { getSettings, clampInt, warn, normalizeStepSampling } from './state.js';
 import { activityEntry } from './progress.js';
 
 let internalDepth = 0;
@@ -190,9 +190,10 @@ export function getConnectionProfile(id) {
  * @param {AbortSignal|null} [options.signal] Cancels queued calls, retries and supported transports
  * @param {boolean} [options.checkOutput=true] Disable generic sanity filters when the caller reviews output itself
  * @param {boolean} [options.recoverContext=false] Return context-limit errors to the caller before profile fallback
+ * @param {object|null} [options.sampling=null] Step-owned sampling; disables preset/instruct imports
  * @returns {Promise<{content: string, reasoning: string}>}
  */
-export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true, recoverContext = false } = {}) {
+export async function generateVia({ profileId = '', systemPrompt = '', prompt = '', maxTokens = 512, jsonSchema = null, signal = null, checkOutput = true, recoverContext = false, sampling = null } = {}) {
     throwIfAborted(signal);
     const context = getContext();
     const profile = profileId ? getConnectionProfile(profileId) : null;
@@ -205,7 +206,7 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         const service = getServiceFromContext() ?? await loadServiceFallback();
         if (service && typeof service.sendRequest === 'function') {
             try {
-                const result = await abortable(generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal }), signal);
+                const result = await abortable(generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling }), signal);
                 // A technically successful request can still return garbage (sampling
                 // collapse, reasoning corruption). Treat that like a failure so the
                 // active connection gets a chance before any retry logic kicks in.
@@ -222,6 +223,9 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
         }
     }
 
+    if (sampling !== null) {
+        return abortable(generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling }), signal);
+    }
     const request = activeQueue.then(async () => {
         throwIfAborted(signal);
         await waitForegroundIdle(signal);
@@ -231,11 +235,21 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
     return abortable(request, signal);
 }
 
-async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal }) {
+function samplingPayload(sampling, isChatCompletion, source) {
+    const values = normalizeStepSampling(sampling);
+    // OpenAI/Claude/Gemini have no repetition-penalty control. The ST backend
+    // handles further provider-specific translation of supported parameters.
+    if (isChatCompletion && ['openai', 'claude', 'makersuite', 'vertexai'].includes(source)) delete values.repetition_penalty;
+    if (!isChatCompletion) Object.assign(values, { rep_pen: values.repetition_penalty, repeat_penalty: values.repetition_penalty });
+    return values;
+}
+
+async function generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling }) {
     throwIfAborted(signal);
     const isChatCompletion = (profile.mode ?? 'cc') === 'cc';
     let payloadPrompt;
-    const overridePayload = {};
+    const source = getContext().CONNECT_API_MAP?.[profile.api]?.source;
+    const overridePayload = sampling !== null ? samplingPayload(sampling, isChatCompletion, source) : {};
 
     if (isChatCompletion) {
         const messages = [];
@@ -266,8 +280,8 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
         stream: false,
         signal,
         extractData: true,
-        includePreset: true,
-        includeInstruct: true,
+        includePreset: sampling === null,
+        includeInstruct: sampling === null,
     }, overridePayload);
 
     // If the service returns a stream factory despite the non-streaming request,
@@ -290,6 +304,41 @@ async function generateViaService(service, profile, { systemPrompt, prompt, maxT
         content: String(result?.content ?? ''),
         reasoning: String(result?.reasoning ?? ''),
     };
+}
+
+/** Use only active connection routing, never its generation preset or raw settings. */
+async function generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling }) {
+    throwIfAborted(signal);
+    const chat = context.mainApi === 'openai';
+    const text = context.mainApi === 'textgenerationwebui';
+    const service = chat ? context.ChatCompletionService : text ? context.TextCompletionService : null;
+    if (typeof service?.processRequest !== 'function') {
+        throw new Error('Isolated step sampling needs a saved Connection Manager profile or an active Chat/Text Completion connection with request-service support.');
+    }
+    const settings = chat ? context.chatCompletionSettings ?? {} : context.textCompletionSettings ?? {};
+    const payload = { stream: false, max_tokens: maxTokens, ...samplingPayload(sampling, chat, settings.chat_completion_source) };
+    if (chat) {
+        // Explicit allowlist: connection endpoints/auth only, no sampling, prompts,
+        // reasoning effort, prefill, stop strings, or global custom request body.
+        for (const key of ['chat_completion_source', 'custom_url', 'reverse_proxy', 'proxy_password', 'vertexai_region',
+            'zai_endpoint', 'siliconflow_endpoint', 'minimax_endpoint', 'pollinations_endpoint', 'workers_ai_account_id']) {
+            if (settings[key] !== undefined) payload[key] = settings[key];
+        }
+        payload.model = context.getChatCompletionModel?.();
+        payload.messages = [...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+            ...(Array.isArray(prompt) ? prompt : prompt ? [{ role: 'user', content: prompt }] : [])];
+        if (jsonSchema) payload.response_format = { type: 'json_schema', json_schema: { name: jsonSchema.name ?? 'response', schema: jsonSchema.value ?? jsonSchema, strict: jsonSchema.strict === true } };
+    } else {
+        payload.api_type = settings.type;
+        payload.api_server = settings.server_urls?.[settings.type];
+        const getTextGenModel = context.getTextGenModel ?? (await import('../../../../textgen-settings.js')).getTextGenModel;
+        payload.model = getTextGenModel(settings);
+        payload.prompt = [systemPrompt, flattenMessages(prompt)].filter(Boolean).join('\n\n');
+        if (jsonSchema) payload.prompt += `\n\nRespond with ONLY JSON conforming to:\n${JSON.stringify(jsonSchema.value ?? jsonSchema)}`;
+    }
+    const result = await service.processRequest(payload, {}, true, signal);
+    throwIfAborted(signal);
+    return { content: String(result?.content ?? ''), reasoning: String(result?.reasoning ?? '') };
 }
 
 /** Connection Manager wraps provider errors in Error.cause. */

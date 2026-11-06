@@ -8,6 +8,7 @@
 import { getContext } from '../../../../extensions.js';
 import {
     DEFAULT_FIELDS, DEFAULT_STEPS, DEFAULT_REFINEMENT_STEPS, STEP_ROLES,
+    normalizeStepSampling,
     getSettings, saveSettings, getChatStore, allStoredProfiles, clearAllProfiles,
     resolveTargetChar, getGroupMembers, getMainCharacter, charKey,
     getStoredProfile, setStoredProfile, log,
@@ -999,7 +1000,28 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
                     </div>
                 </div>
                 <textarea class="smarttavern_step_prompt" rows="6" placeholder="${escapeHtml(placeholder)}">${escapeHtml(step.prompt)}</textarea>
+                <div class="smarttavern_step_sampling">
+                    <button type="button" class="menu_button smarttavern_sampling_toggle" aria-expanded="false"><i class="fa-solid fa-sliders"></i> Sampling</button>
+                    <div class="smarttavern_sampling_fields" hidden>
+                        <div class="smarttavern_hint">This step uses its own sampling, without importing ST preset or instruct settings. Other parameters use provider defaults. Unsupported controls may be ignored or rejected by the API.</div>
+                        ${Object.entries(normalizeStepSampling(step.sampling)).map(([key, value]) => `<label>${({ temperature: 'Temperature', repetition_penalty: 'Repetition penalty', presence_penalty: 'Presence penalty', frequency_penalty: 'Frequency penalty' })[key]}
+                            <input class="text_margin_input" data-sampling="${key}" type="number" min="${key === 'temperature' || key === 'repetition_penalty' ? 0 : -2}" max="2" step="0.05" value="${value}"></label>`).join('')}
+                    </div>
+                </div>
             </div>`);
+        card.find('.smarttavern_sampling_toggle').on('click', function () {
+            const fields = card.find('.smarttavern_sampling_fields').get(0);
+            fields.hidden = !fields.hidden;
+            $(this).attr('aria-expanded', String(!fields.hidden));
+        });
+        card.find('[data-sampling]').on('change', function () {
+            const values = normalizeStepSampling(steps[index].sampling);
+            const key = this.dataset.sampling;
+            const value = this.value === '' ? NaN : Number(this.value);
+            steps[index].sampling = normalizeStepSampling({ ...values, [key]: value });
+            this.value = String(steps[index].sampling[key]);
+            saveSettings();
+        });
         // Header click collapses the card; interactive controls are excluded.
         card.find('.smarttavern_step_header').on('click', (event) => {
             if ($(event.target).closest('input, select, label, a, .menu_button').length) return;
@@ -1038,7 +1060,7 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
         card.find('.smarttavern_step_up').on('click', () => moveArrayItem(steps, index, -1, () => { saveSettings(); renderStepEditor(); }));
         card.find('.smarttavern_step_down').on('click', () => moveArrayItem(steps, index, +1, () => { saveSettings(); renderStepEditor(); }));
         card.find('.smarttavern_step_duplicate').on('click', () => {
-            const copy = { ...steps[index], name: `${steps[index].name} copy` };
+            const copy = { ...structuredClone(steps[index]), name: `${steps[index].name} copy` };
             steps.splice(index + 1, 0, copy);
             saveSettings();
             renderStepEditor();

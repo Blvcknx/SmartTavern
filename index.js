@@ -58,7 +58,13 @@ async function initSmartTavern() {
     // Refinement pipeline: refine the fresh reply once it is rendered, then run the
     // profile auto-update so it reads the refined message (never in parallel).
     const refineEvent = events.CHARACTER_MESSAGE_RENDERED ?? events.MESSAGE_RECEIVED;
-    context.eventSource.on(refineEvent, onCharacterMessageRendered);
+    context.eventSource.on(refineEvent, (messageId, type) => {
+        // ST awaits render listeners before emitting GENERATION_ENDED. Active
+        // connection calls wait for that event, so returning the refinement promise
+        // here would stall both sides until gen.js's 60-second safety cap.
+        // The async handler catches errors and keeps profile maintenance ordered.
+        void onCharacterMessageRendered(messageId, type);
+    });
 
     try {
         initUI();

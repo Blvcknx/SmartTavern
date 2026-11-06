@@ -72,6 +72,16 @@ export const DEFAULT_STEPS = Object.freeze([
 // that touches 10% of the reply costs a fraction of a full rewrite's output
 // tokens, which makes refinement drastically faster. 'full' keeps the classic
 // whole-reply <revised_reply> contract.
+export const STEP_SAMPLING = Object.freeze({ temperature: 0.7, repetition_penalty: 1, presence_penalty: 0, frequency_penalty: 0 });
+
+export function normalizeStepSampling(value) {
+    return Object.fromEntries(Object.entries(STEP_SAMPLING).map(([key, fallback]) => {
+        const number = value?.[key];
+        const min = key === 'temperature' || key === 'repetition_penalty' ? 0 : -2;
+        return [key, typeof number === 'number' && Number.isFinite(number) ? Math.max(min, Math.min(2, number)) : fallback];
+    }));
+}
+
 export const LEGACY_SURGICAL_REFINEMENT_STEPS = Object.freeze([
     {
         name: 'Body & Spatial Awareness',

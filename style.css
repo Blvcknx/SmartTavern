@@ -341,9 +341,25 @@
     transform: rotate(-90deg);
 }
 
+.smarttavern_step_card.collapsed .smarttavern_step_sampling,
 .smarttavern_step_card.collapsed .smarttavern_step_prompt,
 .smarttavern_step_card.collapsed .smarttavern_step_profile {
     display: none;
+}
+
+.smarttavern_step_sampling {
+    padding: 8px;
+}
+
+.smarttavern_sampling_fields:not([hidden]) {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.smarttavern_sampling_fields .smarttavern_hint {
+    grid-column: 1 / -1;
 }
 
 /* Avatar context menu (RMB / long-press) */
