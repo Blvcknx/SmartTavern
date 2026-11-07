@@ -35,7 +35,7 @@ import {
 } from './agent.js';
 import { rollsMacroText } from './agent-core.js';
 import { planExpansion } from './planner.js';
-import { askPlannerUser, userAnswersContext } from './user-context.js';
+import { askPlannerUser, savedUserAnswers, userAnswersContext } from './user-context.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
 
@@ -457,7 +457,7 @@ export function injectEphemeral(chatArr, text, settings, role = 'assistant', ind
 // Pipeline
 // --------------------------------------------------------------------------------------------
 
-async function runSteps({ char, profile, chat, settings, signal, dryRun = false, type = 'normal' }) {
+async function runSteps({ char, profile, chat, settings, signal, dryRun = false, type = 'normal', userAnswers = [] }) {
     const stepOutputs = Object.create(null);
     const steps = (Array.isArray(settings.steps) ? settings.steps : [])
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
@@ -477,14 +477,14 @@ async function runSteps({ char, profile, chat, settings, signal, dryRun = false,
             const expanded = expandMacros(step.prompt, resolve);
             if (step.kind === 'user') {
                 const output = await askPlannerUser(substituteParamsSafe(expanded), { signal, dryRun,
-                    replay: ['swipe', 'regenerate', 'continue'].includes(type) });
+                    replay: ['swipe', 'regenerate', 'continue'].includes(type), answers: userAnswers });
                 stepOutputs[step.name] = output;
                 stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, skipped: !output };
                 activityStepState(index, output ? 'done' : 'skipped');
                 activityEntry({ title: `User context · ${label}`, text: output || 'No answer supplied; continue without assumptions.', tone: 'info' });
                 return;
             }
-            const userContext = settings.agentEngine !== 'legacy' ? userAnswersContext() : '';
+            const userContext = settings.agentEngine !== 'legacy' ? userAnswersContext(userAnswers) : '';
             const text = substituteParamsSafe([step.generated ? `${step.sharedContext}\n\n[TASK]\n${expanded}` : expanded,
                 userContext].filter(Boolean).join('\n\n'));
             const result = await withInternalGeneration(() => generateWithRetry({
@@ -608,10 +608,12 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             settings = { ...settings, steps: planned.steps };
             if (!isCurrentChat()) return null;
         }
+        // Disposable answers belong to this invocation only; only explicit opt-ins survive.
+        const userAnswers = plannerMode ? [...savedUserAnswers()] : [];
         let stepOutputs = Object.create(null);
         let stepStats = [];
         if (expand) {
-            ({ stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings, signal: control.signal, dryRun: isDryRun, type }));
+            ({ stepOutputs, stepStats } = await runSteps({ char, profile, chat: arr, settings, signal: control.signal, dryRun: isDryRun, type, userAnswers }));
         } else {
             activitySteps({ names: [] }); // no expansion chips to show
         }
@@ -675,7 +677,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         }
         // Templates may reference these macros anywhere. Relocate their complete
         // sections so the directive is still last and the brief directly precedes it.
-        const savedUserContext = expand && plannerMode ? userAnswersContext() : '';
+        const savedUserContext = expand && plannerMode ? userAnswersContext(userAnswers) : '';
         const turnSections = [savedUserContext, briefText, directive?.text ?? ''].filter(Boolean);
         for (const section of turnSections) injectionText = injectionText.split(section).join('').trim();
         injectionText = [injectionText, ...turnSections].filter(Boolean).join('\n\n');

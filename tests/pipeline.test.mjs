@@ -253,7 +253,7 @@ const agentOptions = h => ({ chat: [...h.savedChat], char: h.context.characters[
 const lockDifficulty = 'The lock is difficult for Alice; interpret the roll against her limited experience.';
 const lockRoll = `<tool name="roll_dice">${JSON.stringify({ reason: 'Pick the lock', difficulty: lockDifficulty })}</tool>`;
 
-test('planner user blocks save answers, feed dependent assessments, survive reload, and stay chat-local', async () => {
+test('explicitly kept planner answers feed dependent assessments, survive reload, and stay chat-local', async () => {
     let popups = 0;
     const h = await harness({ agentProfileId: 'model', steps: [], injectAnchor: 'prompt-end' }, async (messages, index) => {
         if (index === 1) return { content: '## User: Destination\nWhere do you want to go?\n## Expansion: Route\nPlan travel using {{step:Destination}}.' };
@@ -263,6 +263,8 @@ test('planner user blocks save answers, feed dependent assessments, survive relo
         popups++;
         assert.equal(popup.options.okButton, 'Submit');
         assert.equal(popup.options.cancelButton, 'Skip');
+        assert.equal(popup.content.children[2].children[0].checked, false);
+        popup.content.children[2].children[0].checked = true;
         popup.value = ' The harbor ';
         return 1;
     } });
@@ -283,6 +285,46 @@ test('planner user blocks save answers, feed dependent assessments, survive relo
     assert.match(history.map(message => message.mes).join('\n'), /USER CONTEXT/);
     reloaded.context.chatMetadata = {};
     assert.equal(reloaded.state.getChatStore().userAnswers, undefined);
+});
+
+test('planner answers are disposable by default and ignore previously auto-saved answers', async () => {
+    let popups = 0;
+    const settings = { agentProfileId: 'model', steps: [], injectAnchor: 'before-last-user' };
+    const respond = async (messages, index) => {
+        const prompt = messages.map(message => message.content).join('\n');
+        assert.ok(!prompt.includes('Old automatic answer'));
+        if (index % 2 === 1) {
+            assert.ok(!prompt.includes('The harbor'));
+            return { content: '## User: Destination\nWhere do you want to go?\n## Expansion: Route\nPlan using {{step:Destination}}.' };
+        }
+        assert.match(prompt, /Answer: The harbor/);
+        return { content: 'Use the harbor road.' };
+    };
+    const onPopup = popup => {
+        popups++;
+        assert.equal(popup.content.children[2].children[0].checked, false);
+        popup.value = 'The harbor';
+        return 1;
+    };
+    const h = await harness(settings, respond, { planner: true, realAgent: true, onPopup });
+    h.state.getChatStore().userAnswers = [{ question: 'Where do you want to go?', answer: 'Old automatic answer' }];
+    const chat = [...h.savedChat];
+    for (let turn = 0; turn < 2; turn++) {
+        const result = await h.pipeline.runPipeline({ chat });
+        assert.match(result.stepOutputs.Route, /harbor road/);
+        assert.match(result.injectionText, /Answer: The harbor/);
+        assert.equal(h.state.getChatStore().userAnswers.length, 1);
+    }
+    assert.equal(popups, 2);
+    const reloaded = await harness(settings, async messages => {
+        const prompt = messages.map(message => message.content).join('\n');
+        assert.ok(!prompt.includes('The harbor'));
+        assert.ok(!prompt.includes('Old automatic answer'));
+        return { content: 'NO ADDITIONS' };
+    }, { planner: true, realAgent: true, onPopup: () => { throw new Error('Unexpected question'); } });
+    reloaded.context.chatMetadata = JSON.parse(JSON.stringify(h.context.chatMetadata));
+    const result = await reloaded.pipeline.runPipeline({ chat: [...reloaded.savedChat] });
+    assert.ok(!result.injectionText.includes('USER CONTEXT'));
 });
 
 test('skipped user questions do not save answers and dependent blocks still run', async () => {
