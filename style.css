@@ -1255,3 +1255,36 @@ dialog.smarttavern_user_popup {
 #smarttavern_panel #smarttavern_ruling_question {
     flex: 1 1 auto;
 }
+
+/* Lean context: per-field inject controls and per-step activation / reuse / priority row. */
+.smarttavern_field_row {
+    flex-wrap: wrap;
+}
+
+.smarttavern_field_row .smarttavern_field_keywords {
+    flex: 1 1 100%;
+}
+
+.smarttavern_step_lean {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.smarttavern_step_lean .smarttavern_step_priority {
+    width: 64px;
+}
+
+.smarttavern_step_lean .smarttavern_step_keywords_wrap {
+    flex: 1 1 100%;
+}
+
+.smarttavern_step_lean .smarttavern_step_keywords {
+    width: 100%;
+}
+
+.smarttavern_step_card.collapsed .smarttavern_step_lean {
+    display: none;
+}

@@ -1,5 +1,6 @@
 // SmartTavern — settings, per-chat profile store, character resolution and shared helpers.
 import { getContext } from '../../../../extensions.js';
+import { ACTIVATIONS, FIELD_INJECT_MODES, DEFAULT_PRIORITY } from './lean-core.js';
 
 export const MODULE_NAME = 'SmartTavern';
 export const LOG_PREFIX = '[SmartTavern]';
@@ -11,17 +12,74 @@ export const STORE_VERSION = 1;
 // reaches internal prompts essentially uncut.
 export const MAX_EXCERPT_MESSAGE_CHARS = 100000;
 
+// Per-field `inject` decides what the REPLY model sees (internal prompts always get the
+// full profile): 'always', 'relevant' (planner-listed or keyword-matched; see lean-core.js)
+// or 'never'. Optional `keywords` feed the 'relevant' mode.
 export const DEFAULT_FIELDS = Object.freeze([
-    { name: 'Brief Summary', description: 'One short paragraph distilling who the character is right now.' },
-    { name: 'Appearance', description: 'The character\'s current appearance, clothing and notable physical details.' },
-    { name: 'Background', description: 'A long, winding account of the character\'s life and history up to the present. May accumulate detail over time.' },
-    { name: 'Personality', description: 'Personality, temperament, mannerisms and speech patterns, including sexual preferences. Should remain essentially stable over time.', stable: true },
-    { name: 'Aspirations', description: 'What the character wants, strives for and dreams of.', stable: true },
-    { name: 'Fears', description: 'What the character fears, avoids and dreads.', stable: true },
-    { name: 'Values', description: 'Political, ethical, moral and religious values and convictions.', stable: true },
+    { name: 'Brief Summary', description: 'One short paragraph distilling who the character is right now.', inject: 'always' },
+    { name: 'Appearance', description: 'The character\'s current appearance, clothing and notable physical details.', inject: 'relevant' },
+    { name: 'Background', description: 'A long, winding account of the character\'s life and history up to the present. May accumulate detail over time.', inject: 'never' },
+    { name: 'Personality', description: 'Personality, temperament, mannerisms and speech patterns, including sexual preferences. Should remain essentially stable over time.', stable: true, inject: 'always' },
+    { name: 'Aspirations', description: 'What the character wants, strives for and dreams of.', stable: true, inject: 'relevant' },
+    { name: 'Fears', description: 'What the character fears, avoids and dreads.', stable: true, inject: 'relevant' },
+    { name: 'Values', description: 'Political, ethical, moral and religious values and convictions.', stable: true, inject: 'relevant' },
 ]);
 
 export const DEFAULT_STEPS = Object.freeze([
+    {
+        name: 'Physical Condition',
+        enabled: true,
+        role: 'assistant',
+        profileId: '',
+        lookback: null,
+        reuseUnchanged: true,
+        prompt: [
+            'You are narrating the body of {{char}}.',
+            '',
+            'Character profile:',
+            '{{definitions}}',
+            '',
+            'Previous assessment:',
+            '{{previous}}',
+            '',
+            'Recent conversation:',
+            '{{chat}}',
+            '',
+            'Task: Describe {{char}}\'s immediate PHYSICAL state only — health, injuries, pain, exhaustion, arousal, breathing, posture and energy level. Be concrete and consistent with the profile and the recent events. Write in second person ("you"). 3–6 sentences. No preamble, no headings, no out-of-character commentary.',
+            'If nothing relevant changed since the previous assessment, output exactly UNCHANGED.',
+        ].join('\n'),
+    },
+    {
+        name: 'Mental Condition',
+        enabled: true,
+        role: 'assistant',
+        profileId: '',
+        lookback: null,
+        reuseUnchanged: true,
+        prompt: [
+            'You are narrating the mind of {{char}}.',
+            '',
+            'Character profile:',
+            '{{definitions}}',
+            '',
+            'Physical state (just assessed):',
+            '{{step:Physical Condition}}',
+            '',
+            'Previous assessment:',
+            '{{previous}}',
+            '',
+            'Recent conversation:',
+            '{{chat}}',
+            '',
+            'Task: Describe {{char}}\'s immediate MENTAL and EMOTIONAL state — mood, thoughts, desires and what they are fixated on right now. It must be consistent with the profile\'s Personality, Values, Fears and Aspirations, and with the physical state that was just assessed. Write in second person ("you"). 3–6 sentences. No preamble, no headings, no out-of-character commentary.',
+            'If nothing relevant changed since the previous assessment, output exactly UNCHANGED.',
+        ].join('\n'),
+    },
+]);
+
+// The previous default expansion prompts, kept verbatim so a saved step still carrying one
+// (exact match) upgrades to the reusable-assessment prompt below exactly once.
+export const LEGACY_EXPANSION_STEPS = Object.freeze([
     {
         name: 'Physical Condition',
         enabled: true,
@@ -317,6 +375,12 @@ export const DEFAULT_SETTINGS = Object.freeze({
     // connection. Every fallback is reported in the activity log and a toast.
     fallbackToActive: true,
     stepExecution: 'dependencies',
+    // Lean context. Expansion steps may be gated (`activation`: always | keywords |
+    // planner) by keywords found in the last `activationScanDepth` non-system messages;
+    // `tailMaxTokens` caps the prompt-end reply tail (0 = off; lowest-priority whole
+    // sections are dropped first). See lean-core.js.
+    activationScanDepth: 2,
+    tailMaxTokens: 0,
     // Internal LLM calls (pipeline steps, profile bootstrap/update) are retried when
     // they fail, come back empty, or collapse into a repetition loop. `genRetries`
     // counts EXTRA attempts after the first; the delay grows linearly per attempt.
@@ -645,6 +709,61 @@ function normalizeSettings(settings) {
             field.stable = LEGACY_STABLE_FIELDS.includes(String(field.name ?? '').trim().toLowerCase());
         }
         settings.stableFieldsVersion = 1;
+        changed = true;
+    }
+    // Lean context. Existing configs keep their old behaviour: every field is injected
+    // 'always', every block 'always' active, nothing reused, no tail budget.
+    const scanDepth = clampInt(settings.activationScanDepth, 1, 20, DEFAULT_SETTINGS.activationScanDepth);
+    if (settings.activationScanDepth !== scanDepth) {
+        settings.activationScanDepth = scanDepth;
+        changed = true;
+    }
+    const tailMaxTokens = clampInt(settings.tailMaxTokens, 0, 32000, 0);
+    if (settings.tailMaxTokens !== tailMaxTokens) {
+        settings.tailMaxTokens = tailMaxTokens;
+        changed = true;
+    }
+    for (const step of (Array.isArray(settings.steps) ? settings.steps : [])) {
+        if (!isPlainObject(step)) continue;
+        if (!ACTIVATIONS.includes(step.activation)) {
+            step.activation = 'always';
+            changed = true;
+        }
+        if (typeof step.keywords !== 'string') {
+            step.keywords = '';
+            changed = true;
+        }
+        if (typeof step.reuseUnchanged !== 'boolean') {
+            step.reuseUnchanged = false;
+            changed = true;
+        }
+        const priority = clampInt(step.priority, 0, 100, DEFAULT_PRIORITY);
+        if (step.priority !== priority) {
+            step.priority = priority;
+            changed = true;
+        }
+    }
+    for (const field of (Array.isArray(settings.fields) ? settings.fields : [])) {
+        if (!isPlainObject(field)) continue;
+        if (!FIELD_INJECT_MODES.includes(field.inject)) {
+            field.inject = 'always';
+            changed = true;
+        }
+        if (typeof field.keywords !== 'string') {
+            field.keywords = '';
+            changed = true;
+        }
+    }
+    // Saved Physical / Mental Condition steps still carrying the exact old default prompt
+    // move to the reusable-assessment prompt; custom prompts are never touched.
+    if (settings.leanContextVersion !== 1) {
+        for (const step of (Array.isArray(settings.steps) ? settings.steps : [])) {
+            if (!isPlainObject(step)) continue;
+            if (!LEGACY_EXPANSION_STEPS.some(preset => preset.name === step.name && preset.prompt === step.prompt)) continue;
+            step.prompt = DEFAULT_STEPS.find(preset => preset.name === step.name).prompt;
+            step.reuseUnchanged = true;
+        }
+        settings.leanContextVersion = 1;
         changed = true;
     }
     if (changed) saveSettings();

@@ -54,7 +54,7 @@ function extract(text, tail) {
     };
 }
 
-const PROFILE_POINTER = '(the living profile is given in the character description above)';
+export const PROFILE_POINTER = '(the living profile is given in the character description above)';
 
 /**
  * With the living description override on, the profile already sits in the card

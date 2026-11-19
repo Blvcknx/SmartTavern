@@ -78,3 +78,27 @@ test('budgeting removes oldest whole messages, then preserves the newest suffix'
     assert.ok(fitted[0].length < 200);
     await assert.rejects(fitHistory({ history: ['x'], fixed: 'fixed', budget: 3, count }), /instructions and block definitions/);
 });
+
+test('skip headings only accept planner-activated blocks and free their slots; fields are validated', () => {
+    const existing = [{ name: 'Keep' }, { name: 'Maybe', activation: 'planner' }, { name: 'Also', activation: 'planner' }, { name: 'D' }, { name: 'E' }];
+    const result = parseExpansionPlan(`## Skip: maybe
+Nothing new this turn.
+## Skip: Keep
+nope
+## Skip: Ghost
+## Skip: Maybe
+duplicate
+## Fields: appearance, Fears, none, Unknown
+## Expansion: New one
+Prompt
+## Expansion: Another
+Prompt two`, existing, { fieldNames: ['Appearance', 'Fears', 'Background'] });
+    assert.deepEqual(result.skips, [{ name: 'Maybe', reason: 'Nothing new this turn.' }]);
+    assert.deepEqual(result.fields, ['Appearance', 'Fears']);
+    // Five existing, one skipped: exactly one slot is free.
+    assert.deepEqual(result.additions.map(block => block.name), ['New one']);
+    assert.equal(result.issues.length, 3);
+    assert.equal(parseExpansionPlan('## Skip: Maybe', existing).issues.length, 0);
+    assert.equal('skips' in parseExpansionPlan('NO ADDITIONS'), false);
+    assert.deepEqual(parseExpansionPlan('## Fields:\nBackground, Fears', [], { fieldNames: ['Background', 'Fears'] }).fields, ['Background', 'Fears']);
+});

@@ -18,14 +18,40 @@ import {
 } from './state.js';
 import { serializeProfile } from './profiles.js';
 import { isInternalGeneration } from './gen.js';
+import { selectReplyFields, scanText } from './lean-core.js';
 
 // A needle shorter than this is too likely to match unrelated prompt text ("A cat.")
 // and corrupt it — tiny descriptions are left as the card wrote them.
 const MIN_NEEDLE_CHARS = 12;
 
+// Names of the schema fields the reply model sees for the CURRENT generation (lean
+// context, per-field `inject` modes). runPipeline sets it before the prompt is assembled
+// and it is cleared when the generation ends, is stopped or the chat changes — a dry run
+// never sets it. Without a value the selection falls back to the keyword rules alone.
+let replyFieldNames = null;
+
+export function setReplyFields(fields) {
+    replyFieldNames = Array.isArray(fields) ? fields.map(field => String(field?.name ?? '')) : null;
+}
+
+export function clearReplyFields() {
+    replyFieldNames = null;
+}
+
+/** The schema fields the reply model sees right now (the full schema when every field is 'always'). */
+export function replyFields(settings = getSettings()) {
+    const fields = Array.isArray(settings.fields) ? settings.fields : [];
+    if (replyFieldNames) return fields.filter(field => replyFieldNames.includes(String(field?.name ?? '')));
+    return selectReplyFields(fields, { recentText: scanText(getContext().chat, settings.activationScanDepth) });
+}
+
 export function initDescriptionOverride() {
     const context = getContext();
     const events = context.event_types ?? context.eventTypes;
+    const reset = () => { if (!isInternalGeneration()) clearReplyFields(); };
+    context.eventSource.on(events.GENERATION_ENDED, reset);
+    context.eventSource.on(events.GENERATION_STOPPED, reset);
+    context.eventSource.on(events.CHAT_CHANGED, clearReplyFields);
     const onLast = context.eventSource.makeLast?.bind(context.eventSource)
         ?? context.eventSource.on.bind(context.eventSource);
     onLast(events.CHAT_COMPLETION_PROMPT_READY, onChatCompletionPrompt);
@@ -47,8 +73,7 @@ function overrideActive(event) {
  * description, so each member's needle matches inside the joined block).
  */
 function replacementTargets() {
-    const settings = getSettings();
-    const fields = Array.isArray(settings.fields) ? settings.fields : [];
+    const fields = replyFields();
     const context = getContext();
     const chars = context.groupId ? getGroupMembers() : [getMainCharacter()];
     const targets = [];

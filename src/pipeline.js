@@ -16,7 +16,7 @@ import {
     log, warn, getSettings, getStory,
     cardText, chatExcerpt, charKey, getChatStore, getStoredProfile,
     resolveTargetChar, resolveMemberByMessageName, getMainCharacter, isPlainObject,
-    clampInt, substituteParamsSafe, STEP_ROLES, captureChatScope,
+    clampInt, substituteParamsSafe, STEP_ROLES, captureChatScope, saveChatStore,
 } from './state.js';
 import { system_message_types } from '../../../../system-messages.js';
 import { generateWithRetry, withInternalGeneration, isInternalGeneration, createGenerationControl, isAbortError, throwIfAborted, withInterceptorScope } from './gen.js';
@@ -24,7 +24,14 @@ import { bootstrapProfile, serializeProfile } from './profiles.js';
 import { activityStart, activityStatus, activityEntry, activityFail, activityEnd, activitySteps, activityStepState, activityRefinementControls } from './progress.js';
 import { refinementPhase, refinementIssues, hasRefinedPayload, parseDraftEdits, editIssues, applyDraftEdits, numberedDraft, paragraphBlocks, stripThinkBlocks } from './refinement-checks.js';
 import { applyVeil, setVeilStep, setVeilStatus, revealVeil, dismissVeil, armPreVeil } from './veil.js';
-import { stagePromptTail, clearPromptTail } from './tail.js';
+import { stagePromptTail, clearPromptTail, PROFILE_POINTER } from './tail.js';
+import { setReplyFields, clearReplyFields, livingProfileTexts } from './description.js';
+import {
+    scanText, partitionByActivation, stepActivation, selectReplyFields, isUnchangedOutput, anchorIndex,
+    previousFromMemory, NO_PREVIOUS, estimateTokens, planTailBudget,
+    PRIORITY_BRIEF, PRIORITY_USER_ANSWERS, PRIORITY_PROFILE, DEFAULT_PRIORITY,
+} from './lean-core.js';
+import { configuredBlocks } from './planner-core.js';
 import {
     prepareStoryDirective, storyMacroContext, hasStory,
     markStoryBeatDelivered, recordDirectiveInjection, resetStoryGenerationState,
@@ -199,6 +206,8 @@ function recordLastRun(result, pipeline, source) {
         brief: result.brief ?? '',
         agentTranscript: result.agentTranscript ?? null,
         planner: result.planner ?? null,
+        activation: result.activation ?? { skipped: [], inactive: [] },
+        tail: result.tail ?? null,
         effectiveSteps: result.effectiveSteps ?? [],
         surfacedRulings: result.surfacedRulings ?? [],
         source,
@@ -308,8 +317,12 @@ export function turnEnforcementActive(settings = getSettings()) {
  * working draft: surgical passes pass the numbered rendering as `currentDraft` and
  * the plain text as `draftPlain`, so {{draft}} shows the numbered paragraphs while
  * {{draft_plain}} / {{draft_paragraphs}} still resolve usefully.
+ * Lean context: `previous` is the step's stored previous output for {{previous}};
+ * `definitionsFields` (the reply model's field subset) and `definitionsText` (a fixed
+ * replacement, e.g. '' when the budget dropped the profile) override {{definitions}} —
+ * only the reply tail / history header pass them; internal prompts keep the full profile.
  */
-export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, step = null, stepsList = null, currentDraft = null, originalDraft = null, draftPlain = null, draftMessageId = null, story = null, agent = null }) {
+export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, step = null, stepsList = null, currentDraft = null, originalDraft = null, draftPlain = null, draftMessageId = null, story = null, agent = null, previous = null, definitionsFields = null, definitionsText = null }) {
     const fieldLookup = new Map((settings.fields ?? []).map(f => [String(f?.name ?? '').trim().toLowerCase(), String(f?.name ?? '')]));
     const list = Array.isArray(stepsList) ? stepsList : (Array.isArray(settings.steps) ? settings.steps : []);
     const stepLookup = new Map(list.map(s => [String(s?.name ?? '').trim().toLowerCase(), String(s?.name ?? '')]));
@@ -337,7 +350,11 @@ export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, 
             return base ? numberedDraft(base) : '';
         }
         if (m === 'original_draft') return originalDraft ?? '';
-        if (m === 'definitions') return serializeProfile(profile, settings.fields ?? []) || '(no profile stored yet)';
+        if (m === 'definitions') {
+            if (definitionsText !== null) return definitionsText;
+            return serializeProfile(profile, definitionsFields ?? settings.fields ?? []) || '(no profile stored yet)';
+        }
+        if (m === 'previous') return previous || NO_PREVIOUS;
         if (m === 'chat') return chatExcerpt(excerptChat, lookback);
         const chatN = m.match(/^chat:(\d+)$/);
         if (chatN) return chatExcerpt(excerptChat, Number(chatN[1]));
@@ -392,13 +409,13 @@ function stepBlocks(stepsList, stepOutputs) {
     return parts;
 }
 
-export function assembleInjection({ settings, char, profile, chat, stepOutputs, story = null }) {
-    return assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs, story })
+export function assembleInjection({ settings, char, profile, chat, stepOutputs, story = null, definitionsFields = null }) {
+    return assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs, story, definitionsFields })
         .map(block => block.text).join('\n\n');
 }
 
-export function assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs, story = null }) {
-    const resolve = makeMacroResolver({ char, profile, chat, stepOutputs, settings, story });
+export function assembleInjectionBlocks({ settings, char, profile, chat, stepOutputs, story = null, definitionsFields = null }) {
+    const resolve = makeMacroResolver({ char, profile, chat, stepOutputs, settings, story, definitionsFields });
     const parts = [];
     const roleFor = step => STEP_ROLES.includes(step?.role) ? step.role : 'assistant';
     const add = (text, role) => { if (text) parts.push({ text, role }); };
@@ -471,6 +488,22 @@ async function runSteps({ char, profile, chat, settings, signal, dryRun = false,
         .filter(s => s && s.enabled !== false && String(s?.prompt ?? '').trim());
     const stepStats = steps.map(step => ({ name: step.name || 'Unnamed step', chars: 0, elapsedMs: 0, skipped: true }));
     activitySteps({ names: steps.map(s => s.name || 'Unnamed step') });
+    // Reusable assessments: each step's previous output lives in chat metadata, anchored
+    // to the saved chat message that was last when it was produced (see previousFromMemory).
+    const savedChat = getContext().chat ?? [];
+    const anchorAt = anchorIndex(savedChat, chat);
+    const memory = getChatStore().stepMemory;
+    const previousFor = step => (anchorAt >= 0 && step.generated !== true && step.kind !== 'user' && isPlainObject(memory) && Object.hasOwn(memory, step.name))
+        ? previousFromMemory(memory[step.name], savedChat, anchorAt) : '';
+    const remember = (step, text) => {
+        // Only real generations store; a dry run must not move the anchor of a live chat.
+        if (dryRun || anchorAt < 0 || !text || step.generated === true || step.kind === 'user' || step.name === '__proto__') return;
+        if (step.reuseUnchanged !== true && !/\{\{\s*previous\s*\}\}/i.test(String(step.prompt))) return;
+        const store = getChatStore();
+        if (!isPlainObject(store.stepMemory)) store.stepMemory = {};
+        store.stepMemory[step.name] = { text, sourceIndex: anchorAt, sourceText: String(savedChat[anchorAt]?.mes ?? '') };
+        saveChatStore();
+    };
     const runStep = async (step, index) => {
         const label = step.name || 'Unnamed step';
         activityStatus(`Step ${index + 1}/${steps.length} · ${label}`);
@@ -481,7 +514,8 @@ async function runSteps({ char, profile, chat, settings, signal, dryRun = false,
             const earlierOutputs = Object.fromEntries(steps.slice(0, index)
                 .filter(previous => Object.hasOwn(stepOutputs, previous.name))
                 .map(previous => [previous.name, stepOutputs[previous.name]]));
-            const resolve = makeMacroResolver({ char, profile, chat, stepOutputs: earlierOutputs, settings, stepsList: steps, step });
+            const previous = previousFor(step);
+            const resolve = makeMacroResolver({ char, profile, chat, stepOutputs: earlierOutputs, settings, stepsList: steps, step, previous });
             const expanded = expandMacros(step.prompt, resolve);
             if (step.kind === 'user') {
                 const output = await askPlannerUser(substituteParamsSafe(expanded), { signal, dryRun,
@@ -504,14 +538,21 @@ async function runSteps({ char, profile, chat, settings, signal, dryRun = false,
                 prompt: text,
                 maxTokens: settings.stepMaxTokens,
             }));
-            const output = String(result?.content ?? '').trim();
+            let output = String(result?.content ?? '').trim();
+            // "UNCHANGED" answers reuse the stored previous output; without one they are empty.
+            let reused = false;
+            if (step.reuseUnchanged === true && isUnchangedOutput(output)) {
+                reused = Boolean(previous);
+                output = previous;
+            }
             stepOutputs[step.name] = output;
-            stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, failed: false };
+            stepStats[index] = { name: label, chars: output.length, elapsedMs: Date.now() - startedAt, failed: false, ...(reused ? { reused: true } : {}) };
             activityStepState(index, 'done');
             activityEntry({
-                title: `${label} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s · ${output.length} chars`,
+                title: `${label} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s · ${output.length} chars${reused ? ' · reused (unchanged)' : ''}`,
                 text: output,
             });
+            remember(step, output);
             log(`step "${label}" finished (${output.length} chars)`);
         } catch (error) {
             if (isAbortError(error)) throw error;
@@ -572,6 +613,8 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
 
     if (inject) {
         clearPromptTail();
+        // The previous generation's reply-field selection must never reach this one.
+        clearReplyFields();
         sweepEphemeral(arr);
     }
 
@@ -607,12 +650,27 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         });
 
         const expand = settings.expansionEnabled !== false;
+        // Lean context: keyword-gated blocks whose keywords are absent from the last
+        // `activationScanDepth` messages do not run (and leave no output, so {{step:Name}}
+        // resolves to ''). 'planner' blocks pass here; the planner may skip them below.
+        const scanned = scanText(arr, settings.activationScanDepth);
+        const activation = { skipped: [], inactive: [] };
+        if (expand) {
+            const gated = partitionByActivation(configuredBlocks(settings.steps), scanned);
+            activation.inactive = gated.inactive.map(item => item.name);
+            if (gated.inactive.length) {
+                const off = new Set(configuredBlocks(settings.steps).filter(step => !gated.active.includes(step)));
+                settings = { ...settings, steps: settings.steps.filter(step => !off.has(step)) };
+                activityEntry({ title: `${gated.inactive.length} block(s) not triggered`, text: activation.inactive.map(name => `Not triggered: ${name}`).join('\n'), tone: 'info' });
+            }
+        }
         let planner = null;
         if (expand && plannerMode) {
             const active = agentActiveForTurn(settings);
             if (active && inject && settings.agentMode === 'armed') consumeAgentArm();
             const planned = await planExpansion({ char, profile, chat: arr, settings, directive, signal: control.signal, active });
             planner = planned.record;
+            activation.skipped = planned.record.skips ?? [];
             settings = { ...settings, steps: planned.steps };
             if (!isCurrentChat()) return null;
         }
@@ -640,6 +698,18 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         throwIfAborted(control.signal);
         if (!isCurrentChat()) return null;
 
+        // Reply-model field set (per-field inject modes). The planner's ## Fields answer
+        // only counts when the planner ran, did not fail and actually sent the heading.
+        const replyFieldList = selectReplyFields(settings.fields ?? [], {
+            plannerFields: planner?.fields ?? null, plannerRan: Boolean(planner?.ran) && !planner?.error, recentText: scanned,
+        });
+        const leanFields = replyFieldList.length !== (settings.fields ?? []).length;
+        if (leanFields) {
+            const dropped = (settings.fields ?? []).filter(field => !replyFieldList.includes(field)).map(field => field.name);
+            activityEntry({ title: `Reply profile: ${replyFieldList.length} of ${settings.fields.length} field(s)`, text: `Not sent to the reply model: ${dropped.join(', ')}`, tone: 'info' });
+        }
+        // A dry run only reports; it must not leave a selection behind for a later generation.
+        if (inject) setReplyFields(replyFieldList);
         const storyContext = directive ? storyMacroContext(directive) : null;
         const briefText = agentResult?.brief ?? '';
         const surfacedRulings = (Array.isArray(agentResult?.turn?.rulings) ? agentResult.turn.rulings : [])
@@ -652,7 +722,6 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
                 rulingsText: surfacedRulings.map(record => record.ruling).join(' | '),
             }
             : null;
-        const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs, settings, stepsList: settings.steps, story: storyContext, agent: agentMacro });
         const hasStepBlocks = stepBlocks(settings.steps, stepOutputs).length > 0;
         // A tail template that embeds {{story}} / {{brief}} carries those sections
         // itself; otherwise they are appended below in fixed order — expansion outputs,
@@ -661,19 +730,71 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         const tailTemplate = String(settings.tailPrompt ?? '');
         const usesStoryMacro = /\{\{\s*story\s*\}\}/i.test(tailTemplate);
         const usesBriefMacro = /\{\{\s*(brief|rolls)\s*\}\}/i.test(tailTemplate);
+        const savedUserContext = expand && plannerMode ? userAnswersContext(userAnswers) : '';
+        // Prompt-end tail. Templates may reference the turn macros anywhere; their complete
+        // sections are relocated so the directive is still last and the brief directly
+        // precedes it. `drop` (tail budget) removes whole sections by re-expanding the
+        // template against the reduced set — never by cutting text.
+        const buildTail = (drop = new Set()) => {
+            const outputs = Object.assign(Object.create(null), stepOutputs);
+            for (const id of drop) if (id.startsWith('step:')) delete outputs[id.slice(5)];
+            const brief = drop.has('brief') ? '' : briefText;
+            const answers = drop.has('answers') ? '' : savedUserContext;
+            const agentView = agentMacro ? { ...agentMacro, brief } : null;
+            const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs: outputs, settings, stepsList: settings.steps,
+                story: storyContext, agent: agentView, definitionsFields: replyFieldList, definitionsText: drop.has('profile') ? '' : null });
+            let text = '';
+            if ((expand && stepBlocks(settings.steps, outputs).length > 0) || (directive && usesStoryMacro) || (brief && usesBriefMacro)) {
+                text = substituteParamsSafe(expandMacros(tailTemplate, resolve)).trim();
+            }
+            if (brief && !text.includes(brief)) text = text ? `${text}\n\n${brief}` : brief;
+            if (directive?.text && !text.includes(directive.text)) text = text ? `${text}\n\n${directive.text}` : directive.text;
+            const turn = [answers, brief, directive?.text ?? ''].filter(Boolean);
+            for (const section of turn) text = text.split(section).join('').trim();
+            return [text, ...turn].filter(Boolean).join('\n\n');
+        };
+        // Sizes the tail's sections (each one's marginal cost in the expanded tail) and, with
+        // a budget, picks the whole sections to drop. The profile inside the tail is skipped
+        // when the description override already carries it (tail.js swaps it for a pointer).
+        const planTail = budget => {
+            const full = buildTail();
+            const leanDefinitions = serializeProfile(profile, replyFieldList);
+            const profileDeduped = Boolean(leanDefinitions) && livingProfileTexts().includes(leanDefinitions);
+            const tokensOf = text => estimateTokens(profileDeduped ? text.split(leanDefinitions).join(PROFILE_POINTER) : text);
+            const total = tokensOf(full);
+            const candidates = [];
+            for (const step of settings.steps ?? []) {
+                if (!step || step.enabled === false || !String(stepOutputs[step.name] ?? '').trim()) continue;
+                candidates.push({ id: `step:${step.name}`, label: step.name, priority: clampInt(step.priority, 0, 100, DEFAULT_PRIORITY) });
+            }
+            if (!profileDeduped && leanDefinitions && /\{\{\s*definitions\s*\}\}/i.test(tailTemplate)) {
+                candidates.push({ id: 'profile', label: 'Living profile', priority: PRIORITY_PROFILE });
+            }
+            if (savedUserContext) candidates.push({ id: 'answers', label: 'Saved answers', priority: PRIORITY_USER_ANSWERS });
+            if (briefText) candidates.push({ id: 'brief', label: 'Turn Brief', priority: PRIORITY_BRIEF });
+            const sections = candidates.map(item => ({ ...item, tokens: Math.max(0, total - tokensOf(buildTail(new Set([item.id])))) }));
+            const required = [];
+            if (directive?.text) required.push({ id: 'directive', label: 'Story directive', tokens: estimateTokens(directive.text), required: true });
+            const fixed = Math.max(0, total - sections.concat(required).reduce((sum, item) => sum + item.tokens, 0));
+            required.push({ id: 'template', label: 'Template and fixed text', tokens: fixed, required: true });
+            const plan = planTailBudget([...sections, ...required], budget);
+            const dropIds = new Set(plan.dropped);
+            const label = id => sections.find(item => item.id === id)?.label ?? id;
+            return {
+                budget, tokens: total, dropIds,
+                sections: [...sections, ...required].map(item => ({ label: item.label, tokens: item.tokens, dropped: dropIds.has(item.id) })),
+                dropped: plan.dropped.map(label),
+                savedTokens: dropIds.size ? total - tokensOf(buildTail(dropIds)) : 0,
+            };
+        };
         let injectionText = '';
+        let tail = null;
         if (settings.injectAnchor === 'prompt-end') {
-            if ((expand && hasStepBlocks) || (directive && usesStoryMacro) || (briefText && usesBriefMacro)) {
-                injectionText = substituteParamsSafe(expandMacros(tailTemplate, resolve)).trim();
-            }
-            if (briefText && !injectionText.includes(briefText)) {
-                injectionText = injectionText ? `${injectionText}\n\n${briefText}` : briefText;
-            }
-            if (directive?.text && !injectionText.includes(directive.text)) {
-                injectionText = injectionText ? `${injectionText}\n\n${directive.text}` : directive.text;
-            }
+            injectionText = buildTail();
+            tail = planTail(clampInt(settings.tailMaxTokens, 0, 32000, 0));
+            if (tail.dropped.length) injectionText = buildTail(tail.dropIds);
         } else if (expand && hasStepBlocks) {
-            injectionText = assembleInjection({ settings, char, profile, chat: arr, stepOutputs, story: storyContext });
+            injectionText = assembleInjection({ settings, char, profile, chat: arr, stepOutputs, story: storyContext, definitionsFields: replyFieldList });
             if (briefText && !injectionText.includes(briefText)) {
                 injectionText = injectionText ? `${injectionText}\n\n${briefText}` : briefText;
             }
@@ -683,16 +804,22 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         } else if (briefText || directive?.text) {
             injectionText = [briefText, directive?.text ?? ''].filter(Boolean).join('\n\n');
         }
-        // Templates may reference these macros anywhere. Relocate their complete
-        // sections so the directive is still last and the brief directly precedes it.
-        const savedUserContext = expand && plannerMode ? userAnswersContext(userAnswers) : '';
         const turnSections = [savedUserContext, briefText, directive?.text ?? ''].filter(Boolean);
-        for (const section of turnSections) injectionText = injectionText.split(section).join('').trim();
-        injectionText = [injectionText, ...turnSections].filter(Boolean).join('\n\n');
+        if (settings.injectAnchor !== 'prompt-end') {
+            for (const section of turnSections) injectionText = injectionText.split(section).join('').trim();
+            injectionText = [injectionText, ...turnSections].filter(Boolean).join('\n\n');
+        }
+        if (tail?.dropped.length) {
+            const note = `Tail budget: dropped ${tail.dropped.join(', ')} (\u2248${tail.savedTokens} tokens)`;
+            activityEntry({ title: note, tone: 'info' });
+        }
         const agentRecord = {
             planner,
             effectiveSteps: (Array.isArray(settings.steps) ? settings.steps : []).filter(Boolean)
-                .map(({ name, prompt, generated, kind }) => ({ name, prompt, generated: Boolean(generated), ...(kind ? { kind } : {}) })),
+                .map(({ name, prompt, generated, kind, activation: mode }) => ({ name, prompt, generated: Boolean(generated), ...(kind ? { kind } : {}),
+                    ...(stepActivation({ activation: mode }) !== 'always' ? { activation: stepActivation({ activation: mode }) } : {}) })),
+            activation,
+            tail,
             agentRan: Boolean(agentResult),
             brief: briefText,
             agentTranscript: agentResult?.transcript ?? null,

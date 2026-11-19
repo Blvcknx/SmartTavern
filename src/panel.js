@@ -17,6 +17,7 @@ import { listConnectionProfiles } from './gen.js';
 import { runPipeline, runRefinementDryRun, getLastRunResults } from './pipeline.js';
 import { rebuildProfile, updateProfile, generateProfileField, resetProfile, serializeProfile } from './profiles.js';
 import { chipsHtml } from './chips.js';
+import { fieldInjectMode, stepActivation, hasKeywords } from './lean-core.js';
 import { renderStoryTab, wireStoryTab } from './story-ui.js';
 import { renderAgentTab, wireAgentTab } from './agent-ui.js';
 
@@ -351,7 +352,8 @@ function buildPanelHtml() {
                 <div class="smarttavern_steps_section_title"><i class="fa-solid fa-diagram-project"></i><span>Expansion steps — pre-reply context</span></div>
                 <div class="smarttavern_hint">
                     Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{field:Name}}, {{chat}},
-                    {{chat:N}}, {{step:Name}} for earlier outputs, {{steps}} for all earlier outputs.
+                    {{chat:N}}, {{step:Name}} for earlier outputs, {{steps}} for all earlier outputs,
+                    {{previous}} for this step's previous output in this chat.
                     Independent steps run together; explicit references preserve order. Each step may pin
                     its own Connection Manager profile; the lookback sets this step's {{chat}} history
                     (0 = none, empty = global default). Per-block roles apply to history injection
@@ -387,6 +389,9 @@ function buildPanelHtml() {
                 <div class="smarttavern_hint">
                     The profile JSON schema is built from these fields. They drive the bootstrap,
                     background updates, and the {{definitions}} / {{field:Name}} macros.
+                    <b>Inject</b> only affects the reply model (description override and the reply tail's
+                    {{definitions}}): Never hides a field from it, When relevant sends it when the planner
+                    lists it or its keywords match the recent messages. Internal prompts keep every field.
                 </div>
                 <div id="smarttavern_fields"></div>
                 <div class="smarttavern_row_actions">
@@ -503,6 +508,12 @@ function buildPanelHtml() {
                     <label title="Hard word cap of the compiled scene directive; the fact ledger is trimmed first when exceeded">Story directive word cap
                         <input id="smarttavern_storyDirectiveMaxWords" class="text_margin_input" type="number" min="60" max="400" step="10" value="${settings.storyDirectiveMaxWords}">
                     </label>
+                    <label title="Keyword-activated blocks and 'when relevant' fields scan this many of the latest non-system messages">Activation scan depth (messages)
+                        <input id="smarttavern_activationScanDepth" class="text_margin_input" type="number" min="1" max="20" step="1" value="${settings.activationScanDepth}">
+                    </label>
+                    <label title="Approximate token budget (about 3.5 characters per token) of the prompt-end reply tail. When exceeded, whole sections are dropped lowest priority first: blocks by their Priority, the profile (60), saved answers (80), Turn Brief (90). The story directive and required events are never dropped. 0 = off.">Reply-tail token budget (0 = off)
+                        <input id="smarttavern_tailMaxTokens" class="text_margin_input" type="number" min="0" max="32000" step="50" value="${settings.tailMaxTokens}">
+                    </label>
                 </div>
 
                 <div class="smarttavern_expansion_only">
@@ -606,6 +617,8 @@ const PANEL_CONTROLS = [
     ['smarttavern_turnEnforce', 'turnEnforce', 'checkbox'],
     ['smarttavern_storyIdleTurns', 'storyIdleTurns', 'number'],
     ['smarttavern_storyDirectiveMaxWords', 'storyDirectiveMaxWords', 'number'],
+    ['smarttavern_activationScanDepth', 'activationScanDepth', 'number'],
+    ['smarttavern_tailMaxTokens', 'tailMaxTokens', 'number'],
     ['smarttavern_updateInterval', 'updateInterval', 'number'],
     ['smarttavern_chatLookback', 'chatLookback', 'number'],
     ['smarttavern_profileUpdateLookback', 'profileUpdateLookback', 'number'],
@@ -927,6 +940,13 @@ function renderFieldEditor() {
                     <input class="smarttavern_field_stable_input" type="checkbox" ${field.stable ? 'checked' : ''}>
                     <span>Stable</span>
                 </label>
+                <select class="smarttavern_field_inject" title="What the REPLY model sees of this field (description override and {{definitions}} in the reply tail). Internal steps, the planner and the updater always get the full profile. Relevant: sent when the planner lists the field or its keywords match the recent messages (no planner and no keywords: sent).">
+                    <option value="always"${fieldInjectMode(field) === 'always' ? ' selected' : ''}>Always</option>
+                    <option value="relevant"${fieldInjectMode(field) === 'relevant' ? ' selected' : ''}>When relevant</option>
+                    <option value="never"${fieldInjectMode(field) === 'never' ? ' selected' : ''}>Never</option>
+                </select>
+                <input class="text_margin_input smarttavern_field_keywords" type="text" value="${escapeHtml(field.keywords ?? '')}" placeholder="keywords (when relevant)"
+                    title="Comma or newline separated. Case-insensitive substrings; wrap an entry as /regex/flags for a regular expression. Matched against the last N messages (Settings: activation scan depth)."${fieldInjectMode(field) === 'relevant' ? '' : ' hidden'}>
                 <div class="smarttavern_row_actions">
                     <a class="menu_button menu_button_icon smarttavern_field_up" title="Move up"><i class="fa-solid fa-arrow-up"></i></a>
                     <a class="menu_button menu_button_icon smarttavern_field_down" title="Move down"><i class="fa-solid fa-arrow-down"></i></a>
@@ -943,6 +963,15 @@ function renderFieldEditor() {
         });
         row.find('.smarttavern_field_stable_input').on('change', function () {
             settings.fields[index].stable = /** @type {HTMLInputElement} */ (this).checked;
+            saveSettings();
+        });
+        row.find('.smarttavern_field_inject').on('change', function () {
+            settings.fields[index].inject = String(/** @type {HTMLSelectElement} */ (this).value);
+            row.find('.smarttavern_field_keywords').prop('hidden', settings.fields[index].inject !== 'relevant');
+            saveSettings();
+        });
+        row.find('.smarttavern_field_keywords').on('input', function () {
+            settings.fields[index].keywords = String(/** @type {HTMLInputElement} */ (this).value);
             saveSettings();
         });
         row.find('.smarttavern_field_up').on('click', () => moveArrayItem(settings.fields, index, -1, () => { saveSettings(); renderFieldEditor(); }));
@@ -999,7 +1028,7 @@ function renderStepEditor() {
 function renderStepCards($container, steps, { refinement = false } = {}) {
     const placeholder = refinement
         ? 'Prompt for this pass. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{draft}}, {{original_draft}}, {{draft_plain}}, {{draft_paragraphs}}. Surgical passes receive the draft as numbered paragraphs; the model returns <replace id="N"><find>exact text</find><with>replacement</with></replace> for phrases or sentences, or <edit id="N">…</edit> / <delete id="N"/> / <insert after="N">…</insert> (or <audit>PASS</audit> to keep the draft). Full passes wrap the whole revised reply in <revised_reply></revised_reply> instead.'
-        : 'Prompt for this step. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{steps}}.';
+        : 'Prompt for this step. Macros: {{char}}, {{user}}, {{card}}, {{definitions}}, {{chat}}, {{chat:N}}, {{field:Name}}, {{step:Name}}, {{steps}}, {{previous}} (this step\'s previous output).';
     $container.empty();
     steps.forEach((step, index) => {
         const role = STEP_ROLES.includes(step.role) ? step.role : 'assistant';
@@ -1041,6 +1070,27 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
                     </div>
                 </div>
                 <textarea class="smarttavern_step_prompt" rows="6" placeholder="${escapeHtml(placeholder)}">${escapeHtml(step.prompt)}</textarea>
+                ${refinement ? '' : `
+                <div class="smarttavern_step_lean">
+                    <label title="When this block runs. Always: every turn. Keywords: only when a keyword appears in the last N messages (Settings: activation scan depth). Planner: every turn unless the expansion planner skips it (runs if the planner is off or fails).">Activation
+                        <select class="smarttavern_step_activation">
+                            <option value="always"${stepActivation(step) === 'always' ? ' selected' : ''}>Always</option>
+                            <option value="keywords"${stepActivation(step) === 'keywords' ? ' selected' : ''}>Keywords</option>
+                            <option value="planner"${stepActivation(step) === 'planner' ? ' selected' : ''}>Planner decides</option>
+                        </select>
+                    </label>
+                    <label class="checkbox" title="Lets the model answer UNCHANGED when nothing relevant changed; the previous output of this step (stored per chat) is then reused. Use {{previous}} in the prompt to show it.">
+                        <input class="smarttavern_step_reuse" type="checkbox" ${step.reuseUnchanged === true ? 'checked' : ''}>
+                        <span>Reuse when unchanged ({{previous}})</span>
+                    </label>
+                    <label title="Only used when the reply-tail token budget is on (Settings): lower numbers are dropped first when the tail is over budget.">Priority
+                        <input class="text_margin_input smarttavern_step_priority" type="number" min="0" max="100" step="1" value="${Number.isFinite(step.priority) ? step.priority : 50}">
+                    </label>
+                    <div class="smarttavern_step_keywords_wrap"${stepActivation(step) === 'keywords' ? '' : ' hidden'}>
+                        <textarea class="smarttavern_step_keywords" rows="2" placeholder="Keywords, comma or newline separated. /regex/flags for a regular expression; otherwise case-insensitive substring.">${escapeHtml(step.keywords ?? '')}</textarea>
+                        <div class="smarttavern_hint smarttavern_step_keywords_hint"${hasKeywords(step.keywords) ? ' hidden' : ''}>No keywords yet: this block never runs.</div>
+                    </div>
+                </div>`}
                 <div class="smarttavern_step_sampling">
                     <button type="button" class="menu_button smarttavern_sampling_toggle" aria-expanded="false"><i class="fa-solid fa-sliders"></i> Sampling</button>
                     <div class="smarttavern_sampling_fields" hidden>
@@ -1071,6 +1121,24 @@ function renderStepCards($container, steps, { refinement = false } = {}) {
         });
         card.find('.smarttavern_step_enabled').on('change', function () {
             steps[index].enabled = /** @type {HTMLInputElement} */ (this).checked;
+            saveSettings();
+        });
+        card.find('.smarttavern_step_activation').on('change', function () {
+            steps[index].activation = String(/** @type {HTMLSelectElement} */ (this).value);
+            card.find('.smarttavern_step_keywords_wrap').prop('hidden', steps[index].activation !== 'keywords');
+            saveSettings();
+        });
+        card.find('.smarttavern_step_keywords').on('input', function () {
+            steps[index].keywords = String(/** @type {HTMLTextAreaElement} */ (this).value);
+            card.find('.smarttavern_step_keywords_hint').prop('hidden', hasKeywords(steps[index].keywords));
+            saveSettings();
+        });
+        card.find('.smarttavern_step_reuse').on('change', function () {
+            steps[index].reuseUnchanged = /** @type {HTMLInputElement} */ (this).checked;
+            saveSettings();
+        });
+        card.find('.smarttavern_step_priority').on('change', function () {
+            steps[index].priority = coerceNumber(this, 50);
             saveSettings();
         });
         card.find('.smarttavern_step_editmode').on('change', function () {
@@ -1196,7 +1264,7 @@ export function refreshProfileSelects() {
 
 function addField() {
     const settings = getSettings();
-    settings.fields.push({ name: `Field ${settings.fields.length + 1}`, description: '', stable: false });
+    settings.fields.push({ name: `Field ${settings.fields.length + 1}`, description: '', stable: false, inject: 'always', keywords: '' });
     saveSettings();
     renderFieldEditor();
 }
@@ -1207,7 +1275,7 @@ async function restoreDefaultFields() {
         'This replaces your field list with the SmartTavern defaults.',
     );
     if (!confirmed) return;
-    getSettings().fields = structuredClone(DEFAULT_FIELDS).map(f => ({ name: f.name, description: f.description, stable: Boolean(f.stable) }));
+    getSettings().fields = structuredClone(DEFAULT_FIELDS).map(f => ({ name: f.name, description: f.description, stable: Boolean(f.stable), inject: f.inject ?? 'always', keywords: '' }));
     saveSettings();
     renderFieldEditor();
 }
@@ -1224,7 +1292,7 @@ function addStep(listKey) {
         lookback: null,
         // New refinement passes start surgical — the fast default. Full rewrites
         // stay one select away for prompts that need them.
-        ...(listKey === 'refinementSteps' ? { editMode: 'surgical' } : {}),
+        ...(listKey === 'refinementSteps' ? { editMode: 'surgical' } : { activation: 'always', keywords: '', reuseUnchanged: false, priority: 50 }),
         prompt: '',
     });
     saveSettings();
@@ -1248,7 +1316,7 @@ async function restoreDefaultExpansionSteps() {
         'This replaces your expansion step list with the Physical/Mental Condition preset. Refinement passes are not touched.',
     );
     if (!confirmed) return;
-    getSettings().steps = structuredClone(DEFAULT_STEPS).map(s => ({ ...s }));
+    getSettings().steps = structuredClone(DEFAULT_STEPS).map(s => ({ activation: 'always', keywords: '', priority: 50, ...s }));
     saveSettings();
     renderStepEditor();
 }
@@ -1378,6 +1446,18 @@ function renderRunResult(body, result, pipeline) {
             ...plan.additions.map(block => `## ${block.kind === 'user' ? 'User' : 'Expansion'}: ${block.name}\n${block.prompt}`),
         ].join('\n\n'));
     }
+    const lean = [
+        ...(result.activation?.skipped ?? []).map(skip => `Skipped by planner: ${skip.name}${skip.reason ? ` \u2014 ${skip.reason}` : ''}`),
+        ...(result.activation?.inactive ?? []).map(name => `Not triggered: ${name}`),
+    ];
+    if (lean.length) appendSection(body, 'Block activation', lean.join('\n'));
+    if (result.tail?.sections?.length) {
+        const tail = result.tail;
+        appendSection(body, `Reply tail \u00b7 \u2248${tail.tokens} tokens${tail.budget ? ` of ${tail.budget} budget` : ''}`, [
+            ...tail.sections.map(section => `${section.dropped ? '(dropped) ' : ''}${section.label}: \u2248${section.tokens} tokens`),
+            ...(tail.dropped.length ? [`Tail budget: dropped ${tail.dropped.join(', ')} (\u2248${tail.savedTokens} tokens)`] : []),
+        ].join('\n'));
+    }
     if (Array.isArray(result.surfacedRulings) && result.surfacedRulings.length) {
         appendSection(
             body,
@@ -1404,7 +1484,7 @@ function renderRunResult(body, result, pipeline) {
 function stepStatsTitle(name, stat) {
     if (!stat) return name;
     const secs = (stat.elapsedMs / 1000).toFixed(1);
-    return `${name} · ${secs}s · ${stat.chars} chars${stat.failed ? ' · failed' : ''}`;
+    return `${name} · ${secs}s · ${stat.chars} chars${stat.failed ? ' · failed' : ''}${stat.reused ? ' · reused (unchanged)' : ''}`;
 }
 
 /**

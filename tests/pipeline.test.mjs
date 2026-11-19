@@ -78,7 +78,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         `;
         for (const name of ['agent', 'agent-tools', 'rulings', 'ruling-core']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'description', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'user-context', 'narration', ...(realStory ? ['story', 'story-core'] : [])]) {
+    for (const name of ['pipeline', 'state', 'gen', 'tail', 'description', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'lean-core', 'user-context', 'narration', ...(realStory ? ['story', 'story-core'] : [])]) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -92,7 +92,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     await narration.evaluate();
     const state = modules.get('state').namespace;
     state.loadSettings();
-    return { narration: narration.namespace, planner: modules.get('planner').namespace, story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, rulings: modules.get('rulings')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
+    return { description: modules.get('description').namespace, narration: narration.namespace, planner: modules.get('planner').namespace, story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, rulings: modules.get('rulings')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
@@ -393,7 +393,8 @@ test('planner runs before expansion, preserves settings, and injects temporary d
 
 test('planner caps configured blocks at five, preserves overflow, and makes no planning call when full', async () => {
     const steps = Array.from({ length: 7 }, (_, index) => step(`Block ${index}`, `Prompt ${index}`));
-    const h = await harness({ agentProfileId: 'model', steps }, undefined, { planner: true, realAgent: true });
+    // Every field is 'always': a full house has nothing left for the planner to decide.
+    const h = await harness({ agentProfileId: 'model', steps, fields: [{ name: 'Brief Summary', description: 'x', inject: 'always' }] }, undefined, { planner: true, realAgent: true });
     const result = await h.pipeline.runPipeline({ inject: false });
     assert.equal(h.requests.length, 5);
     assert.equal(result.stepStats.length, 5);
@@ -2508,4 +2509,212 @@ test('tail dedupe swaps a profile already present elsewhere in the prompt for a 
     // Profile absent from the rest of the prompt (override off): the tail keeps it.
     assert.equal(h.tail.dedupeProfileInTail(tail, 'Hello', [profile]), tail);
     assert.equal(h.tail.dedupeProfileInTail(tail, profile, []), tail);
+});
+
+// ---- Lean context -------------------------------------------------------------------------
+
+const plain = value => JSON.parse(JSON.stringify(value));
+const promptOf = request => (request.messages ?? []).map(message => message.content).join('\n');
+
+test('keyword blocks run only when a keyword is in the scanned messages; empty lists never run', async () => {
+    const h = await harness({ steps: [
+        { ...step('Always', 'TASK-A') },
+        { ...step('Weather', 'TASK-W'), activation: 'keywords', keywords: 'rain, /sto+rm/i' },
+        { ...step('Empty', 'TASK-E'), activation: 'keywords', keywords: '' },
+    ] });
+    let result = await h.pipeline.runPipeline({ inject: false });
+    assert.equal(h.requests.length, 1);
+    assert.deepEqual(plain(result.activation.inactive), ['Weather', 'Empty']);
+    assert.ok(h.context.activityEntries.some(entry => /Not triggered: Weather/.test(entry.text ?? '')));
+    h.savedChat.push({ name: 'User', is_user: true, mes: 'A STORM is coming' });
+    result = await h.pipeline.runPipeline({ inject: false });
+    assert.equal(h.requests.length, 3);
+    assert.deepEqual(plain(result.activation.inactive), ['Empty']);
+    assert.ok(h.requests.some(request => promptOf(request).includes('TASK-W')));
+    // Only the last activationScanDepth (2) messages are scanned.
+    h.savedChat.push({ name: 'Alice', mes: 'Calm.' }, { name: 'User', is_user: true, mes: 'Fine.' });
+    result = await h.pipeline.runPipeline({ inject: false });
+    assert.deepEqual(plain(result.activation.inactive), ['Weather', 'Empty']);
+});
+
+test('planner skips only planner-activated blocks, frees their slots and dependents see an empty output', async () => {
+    const steps = [step('Keep', 'TASK-K'), { ...step('Maybe', 'TASK-M'), activation: 'planner' }, step('Dependent', 'TASK-D {{step:Maybe}}|'),
+        step('Four', 'TASK-4'), step('Five', 'TASK-5')];
+    const h = await harness({ agentProfileId: 'model', steps, fields: [{ name: 'Brief Summary', description: 'x', inject: 'always' }] }, async (messages, index) => {
+        const prompt = messages.map(message => message.content).join('\n');
+        if (index === 1) {
+            assert.match(prompt, /## Expansion: Maybe\n\[activation: planner — you may skip it\]\nTASK-M/);
+            assert.match(prompt, /## Expansion: Keep\nTASK-K/);
+            return { content: '## Skip: Maybe\nNothing changed here.\n## Skip: Keep\nNot allowed.\n## Expansion: Freed slot\nTASK-NEW' };
+        }
+        return { content: 'OUT' };
+    }, { planner: true, realAgent: true });
+    const result = await h.pipeline.runPipeline({ inject: false });
+    assert.deepEqual(plain(result.activation.skipped), [{ name: 'Maybe', reason: 'Nothing changed here.' }]);
+    assert.ok(result.planner.notices.some(text => /cannot be skipped/.test(text)));
+    assert.equal(result.planner.additions[0].name, 'Freed slot');
+    assert.equal(result.stepStats.length, 5);
+    const prompts = h.requests.slice(1).map(promptOf);
+    assert.ok(!prompts.some(prompt => prompt.includes('TASK-M')));
+    assert.ok(prompts.some(prompt => prompt.includes('TASK-D |')));
+    assert.deepEqual(plain(result.effectiveSteps.map(item => item.name)), ['Keep', 'Dependent', 'Four', 'Five', 'Freed slot']);
+    assert.ok(h.context.activityEntries.some(entry => /Skipped by planner: Maybe — Nothing changed here\./.test(entry.text ?? '')));
+});
+
+test('planner-activated blocks run when the planner fails (fail open)', async () => {
+    const h = await harness({ agentProfileId: 'model', steps: [{ ...step('Maybe', 'TASK-M'), activation: 'planner' }] },
+        async (_messages, index) => ({ content: index === 1 ? '' : 'OUT' }), { planner: true, realAgent: true });
+    const result = await h.pipeline.runPipeline({ inject: false });
+    assert.ok(result.planner.error);
+    assert.deepEqual(plain(result.activation.skipped), []);
+    assert.equal(result.stepOutputs.Maybe, 'OUT');
+});
+
+const leanFields = [
+    { name: 'Brief Summary', description: 'x', inject: 'always' },
+    { name: 'Appearance', description: 'x', inject: 'relevant' },
+    { name: 'Fears', description: 'x', inject: 'relevant', keywords: 'sea' },
+    { name: 'Background', description: 'x', inject: 'never' },
+];
+const leanProfile = { fields: { 'Brief Summary': 'SUMMARY', Appearance: 'LOOKS', Fears: 'WATER', Background: 'HISTORY' } };
+const fieldNames = list => list.map(field => field.name);
+
+test('reply fields follow inject modes, planner choice and keywords; dry runs never leak a selection', async () => {
+    const h = await harness({ agentProfileId: 'model', injectAnchor: 'prompt-end', tailPrompt: '{{definitions}}\n{{steps}}', fields: leanFields, steps: [step('A', 'TASK-A')] },
+        async (_messages, index) => ({ content: index === 1 ? '## Fields: fears' : 'OUT' }), { planner: true, realAgent: true });
+    h.state.setStoredProfile('alice.png', leanProfile);
+    let result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.match(result.injectionText, /## Brief Summary\nSUMMARY/);
+    assert.match(result.injectionText, /## Fears\nWATER/);
+    assert.doesNotMatch(result.injectionText, /LOOKS|HISTORY/);
+    assert.deepEqual(fieldNames(h.description.replyFields()), ['Brief Summary', 'Fears']);
+    // A dry run neither changes nor leaves a selection: after clearing, only keyword rules apply.
+    h.description.clearReplyFields();
+    await h.pipeline.runPipeline({ inject: false });
+    assert.deepEqual(fieldNames(h.description.replyFields()), ['Brief Summary', 'Appearance']);
+    // Planner answered without a ## Fields heading: fail open for keyword-less fields, keywords decide the rest.
+    h.context.extensionSettings.connectionManager.profiles[0].id = 'model';
+    const quiet = await harness({ agentProfileId: 'model', injectAnchor: 'prompt-end', tailPrompt: '{{definitions}}\n{{steps}}', fields: leanFields, steps: [step('A', 'TASK-A')] },
+        async (_messages, index) => ({ content: index === 1 ? 'NO ADDITIONS' : 'OUT' }), { planner: true, realAgent: true });
+    quiet.state.setStoredProfile('alice.png', leanProfile);
+    quiet.savedChat.push({ name: 'Alice', mes: 'Waves lap at the SEA wall.' });
+    result = await quiet.pipeline.runPipeline({ chat: [...quiet.savedChat] });
+    assert.deepEqual(fieldNames(quiet.description.replyFields()), ['Brief Summary', 'Appearance', 'Fears']);
+    assert.match(result.injectionText, /LOOKS/);
+});
+
+test('internal prompts keep the full profile while the reply tail is lean', async () => {
+    const h = await harness({ injectAnchor: 'prompt-end', tailPrompt: '{{definitions}}\n{{steps}}', fields: leanFields, steps: [step('A', 'DEF:{{definitions}}')] });
+    h.state.setStoredProfile('alice.png', leanProfile);
+    const result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.match(promptOf(h.requests[0]), /HISTORY/);
+    assert.doesNotMatch(result.injectionText, /HISTORY|WATER/);
+    assert.match(result.injectionText, /SUMMARY/);
+    // Appearance is relevant without keywords and no planner ran: fail open.
+    assert.match(result.injectionText, /LOOKS/);
+});
+
+test('description slot and reply tail use the same lean profile, so tail dedupe still works', async () => {
+    const description = 'A long enough character description for the swap.';
+    const h = await harness({ injectAnchor: 'prompt-end', tailPrompt: 'Profile:\n{{definitions}}\n{{steps}}', fields: leanFields, steps: [step('A', 'TASK-A')] });
+    h.context.characters[0].description = description;
+    h.state.setStoredProfile('alice.png', leanProfile);
+    const coreChat = [...h.savedChat];
+    await h.pipeline.runPipeline({ chat: coreChat });
+    const reserved = coreChat.find(message => message.smarttavern_ephemeral);
+    const event = { chat: [{ role: 'system', content: `Description: ${description}` }, { role: 'user', content: 'Hello' }, { role: 'assistant', content: reserved.mes }] };
+    h.tail.appendChatTail(event);
+    assert.match(event.chat[0].content, /## Brief Summary\nSUMMARY/);
+    assert.doesNotMatch(event.chat[0].content, /HISTORY|WATER/);
+    assert.match(event.chat.at(-1).content, /Profile:\n\(the living profile is given in the character description above\)/);
+    assert.doesNotMatch(event.chat.at(-1).content, /SUMMARY/);
+});
+
+test('saved configs migrate to old behaviour; old default prompts upgrade once; new installs get lean defaults', async () => {
+    const fresh = await harness();
+    const defaults = fresh.state.getSettings();
+    assert.deepEqual(defaults.fields.map(field => field.inject), ['always', 'relevant', 'never', 'always', 'relevant', 'relevant', 'relevant']);
+    assert.equal(defaults.activationScanDepth, 2);
+    assert.equal(defaults.tailMaxTokens, 0);
+    assert.ok(defaults.steps.every(item => item.reuseUnchanged === true && /\{\{previous\}\}/.test(item.prompt) && /exactly UNCHANGED/.test(item.prompt)));
+    const [oldPhysical] = fresh.state.LEGACY_EXPANSION_STEPS;
+    const saved = await harness({ fields: [{ name: 'X', description: 'd' }, { name: 'Y', description: 'd', inject: 'bogus', keywords: 7 }], tailMaxTokens: -5, activationScanDepth: 99,
+        steps: [{ ...step('Physical Condition', oldPhysical.prompt) }, { ...step('Mental Condition', 'Custom prompt') }] });
+    const settings = saved.state.getSettings();
+    assert.deepEqual(settings.fields.map(field => [field.inject, field.keywords]), [['always', ''], ['always', '']]);
+    assert.equal(settings.tailMaxTokens, 0);
+    assert.equal(settings.activationScanDepth, 20);
+    assert.equal(settings.steps[0].reuseUnchanged, true);
+    assert.match(settings.steps[0].prompt, /\{\{previous\}\}/);
+    assert.deepEqual([settings.steps[1].prompt, settings.steps[1].reuseUnchanged, settings.steps[1].activation, settings.steps[1].priority], ['Custom prompt', false, 'always', 50]);
+});
+
+test('UNCHANGED reuses the previous output only within a valid anchor; dry runs and swipes do not store or reuse', async () => {
+    const answers = ['Tired.', 'UNCHANGED.', 'UNCHANGED', 'Dry output', 'Fresh'];
+    const h = await harness({ steps: [{ ...step('Phys', 'PREV[{{previous}}]'), reuseUnchanged: true }] }, async () => ({ content: answers.shift() }));
+    const memory = () => h.state.getChatStore().stepMemory?.Phys;
+    let result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.match(promptOf(h.requests[0]), /PREV\[\(none yet\)\]/);
+    assert.deepEqual(plain(memory()), { text: 'Tired.', sourceIndex: 0, sourceText: 'Hello' });
+    // Next turn: the anchor (message 0) is earlier than the new one and unchanged.
+    h.savedChat.push({ name: 'Alice', mes: 'Hi' }, { name: 'User', is_user: true, mes: 'Next' });
+    result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.match(promptOf(h.requests[1]), /PREV\[Tired\.\]/);
+    assert.equal(result.stepOutputs.Phys, 'Tired.');
+    assert.equal(result.stepStats[0].reused, true);
+    assert.ok(h.context.activityEntries.some(entry => /reused \(unchanged\)/.test(entry.title ?? '')));
+    assert.equal(memory().sourceIndex, 2);
+    // Regenerate against the same anchor: no previous, so UNCHANGED means nothing.
+    result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.match(promptOf(h.requests[2]), /PREV\[\(none yet\)\]/);
+    assert.equal(result.stepOutputs.Phys, '');
+    assert.equal(memory().text, 'Tired.');
+    // Dry runs never store.
+    h.savedChat.push({ name: 'Alice', mes: 'Ok' }, { name: 'User', is_user: true, mes: 'Later' });
+    await h.pipeline.runPipeline({ inject: false });
+    assert.equal(memory().text, 'Tired.');
+    assert.equal(memory().sourceIndex, 2);
+    // An edited anchor message invalidates the stored output.
+    h.savedChat[2].mes = 'Next (edited)';
+    result = await h.pipeline.runPipeline({ chat: [...h.savedChat] });
+    assert.match(promptOf(h.requests.at(-1)), /PREV\[\(none yet\)\]/);
+    assert.equal(memory().text, 'Fresh');
+});
+
+test('UNCHANGED is ordinary output when reuse is off', async () => {
+    const h = await harness({ steps: [step('Phys', 'TASK')] }, async () => ({ content: 'UNCHANGED' }));
+    const result = await h.pipeline.runPipeline({ inject: false });
+    assert.equal(result.stepOutputs.Phys, 'UNCHANGED');
+});
+
+test('reply-tail budget drops whole lowest-priority blocks, keeps the directive and reports it', async () => {
+    const respond = async messages => {
+        const prompt = messages.map(message => message.content).join('\n');
+        // Distinct words keep the repetition guard quiet; about 350 characters each.
+        const filler = label => `${label} ${Array.from({ length: 80 }, (_, index) => `w${index}`).join(' ')}`;
+        return { content: prompt.includes('TASK-A') ? filler('AAA') : prompt.includes('TASK-B') ? filler('BBB') : filler('CCC') };
+    };
+    const steps = [{ ...step('A', 'TASK-A'), priority: 10 }, { ...step('B', 'TASK-B'), priority: 90 }, { ...step('C', 'TASK-C'), priority: 10 }];
+    const base = { injectAnchor: 'prompt-end', tailPrompt: '{{steps}}\nGo.', steps };
+    const open = await harness({ ...base }, respond);
+    const full = await open.pipeline.runPipeline({ inject: false });
+    assert.match(full.injectionText, /AAA[\s\S]*BBB[\s\S]*CCC/);
+    assert.equal(full.tail.dropped.length, 0);
+    assert.ok(full.tail.sections.some(section => section.label === 'A' && section.tokens >= 90));
+    const h = await harness({ ...base, tailMaxTokens: 250 }, respond);
+    const result = await h.pipeline.runPipeline({ inject: false });
+    // Equal priority: the later block (C) goes first; A and B fit.
+    assert.deepEqual(plain(result.tail.dropped), ['C']);
+    assert.doesNotMatch(result.injectionText, /CCC/);
+    assert.match(result.injectionText, /AAA[\s\S]*BBB[\s\S]*Go\./);
+    assert.ok(h.context.activityEntries.some(entry => /^Tail budget: dropped C \(\u2248\d+ tokens\)$/.test(entry.title ?? '')));
+    const tight = await harness({ ...base, tailMaxTokens: 150 }, respond);
+    const squeezed = await tight.pipeline.runPipeline({ inject: false });
+    assert.deepEqual(plain(squeezed.tail.dropped), ['A', 'C']);
+    assert.match(squeezed.injectionText, /BBB/);
+    const directive = { text: 'DIRECTIVE '.repeat(200), must: '', beat: '', chapter: '', ledger: '' };
+    const never = await harness({ ...base, tailMaxTokens: 10 }, respond, { directive });
+    const kept = await never.pipeline.runPipeline({ inject: false });
+    assert.ok(kept.injectionText.includes(directive.text));
+    assert.doesNotMatch(kept.injectionText, /AAA|BBB|CCC/);
 });
