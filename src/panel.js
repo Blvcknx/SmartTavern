@@ -20,8 +20,11 @@ import { chipsHtml } from './chips.js';
 import { fieldInjectMode, stepActivation, hasKeywords } from './lean-core.js';
 import { renderStoryTab, wireStoryTab } from './story-ui.js';
 import { renderAgentTab, wireAgentTab } from './agent-ui.js';
+import { renderSceneTab, wireSceneTab } from './scene-ui.js';
+import { cancelGmTick } from './gm.js';
+import { formatClock } from './gm-core.js';
 
-const TABS = ['profile', 'story', 'agent', 'steps', 'schema', 'results', 'settings'];
+const TABS = ['profile', 'story', 'scene', 'agent', 'steps', 'schema', 'results', 'settings'];
 
 // --------------------------------------------------------------------------------------------
 // Helpers
@@ -117,6 +120,7 @@ export function initPanel() {
         refreshStatus();
         if (isPanelOpen() && activeTab === 'profile') renderProfileTab();
         if (isPanelOpen() && activeTab === 'story') renderStoryTab();
+        if (isPanelOpen() && activeTab === 'scene') renderSceneTab();
         if (isPanelOpen() && activeTab === 'agent') renderAgentTab();
     });
 
@@ -261,6 +265,7 @@ function switchTab(tab) {
 function renderActiveTab() {
     if (activeTab === 'profile') renderProfileTab();
     else if (activeTab === 'story') renderStoryTab();
+    else if (activeTab === 'scene') renderSceneTab();
     else if (activeTab === 'agent') renderAgentTab();
     else if (activeTab === 'steps') renderStepEditor();
     else if (activeTab === 'schema') renderFieldEditor();
@@ -292,6 +297,7 @@ function buildPanelHtml() {
         <div class="smarttavern_panel_tabs">
             <a class="smarttavern_tab_button" data-tab="profile" title="Living bio of the current character"><i class="fa-solid fa-user-pen"></i><span>Profile</span></a>
             <a class="smarttavern_tab_button" data-tab="story" title="Story Director — scenario, chapters and per-turn beats"><i class="fa-solid fa-clapperboard"></i><span>Story</span></a>
+            <a class="smarttavern_tab_button" data-tab="scene" title="Scene state — established facts shared by the tracker, the agent and you"><i class="fa-solid fa-map-location-dot"></i><span>Scene</span></a>
             <a class="smarttavern_tab_button" data-tab="agent" title="Expansion planner, quick narration, and legacy agent"><i class="fa-solid fa-compass"></i><span>Agent</span></a>
             <a class="smarttavern_tab_button" data-tab="steps" title="Pipeline steps"><i class="fa-solid fa-diagram-project"></i><span>Steps</span></a>
             <a class="smarttavern_tab_button" data-tab="schema" title="Profile schema fields"><i class="fa-solid fa-list-check"></i><span>Schema</span></a>
@@ -331,6 +337,10 @@ function buildPanelHtml() {
 
             <div class="smarttavern_tab_panel" data-tab="story">
                 <div id="smarttavern_story_root"></div>
+            </div>
+
+            <div class="smarttavern_tab_panel" data-tab="scene">
+                <div id="smarttavern_scene_root"></div>
             </div>
 
             <div class="smarttavern_tab_panel" data-tab="agent">
@@ -559,6 +569,36 @@ function buildPanelHtml() {
                     <span class="smarttavern_missing_profile" id="smarttavern_story_missing_profile" title="The pinned connection profile no longer exists — requests fall back to the active connection"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
                 </label>
 
+                <div class="smarttavern_steps_section_title"><i class="fa-solid fa-map-location-dot"></i><span>Scene state</span></div>
+                <label class="checkbox" title="After each finalized character reply, one background call records the scene facts that changed. Off by default for installs that existed before this feature.">
+                    <input id="smarttavern_sceneTrackerEnabled" type="checkbox" ${settings.sceneTrackerEnabled ? 'checked' : ''}>
+                    <span>Scene tracker (one extra background call per reply)</span>
+                </label>
+                <label title="Connection Manager profile used for the scene tracker; empty uses the active connection">Scene tracker connection profile
+                    <select id="smarttavern_sceneTrackerProfileId" class="smarttavern_profile_select"></select>
+                    <span class="smarttavern_missing_profile" id="smarttavern_scene_missing_profile" title="The pinned connection profile no longer exists — requests fall back to the active connection"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
+                </label>
+                <div class="smarttavern_grid">
+                    <label title="Run the tracker on every Nth character reply (counted per chat)">Track every N replies
+                        <input id="smarttavern_sceneTrackerEvery" class="text_margin_input" type="number" min="1" max="20" step="1" value="${settings.sceneTrackerEvery}">
+                    </label>
+                    <label title="Recent messages the tracker reads">Tracker lookback (messages)
+                        <input id="smarttavern_sceneTrackerLookback" class="text_margin_input" type="number" min="1" max="20" step="1" value="${settings.sceneTrackerLookback}">
+                    </label>
+                    <label title="Output budget of one tracker call">Tracker max tokens
+                        <input id="smarttavern_sceneTrackerMaxTokens" class="text_margin_input" type="number" min="128" max="32000" step="64" value="${settings.sceneTrackerMaxTokens}">
+                    </label>
+                    <label title="Cap on the active scene. When exceeded, the least recently set unpinned facts drop out of the resolved scene (pinned facts never do).">Max scene facts
+                        <input id="smarttavern_sceneMaxFacts" class="text_margin_input" type="number" min="10" max="200" step="5" value="${settings.sceneMaxFacts}">
+                    </label>
+                </div>
+                <label title="Adds a [Scene state] section to the prompt-end reply tail (before the Turn Brief); it is dropped before the brief when the tail budget is exceeded">Scene state in the reply tail
+                    <select id="smarttavern_sceneInTail">
+                        <option value="off"${settings.sceneInTail !== 'on' ? ' selected' : ''}>Off (use {{scene}} in prompts)</option>
+                        <option value="on"${settings.sceneInTail === 'on' ? ' selected' : ''}>On</option>
+                    </select>
+                </label>
+
                 <hr>
 
                 <div class="smarttavern_row_actions">
@@ -589,6 +629,7 @@ function buildPanel() {
     wireDataButtons();
     wireProfileTab();
     wireStoryTab($panel());
+    wireSceneTab($panel());
     wireAgentTab($panel());
     initDrag();
 
@@ -619,6 +660,11 @@ const PANEL_CONTROLS = [
     ['smarttavern_storyDirectiveMaxWords', 'storyDirectiveMaxWords', 'number'],
     ['smarttavern_activationScanDepth', 'activationScanDepth', 'number'],
     ['smarttavern_tailMaxTokens', 'tailMaxTokens', 'number'],
+    ['smarttavern_sceneTrackerEnabled', 'sceneTrackerEnabled', 'checkbox'],
+    ['smarttavern_sceneTrackerEvery', 'sceneTrackerEvery', 'number'],
+    ['smarttavern_sceneTrackerLookback', 'sceneTrackerLookback', 'number'],
+    ['smarttavern_sceneTrackerMaxTokens', 'sceneTrackerMaxTokens', 'number'],
+    ['smarttavern_sceneMaxFacts', 'sceneMaxFacts', 'number'],
     ['smarttavern_updateInterval', 'updateInterval', 'number'],
     ['smarttavern_chatLookback', 'chatLookback', 'number'],
     ['smarttavern_profileUpdateLookback', 'profileUpdateLookback', 'number'],
@@ -648,7 +694,10 @@ function wireGeneralControls() {
             // Pipeline toggles re-scope the visible settings; the enable toggle exists in
             // both the drawer and this panel — keep them in sync.
             if (id === 'smarttavern_refinementEnabled' || id === 'smarttavern_expansionEnabled') applyModeVisibility();
-            if (id === 'smarttavern_enabled') $('#smarttavern_drawer_enabled').prop('checked', el.checked);
+            if (id === 'smarttavern_enabled') {
+                $('#smarttavern_drawer_enabled').prop('checked', el.checked);
+                if (!el.checked) cancelGmTick();
+            }
         });
     }
 
@@ -668,6 +717,17 @@ function wireGeneralControls() {
     const storySelect = $panel().find('#smarttavern_storyProfileId').get(0);
     storySelect?.addEventListener('change', () => {
         getSettings().storyProfileId = String(storySelect.value ?? '');
+        saveSettings();
+    });
+
+    const sceneSelect = $panel().find('#smarttavern_sceneTrackerProfileId').get(0);
+    sceneSelect?.addEventListener('change', () => {
+        getSettings().sceneTrackerProfileId = String(sceneSelect.value ?? '');
+        saveSettings();
+    });
+    const sceneTailEl = $panel().find('#smarttavern_sceneInTail').get(0);
+    sceneTailEl?.addEventListener('change', () => {
+        getSettings().sceneInTail = sceneTailEl.value === 'on' ? 'on' : 'off';
         saveSettings();
     });
 
@@ -1239,6 +1299,9 @@ export function refreshProfileSelects() {
     const storySelect = $panel().find('#smarttavern_storyProfileId').get(0);
     if (storySelect) refresh(storySelect, settings.storyProfileId ?? '');
     updateBadge($panel().find('#smarttavern_story_missing_profile'), settings.storyProfileId ?? '');
+    const sceneSelect = $panel().find('#smarttavern_sceneTrackerProfileId').get(0);
+    if (sceneSelect) refresh(sceneSelect, settings.sceneTrackerProfileId ?? '');
+    updateBadge($panel().find('#smarttavern_scene_missing_profile'), settings.sceneTrackerProfileId ?? '');
     const agentSelect = $panel().find('#smarttavern_agentProfileId').get(0);
     if (agentSelect) refresh(agentSelect, settings.agentProfileId ?? '');
     updateBadge($panel().find('#smarttavern_agent_missing_profile'), settings.agentProfileId ?? '');
@@ -1248,6 +1311,12 @@ export function refreshProfileSelects() {
     const rulingSelect = $panel().find('#smarttavern_rulingProfileId').get(0);
     if (rulingSelect) refresh(rulingSelect, settings.rulingProfileId ?? '');
     updateBadge($panel().find('#smarttavern_ruling_missing_profile'), settings.rulingProfileId ?? '');
+    const gmSelect = $panel().find('#smarttavern_gmProfileId').get(0);
+    if (gmSelect) refresh(gmSelect, settings.gmProfileId ?? '');
+    updateBadge($panel().find('#smarttavern_gm_missing_profile'), settings.gmProfileId ?? '');
+    const gmFitSelect = $panel().find('#smarttavern_gmFitProfileId').get(0);
+    if (gmFitSelect) refresh(gmFitSelect, settings.gmFitProfileId ?? '');
+    updateBadge($panel().find('#smarttavern_gmfit_missing_profile'), settings.gmFitProfileId ?? '');
     // Both step lists render through the same card builder; each select carries its own
     // step object so index-based lookups cannot cross wires between the two pipelines.
     $panel().find('.smarttavern_step_profile').each(function () {
@@ -1433,8 +1502,18 @@ function renderRunResult(body, result, pipeline) {
     if (result.storyDirective) {
         appendSection(body, 'Story directive (what the reply model was told)', result.storyDirective);
     }
+    if (result.gm) {
+        // GM engine: the brief was prepared between turns, or the planner took over.
+        const gm = result.gm;
+        appendSection(body, gm.used ? `GM brief (prepared ${formatClock(gm.preparedAt)})` : 'GM brief unavailable — the planner took over', [
+            gm.used ? `Prepared ${formatClock(gm.preparedAt)}${gm.waited ? ' (waited for a running tick)' : ''}. ${gm.branches} branch(es) prepared, ${gm.chosen.length} chosen.` : gm.reason,
+            ...gm.chosen.map(branch => `Branch chosen: if ${branch.if} → ${branch.then}`),
+            ...(gm.fit ? [`Fit check: ${gm.fit.ran ? (gm.fit.ok ? `use ${gm.fit.use.join(', ') || 'none'}` : `failed (${gm.fit.error}) — general brief only`) : gm.fit.error}`] : []),
+            ...(gm.question ? [`Question: ${gm.question}`] : []),
+        ].join('\n'));
+    }
     if (result.agentRan) {
-        appendSection(body, 'Turn Brief (thinking agent — injected before the directive)', result.brief || '(nothing at stake — no brief this turn)');
+        appendSection(body, result.gm?.used ? 'Turn Brief (GM — injected before the directive)' : 'Turn Brief (thinking agent — injected before the directive)', result.brief || '(nothing at stake — no brief this turn)');
     } else if (result.brief) {
         appendSection(body, 'Turn Brief', result.brief);
     }

@@ -57,6 +57,8 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         story: `export const previewStoryDirective = () => (${JSON.stringify(directive)}); export const prepareStoryDirective = () => (${JSON.stringify(directive)}); export const storyMacroContext = value => value; export const recordedDirective = () => null; export const compileStoryDirective = () => null; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};`,
         // Thinking agent stub: these tests exercise the non-agent path (the default
         // agentMode is 'always', so the stub gate must stay closed explicitly).
+        // GM engine stub: the planner/legacy tests never use a prepared brief (gm.test.mjs does).
+        gm: 'export const prepareGmTurn = async () => ({ ok: false, record: {} }); export const gmHasWork = () => false;',
         agent: 'export const consumeAgentArm = () => {}; export const getTurnBrief = () => ""; export const agentActiveForTurn = () => false; export const runAgentLoop = async () => null; export const resetAgentTurn = () => {}; export const agentTurnRequirements = () => ({ must: [], rolls: [] }); export const armAgent = () => {}; export const clearAgentSession = () => {};',
     };
     if (realAgent) {
@@ -76,9 +78,9 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
             };
             export const deleteWorldInfoEntry = async (data, uid) => { delete data.entries[uid]; return true; };
         `;
-        for (const name of ['agent', 'agent-tools', 'rulings', 'ruling-core']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
+        for (const name of ['agent', 'agent-tools', 'rulings', 'ruling-core', 'gm-core']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'description', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'lean-core', 'user-context', 'narration', ...(realStory ? ['story', 'story-core'] : [])]) {
+    for (const name of ['pipeline', 'state', 'gen', 'native-core', 'tail', 'description', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'lean-core', 'user-context', 'narration', 'scene-core', 'scene', ...(realStory ? ['story', 'story-core'] : [])]) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -92,7 +94,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
     await narration.evaluate();
     const state = modules.get('state').namespace;
     state.loadSettings();
-    return { description: modules.get('description').namespace, narration: narration.namespace, planner: modules.get('planner').namespace, story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, rulings: modules.get('rulings')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
+    return { description: modules.get('description').namespace, narration: narration.namespace, planner: modules.get('planner').namespace, story: modules.get('story').namespace, pipeline: pipeline.namespace, agent: modules.get('agent').namespace, tools: modules.get('agent-tools')?.namespace, world: modules.get('world-info')?.namespace, rulings: modules.get('rulings')?.namespace, checks: modules.get('refinement-checks').namespace, edits: modules.get('refinement-edits').namespace, profiles: modules.get('profiles').namespace, tail: modules.get('tail').namespace, scene: modules.get('scene').namespace, sceneCore: modules.get('scene-core').namespace, gen: modules.get('gen').namespace, state, context, requests, savedChat };
 }
 
 const step = (name, prompt, role = 'assistant') => ({ name, prompt, role, profileId: 'model', enabled: true });
@@ -2717,4 +2719,258 @@ test('reply-tail budget drops whole lowest-priority blocks, keeps the directive 
     const kept = await never.pipeline.runPipeline({ inject: false });
     assert.ok(kept.injectionText.includes(directive.text));
     assert.doesNotMatch(kept.injectionText, /AAA|BBB|CCC/);
+});
+
+// ---- Shared scene state ---------------------------------------------------------------------
+
+const sceneSettings = { sceneVersion: 1, sceneTrackerEnabled: true, sceneTrackerProfileId: 'model' };
+const seedScene = (h, facts, extra = {}) => { h.state.getChatStore().scene = { facts, pinned: [], locked: [], log: [], tick: 0, ...extra }; };
+const sceneFact = (key, value, index, text, by = 'user') => ({ key, value, evidence: '', sourceIndex: index, sourceText: text, by, at: 1 });
+const sceneOf = h => plain({ ...h.scene.getSceneObject() });
+
+test('{{scene}} resolves in expansion step prompts, refinement prompts and the reply-tail template', async () => {
+    const h = await harness({ ...sceneSettings, steps: [step('Assess', 'Facts:\n{{scene}}')], injectAnchor: 'prompt-end', tailPrompt: 'TAIL {{scene}}\n{{steps}}' },
+        async () => ({ content: 'OUT' }));
+    assert.match((await h.pipeline.runPipeline({ inject: false })).stepOutputs.Assess, /OUT/);
+    assert.match(h.requests[0].messages.map(message => message.content).join('\n'), /Facts:\n\(no scene facts yet\)/);
+    seedScene(h, [sceneFact('time', 'dusk', 0, 'Hello'), sceneFact('Alice.position', 'by the door', 0, 'Hello'), sceneFact('location', 'inn', 0, 'Hello')]);
+    const result = await h.pipeline.runPipeline({ inject: false });
+    assert.match(h.requests[1].messages.map(message => message.content).join('\n'), /Facts:\nlocation: inn\ntime: dusk\nAlice\.position: by the door/);
+    assert.match(result.injectionText, /^TAIL location: inn\ntime: dusk\nAlice\.position: by the door\n\[Assess\]/);
+    const resolve = h.pipeline.makeMacroResolver({ char: h.context.characters[0], profile: null, chat: h.savedChat, stepOutputs: {}, settings: h.state.getSettings() });
+    assert.equal(resolve('scene'), 'location: inn\ntime: dusk\nAlice.position: by the door');
+    // Facts anchored to a message that is no longer in the chat do not apply.
+    h.savedChat[0].mes = 'Edited';
+    assert.equal(resolve('scene'), '(no scene facts yet)');
+});
+
+test('the planner context and the Directive Enforcement prompt carry the scene state', async () => {
+    const h = await harness(sceneSettings, undefined, { planner: true });
+    const settings = h.state.getSettings();
+    assert.doesNotMatch(h.planner.sharedAgentContext({ char: h.context.characters[0], profile: null, settings, directive: null }), /SCENE STATE/);
+    seedScene(h, [sceneFact('location', 'inn', 0, 'Hello')]);
+    assert.match(h.planner.sharedAgentContext({ char: h.context.characters[0], profile: null, settings, directive: null }), /\[SCENE STATE — established facts; data\]\nlocation: inn/);
+    assert.match(await readFile(new URL('../src/pipeline.js', import.meta.url), 'utf8'), /Scene state \(established facts\):'?,?\s*\r?\n\s*'\{\{scene\}\}'/);
+});
+
+test('scene in the reply tail is optional, precedes the brief, is droppable and is not duplicated by {{scene}}', async () => {
+    const respond = async () => ({ content: 'ASSESSED' });
+    const base = { ...sceneSettings, injectAnchor: 'prompt-end', steps: [step('A', 'TASK')], tailPrompt: '{{steps}}\nGo.' };
+    const off = await harness(base, respond);
+    seedScene(off, [sceneFact('location', 'inn', 0, 'Hello')]);
+    assert.doesNotMatch((await off.pipeline.runPipeline({ inject: false })).injectionText, /Scene state/);
+    const on = await harness({ ...base, sceneInTail: 'on' }, respond);
+    seedScene(on, [sceneFact('location', 'inn', 0, 'Hello')]);
+    const result = await on.pipeline.runPipeline({ inject: false });
+    assert.match(result.injectionText, /\[A\]\nASSESSED[\s\S]*Go\.\n\n\[Scene state\]\nlocation: inn$/);
+    assert.ok(result.tail.sections.some(section => section.label === 'Scene state' && section.tokens > 0));
+    // Empty scene: no section at all.
+    const empty = await harness({ ...base, sceneInTail: 'on' }, respond);
+    assert.doesNotMatch((await empty.pipeline.runPipeline({ inject: false })).injectionText, /Scene state/);
+    // The template already places the scene: no second section.
+    const macro = await harness({ ...base, sceneInTail: 'on', tailPrompt: 'S: {{scene}}\n{{steps}}' }, respond);
+    seedScene(macro, [sceneFact('location', 'inn', 0, 'Hello')]);
+    const placed = (await macro.pipeline.runPipeline({ inject: false })).injectionText;
+    assert.equal(placed.split('location: inn').length - 1, 1);
+    assert.doesNotMatch(placed, /\[Scene state\]/);
+    // Budget: priority 70 sits below the brief (90) and above a default block (50).
+    const filler = Array.from({ length: 120 }, (_, index) => `fact${index}`).join(' ');
+    const tight = await harness({ ...base, sceneInTail: 'on', tailMaxTokens: 40 }, respond);
+    seedScene(tight, [sceneFact('location', filler, 0, 'Hello')]);
+    const squeezed = await tight.pipeline.runPipeline({ inject: false });
+    assert.ok(plain(squeezed.tail.dropped).includes('Scene state'));
+    assert.doesNotMatch(squeezed.injectionText, /Scene state/);
+});
+
+test('scene in a history-anchored injection is its own block', async () => {
+    const h = await harness({ ...sceneSettings, sceneInTail: 'on', injectAnchor: 'before-last-user', steps: [step('A', 'TASK')] }, async () => ({ content: 'ASSESSED' }));
+    seedScene(h, [sceneFact('location', 'inn', 0, 'Hello')]);
+    const chat = [...h.savedChat];
+    await h.pipeline.runPipeline({ chat });
+    assert.ok(chat.some(message => /^\[Scene state\]\nlocation: inn$/.test(message.mes)));
+});
+
+test('scene tracker writes facts anchored to the reply; they vanish when the reply text changes', async () => {
+    const h = await harness(sceneSettings, async () => ({ content: '<think>hm</think>\n<set key="location">the cellar</set>\n<set key="Alice.mood">calm</set>' }));
+    const reply = { name: 'Alice', mes: 'Alice walks down into the cellar.' };
+    h.savedChat.push(reply);
+    const outcome = await h.scene.runSceneTracker(reply);
+    assert.equal(outcome.applied, 2);
+    assert.deepEqual(sceneOf(h), { location: 'the cellar', 'Alice.mood': 'calm' });
+    const stored = plain(h.state.getChatStore().scene.facts);
+    assert.deepEqual(stored.map(item => [item.key, item.by, item.sourceIndex, item.sourceText]),
+        [['location', 'tracker', 1, reply.mes], ['Alice.mood', 'tracker', 1, reply.mes]]);
+    const prompt = h.requests[0].messages.map(message => message.content).join('\n');
+    assert.match(prompt, /\(no scene facts yet\)/);
+    assert.match(prompt, /Alice: Alice walks down into the cellar\./);
+    assert.ok(h.context.activityEntries.some(entry => entry.title === 'Scene: 2 updates' && /\+ location: the cellar/.test(entry.text)));
+    // A swipe / edit of the reply drops its facts; restoring the text restores them.
+    reply.mes = 'Alice climbs back up.';
+    assert.deepEqual(sceneOf(h), {});
+    reply.mes = stored[0].sourceText;
+    assert.equal(sceneOf(h).location, 'the cellar');
+    // Rewind: the reply is gone.
+    h.savedChat.pop();
+    assert.deepEqual(sceneOf(h), {});
+});
+
+test('scene tracker never overwrites locked keys, reports them, and a no-change answer writes nothing', async () => {
+    let answer = '<set key="Location">attic</set>\n<set key="time">midnight</set>';
+    const h = await harness(sceneSettings, async () => ({ content: answer }));
+    seedScene(h, [sceneFact('location', 'inn', 0, 'Hello')], { locked: ['LOCATION'] });
+    const reply = { name: 'Alice', mes: 'They climb to the attic at midnight.' };
+    h.savedChat.push(reply);
+    const outcome = await h.scene.runSceneTracker(reply);
+    assert.equal(outcome.applied, 1);
+    assert.deepEqual(sceneOf(h), { location: 'inn', time: 'midnight' });
+    assert.match(h.requests[0].messages.map(message => message.content).join('\n'), /location: inn {2}\[LOCKED\]/);
+    assert.ok(h.context.activityEntries.some(entry => /ignored 1 locked key/.test(entry.title ?? '')));
+    // <none/> is a valid answer and changes nothing; garbage is retried then fails.
+    answer = '<none/>';
+    assert.equal((await h.scene.runSceneTracker(reply)).applied, 0);
+    assert.equal(h.state.getChatStore().scene.facts.length, 2);
+    answer = 'no tags at all';
+    await assert.rejects(h.scene.runSceneTracker(reply), /Unusable model output/);
+});
+
+test('scene tracker results are discarded when the reply changes while the model is thinking', async () => {
+    const h = await harness(sceneSettings, async () => { reply.mes = 'Swiped reply.'; return { content: '<set key="location">attic</set>' }; });
+    const reply = { name: 'Alice', mes: 'Original reply.' };
+    h.savedChat.push(reply);
+    assert.equal(await h.scene.runSceneTracker(reply), null);
+    assert.deepEqual(plain(h.state.getChatStore().scene?.facts ?? []), []);
+});
+
+test('scene tracker honours its switches, narration, user messages, every-N counting and the per-chat busy flag', async () => {
+    const wait = () => new Promise(resolve => setTimeout(resolve, 15));
+    const reply = text => ({ name: 'Alice', mes: text });
+    const run = async (settings, messages) => {
+        const h = await harness({ ...sceneSettings, ...settings }, async () => ({ content: '<none/>' }));
+        for (const message of messages) { h.savedChat.push(message); h.scene.maybeTrackScene(message); await wait(); }
+        return h;
+    };
+    assert.equal((await run({ sceneTrackerEnabled: false }, [reply('a')])).requests.length, 0);
+    assert.equal((await run({ enabled: false }, [reply('a')])).requests.length, 0);
+    assert.equal((await run({}, [{ is_user: true, name: 'User', mes: 'u' }, { is_system: true, mes: 's' }, { name: 'Alice', mes: 'n', extra: { smarttavernNarration: true } }])).requests.length, 0);
+    const every = await run({ sceneTrackerEvery: 2 }, [reply('a'), reply('b'), reply('c'), reply('d')]);
+    assert.equal(every.requests.length, 2);
+    assert.equal(every.state.getChatStore().scene.tick, 4);
+    assert.equal((await run({}, [reply('a'), reply('b')])).requests.length, 2);
+    // Busy: a second tick while one call is in flight is skipped.
+    let release;
+    const slow = await harness(sceneSettings, () => new Promise(resolve => { release = () => resolve({ content: '<none/>' }); }));
+    const first = reply('first');
+    const second = reply('second');
+    slow.savedChat.push(first, second);
+    const pending = slow.scene.runSceneTracker(first);
+    await wait();
+    assert.equal(slow.scene.isSceneBusy(), true);
+    assert.equal(await slow.scene.runSceneTracker(second), null);
+    release();
+    await pending;
+    assert.equal(slow.scene.isSceneBusy(), false);
+    assert.equal(slow.requests.length, 1);
+});
+
+test('Track now ignores the tracker switch and the counter, and picks the latest character reply', async () => {
+    const h = await harness({ ...sceneSettings, sceneTrackerEnabled: false, sceneTrackerEvery: 20 }, async () => ({ content: '<set key="weather">rain</set>' }));
+    assert.match((await h.scene.trackSceneNow()).error, /no character reply/);
+    h.savedChat.push({ name: 'Alice', mes: 'It starts to rain.' }, { is_user: true, name: 'User', mes: 'Nice.' });
+    assert.equal((await h.scene.trackSceneNow()).applied, 1);
+    assert.deepEqual(sceneOf(h), { weather: 'rain' });
+    assert.equal(h.state.getChatStore().scene.facts[0].sourceIndex, 1);
+});
+
+test('the legacy agent and the tracker share one store; agentScene migrates once', async () => {
+    const h = await harness(agentSettings, undefined, { realAgent: true });
+    h.savedChat[0].mes = 'Alice stands beside the door.';
+    h.state.getChatStore().agentScene = [{ key: 'location', value: 'hall', evidence: '', sourceIndex: 0, sourceText: 'Alice stands beside the door.' }];
+    assert.deepEqual(plain({ ...h.tools.getSceneState() }), { location: 'hall' });
+    const store = h.state.getChatStore();
+    assert.equal(store.agentScene, undefined);
+    assert.deepEqual(plain(store.scene.facts.map(item => [item.key, item.by])), [['location', 'agent']]);
+    h.tools.getSceneState();
+    assert.equal(store.scene.facts.length, 1); // idempotent
+    const ctx = { ...agentOptions(h), chat: h.savedChat, toolState: {}, turn: {} };
+    assert.equal((await h.tools.executeToolCall({ name: 'update_scene', args: { key: 'Alice.position', value: 'by the door' } }, ctx)).ok, true);
+    assert.equal(plain(store.scene.facts.at(-1)).by, 'agent');
+    assert.deepEqual(sceneOf(h), { location: 'hall', 'Alice.position': 'by the door' });
+    // Locked keys cannot be changed by the agent.
+    h.scene.setSceneLocked('location', true);
+    const refused = await h.tools.executeToolCall({ name: 'update_scene', args: { key: 'LOCATION', value: 'attic' } }, ctx);
+    assert.equal(refused.ok, true);
+    assert.match(refused.result, /locked/);
+    assert.equal(h.tools.getSceneState().location, 'hall');
+    // The agent prompt reads the shared state too (tracker facts appear in getSceneState).
+    h.savedChat.push({ name: 'Alice', mes: 'Reply' });
+    h.scene.writeSceneFacts([{ key: 'time', value: 'dawn' }], { by: 'tracker', sourceIndex: 1 });
+    assert.equal(h.tools.getSceneState().time, 'dawn');
+});
+
+test('user scene edits are anchored to the last message, logged, undoable and rewind-safe; clear keeps pinned keys', async () => {
+    const h = await harness(sceneSettings);
+    h.savedChat.push({ name: 'Alice', mes: 'Reply one.' });
+    h.scene.writeSceneFacts([{ key: 'location', value: 'inn' }, { key: 'time', value: 'dusk' }, { key: 'weather', value: 'fog' }], { by: 'tracker', sourceIndex: 1 });
+    h.savedChat.push({ is_user: true, name: 'User', mes: 'Hmm.' });
+    assert.equal(h.scene.userSetFacts([{ key: 'LOCATION', value: 'cellar' }]), true);
+    assert.equal(h.scene.userSetFacts([{ key: 'location', value: 'cellar' }]), false); // unchanged
+    assert.equal(h.scene.userSetFacts([{ key: 'Bob.mood', value: 'wary' }], 'add'), true);
+    const facts = plain(h.state.getChatStore().scene.facts);
+    assert.deepEqual(facts.filter(item => item.by === 'user').map(item => [item.key, item.sourceIndex]), [['LOCATION', 2], ['Bob.mood', 2]]);
+    assert.deepEqual(sceneOf(h), { location: 'cellar', time: 'dusk', weather: 'fog', 'Bob.mood': 'wary' });
+    assert.deepEqual(plain(h.scene.sceneLog().map(item => [item.action, item.changes[0].before, item.changes[0].after])), [['edit', 'inn', 'cellar'], ['add', null, 'wary']]);
+    // Undo restores the earlier value (and drops the new key); stale undo is refused.
+    assert.equal(h.scene.undoSceneLogEntry(0), true);
+    assert.equal(sceneOf(h).location, 'inn');
+    assert.equal(h.scene.undoSceneLogEntry(0), true); // the 'Bob.mood' entry shifted to index 0
+    assert.equal(sceneOf(h)['Bob.mood'], undefined);
+    // Rewind past the user's anchor message: the user's facts vanish with it.
+    h.scene.userSetFacts([{ key: 'time', value: 'night' }]);
+    assert.equal(sceneOf(h).time, 'night');
+    h.savedChat.pop();
+    assert.equal(sceneOf(h).time, 'dusk');
+    // Clear: removal facts for unpinned keys, one log entry, pinned keys stay, rewind restores.
+    h.scene.setScenePinned('weather', true);
+    h.savedChat.push({ is_user: true, name: 'User', mes: 'Next.' });
+    assert.equal(h.scene.clearScene(), 2);
+    assert.deepEqual(sceneOf(h), { weather: 'fog' });
+    assert.equal(h.scene.sceneLog().at(-1).action, 'clear');
+    assert.equal(h.scene.undoSceneLogEntry(h.scene.sceneLog().length - 1), true);
+    assert.deepEqual(sceneOf(h), { location: 'inn', time: 'dusk', weather: 'fog' });
+});
+
+test('sceneMaxFacts caps the resolved scene without evicting pinned keys, and the log keeps 30 entries', async () => {
+    const h = await harness({ ...sceneSettings, sceneMaxFacts: 10 });
+    h.savedChat.push({ name: 'Alice', mes: 'Reply.' });
+    h.scene.writeSceneFacts(Array.from({ length: 14 }, (_, index) => ({ key: `k${index}`, value: `v${index}` })), { by: 'tracker', sourceIndex: 1 });
+    h.scene.setScenePinned('k0', true);
+    const keys = Object.keys(sceneOf(h));
+    assert.equal(keys.length, 10);
+    assert.ok(keys.includes('k0'));
+    assert.ok(!keys.includes('k1') && !keys.includes('k2') && !keys.includes('k3') && !keys.includes('k4'));
+    assert.ok(keys.includes('k13'));
+    for (let index = 0; index < 35; index++) h.scene.userSetFacts([{ key: 'time', value: `t${index}` }]);
+    assert.equal(h.scene.sceneLog().length, 30);
+});
+
+test('scene settings: new installs enable the tracker, existing installs get it off once, values are validated', async () => {
+    const fresh = await harness();
+    fresh.context.extensionSettings.smarttavern = {};
+    fresh.state.loadSettings();
+    let settings = fresh.state.getSettings();
+    assert.deepEqual(plain([settings.sceneTrackerEnabled, settings.sceneVersion, settings.sceneTrackerEvery, settings.sceneTrackerLookback, settings.sceneTrackerMaxTokens, settings.sceneMaxFacts, settings.sceneInTail, settings.sceneTrackerProfileId]),
+        [true, 1, 1, 4, 1024, 40, 'off', '']);
+    const existing = await harness();
+    existing.context.extensionSettings.smarttavern = { agentEngine: 'legacy', enabled: true };
+    existing.state.loadSettings();
+    assert.equal(existing.state.getSettings().sceneTrackerEnabled, false);
+    assert.equal(existing.state.getSettings().sceneVersion, 1);
+    // The user opts in once; reloading never flips it back.
+    existing.state.getSettings().sceneTrackerEnabled = true;
+    existing.state.loadSettings();
+    assert.equal(existing.state.getSettings().sceneTrackerEnabled, true);
+    const bad = await harness({ sceneVersion: 1, sceneTrackerEvery: 99, sceneTrackerLookback: 0, sceneTrackerMaxTokens: 'x', sceneMaxFacts: 5, sceneInTail: 'maybe', sceneTrackerEnabled: 'yes', sceneTrackerProfileId: 7 });
+    settings = bad.state.getSettings();
+    assert.deepEqual(plain([settings.sceneTrackerEvery, settings.sceneTrackerLookback, settings.sceneTrackerMaxTokens, settings.sceneMaxFacts, settings.sceneInTail, settings.sceneTrackerEnabled, settings.sceneTrackerProfileId]),
+        [20, 1, 1024, 10, 'off', true, '']);
 });

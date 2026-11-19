@@ -1,6 +1,6 @@
 // SmartTavern — ST-bound character-ruling ledger. Storage lives in the per-chat
 // store (getChatStore().rulings / agentRulingSeq / agentRulingLog — precedent:
-// agentMemoryLog / agentScene), the oracle is one JSON-schema'd generateWithRetry
+// agentMemoryLog), the oracle is one JSON-schema'd generateWithRetry
 // call, and every mutation lands in a capped undo log mirrored on undoMemoryLogEntry.
 //
 // A MISSING ledger keeps the whole feature inert: reads return [], prune is a no-op

@@ -1,0 +1,13 @@
+{
+    "name": "smarttavern-mcp",
+    "version": "1.0.0",
+    "description": "SillyTavern server plugin: bridges MCP servers to the SmartTavern extension",
+    "private": true,
+    "type": "module",
+    "main": "index.js",
+    "scripts": { "test": "node --test" },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.12.0",
+        "zod": "^3.25.0 || ^4.0.0"
+    }
+}

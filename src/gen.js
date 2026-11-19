@@ -4,6 +4,7 @@
 import { getContext } from '../../../../extensions.js';
 import { getSettings, clampInt, warn, normalizeStepSampling } from './state.js';
 import { activityEntry } from './progress.js';
+import { toolSupport, forcedToolChoice, toOpenAiTools, normalizeToolResponse } from './native-core.js';
 
 let internalDepth = 0;
 const internalEvents = new WeakSet();
@@ -245,6 +246,53 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
     });
     activeQueue = request.catch(() => {});
     return abortable(request, signal);
+}
+
+// --------------------------------------------------------------------------------------------
+// Native function calling (GM tick, opt-in): one non-streaming Chat Completion request that
+// carries OpenAI-format `tools`, answered with the RAW backend response so tool calls can be
+// read. Profiles only — the active connection (generateRaw) cannot return tool calls.
+// --------------------------------------------------------------------------------------------
+
+/**
+ * Can this profile do native tool calling? ST's ToolManager list, mirrored by native-core.js.
+ * @returns {{supported: boolean, reason: string, source: string, forcedChoice: string|null}}
+ */
+export function nativeToolStatus(profileId = '') {
+    const profile = profileId ? getConnectionProfile(profileId) : null;
+    const source = profile ? String(getContext().CONNECT_API_MAP?.[profile.api]?.source ?? '') : '';
+    const support = toolSupport(profile, source);
+    return { ...support, source, forcedChoice: support.supported ? forcedToolChoice(source) : null };
+}
+
+/**
+ * One tool-calling request.
+ * @param {object} options
+ * @param {string} options.profileId Connection Manager profile (required)
+ * @param {string} [options.systemPrompt]
+ * @param {Array} options.messages OpenAI-format messages (user / assistant+tool_calls / tool)
+ * @param {{name: string, description: string, inputSchema: object}[]} [options.tools]
+ * @param {string|object} [options.toolChoice='auto'] 'auto' | 'required' | 'any' (see forcedToolChoice)
+ * @returns {Promise<{content: string, reasoning: string, toolCalls: {id: string, name: string, args: object, parseError: string}[]}>}
+ */
+export async function generateWithTools({ profileId = '', systemPrompt = '', messages = [], tools = [], toolChoice = 'auto', maxTokens = 512, signal = null, reasoning = null } = {}) {
+    throwIfAborted(signal);
+    const profile = profileId ? getConnectionProfile(profileId) : null;
+    if (!profile) throw new Error('native tool calling needs a connection profile');
+    if ((profile.mode ?? 'cc') !== 'cc') throw new Error('native tool calling needs a Chat Completion profile');
+    const service = getServiceFromContext() ?? await loadServiceFallback();
+    if (!service || typeof service.sendRequest !== 'function') throw new Error('the Connection Manager request service is unavailable');
+    const source = getContext().CONNECT_API_MAP?.[profile.api]?.source;
+    const prompt = [...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []), ...messages];
+    const promptChars = prompt.reduce((sum, message) => sum + String(message?.content ?? '').length + JSON.stringify(message?.tool_calls ?? '').length, 0);
+    const payload = tools.length ? { tools: toOpenAiTools(tools), tool_choice: toolChoice } : {};
+    const raw = await abortable(withOutputLimit(`profile:${profile.id}`, effectiveMaxTokens(maxTokens, promptChars, profile.id), signal,
+        tokens => withReasoningRequest(overrides => service.sendRequest(profile.id, prompt, tokens, {
+            stream: false, signal, extractData: false, includePreset: true, includeInstruct: true,
+        }, overrides), payload, { reasoning, chat: true, source, model: profile.model,
+            key: JSON.stringify([profile.id, profile.api, profile.model, profile['api-url']]), signal })), signal);
+    throwIfAborted(signal);
+    return normalizeToolResponse(raw);
 }
 
 // --------------------------------------------------------------------------------------------

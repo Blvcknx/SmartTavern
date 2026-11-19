@@ -10,6 +10,7 @@ export const DEFAULT_PRIORITY = 50;
 // Fixed priorities of the non-step tail sections (steps carry their own `priority`).
 export const PRIORITY_BRIEF = 90;
 export const PRIORITY_USER_ANSWERS = 80;
+export const PRIORITY_SCENE = 70;
 export const PRIORITY_PROFILE = 60;
 
 // --------------------------------------------------------------------------------------------

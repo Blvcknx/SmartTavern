@@ -1288,3 +1288,73 @@ dialog.smarttavern_user_popup {
 .smarttavern_step_card.collapsed .smarttavern_step_lean {
     display: none;
 }
+
+/* Scene tab: key label, author badges and the pin / lock toggles reuse the ruling-row styles. */
+#smarttavern_panel .smarttavern_scene_key {
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#smarttavern_panel .smarttavern_agent_action_tracker {
+    color: var(--SmartThemeGreenColor, #75ac28);
+}
+
+#smarttavern_panel .smarttavern_agent_action_agent {
+    color: var(--SmartThemeQuoteColor);
+}
+
+#smarttavern_panel .smarttavern_agent_action_user,
+#smarttavern_panel .smarttavern_agent_action_add,
+#smarttavern_panel .smarttavern_agent_action_edit,
+#smarttavern_panel .smarttavern_agent_action_clear {
+    opacity: 0.85;
+}
+
+#smarttavern_panel .smarttavern_scene_pin.is-pinned,
+#smarttavern_panel .smarttavern_scene_lock.is-pinned {
+    color: var(--SmartThemeQuoteColor);
+}
+
+#smarttavern_panel #smarttavern_scene_new_key,
+#smarttavern_panel #smarttavern_scene_new_value {
+    flex: 1 1 120px;
+    min-width: 0;
+}
+
+/* GM engine (Agent tab): progress clock bars and the clock/agenda rows. */
+#smarttavern_panel .smarttavern_gm_bar {
+    height: 6px;
+    margin: 4px 0;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--SmartThemeBorderColor);
+}
+
+#smarttavern_panel .smarttavern_gm_bar > span {
+    display: block;
+    height: 100%;
+    background: var(--SmartThemeQuoteColor);
+}
+
+#smarttavern_panel .smarttavern_gm_clock_advance.disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+#smarttavern_panel #smarttavern_gm_transcript summary {
+    cursor: pointer;
+    margin: 4px 0;
+}
+
+#smarttavern_panel #smarttavern_gm_clock_name,
+#smarttavern_panel #smarttavern_gm_clock_consequence {
+    flex: 1 1 120px;
+    min-width: 0;
+}
+
+#smarttavern_panel #smarttavern_gm_clock_segments {
+    flex: 0 0 64px;
+    min-width: 0;
+}

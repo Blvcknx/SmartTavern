@@ -7,12 +7,14 @@ import {
     showProfilePopup, showRunResults, runUpdateCommand, runRebuildCommand, runResetCommand,
 } from './panel.js';
 import { runStoryCraft, runStoryBeat, runStoryChapter, showStoryDirective } from './story-ui.js';
-import { armAgent } from './agent.js';
+import { cancelGmTick } from './gm.js';
+import { showGmState, armFromCommand } from './gm-ui.js';
 import { parseDice, rollDice } from './agent-core.js';
 import { listAgentOwnedEntries } from './agent-tools.js';
 import { consultOracleManual } from './rulings.js';
 import { showContentPopup, appendSection } from './panel.js';
 import { initProgress } from './progress.js';
+import { showSceneState, runTrackCommand } from './scene-ui.js';
 
 export function initUI() {
     $('#extensions_settings2').append(buildDrawerHtml());
@@ -99,6 +101,7 @@ function wireDrawer() {
             getSettings().enabled = enabledEl.checked;
             saveSettings();
             refreshStatus();
+            if (!enabledEl.checked) cancelGmTick();
             // Mirror the state into the floating panel's copy (if it is currently attached).
             $('#smarttavern_panel #smarttavern_enabled').prop('checked', enabledEl.checked);
         });
@@ -167,10 +170,13 @@ function registerSlashCommands() {
         { name: 'smarttavern-beat', help: 'Compile the next story beat (<steering note>)', run: (arg) => runStoryBeat(arg) },
         { name: 'smarttavern-chapter', help: 'Close the current chapter and write the opening beat of the next', run: () => runStoryChapter() },
         { name: 'smarttavern-story', help: 'Show the story directive the reply model will receive', run: () => showStoryDirective() },
-        { name: 'smarttavern-think', help: 'Arm the selected agent engine for the next reply (one-shot; requires Armed mode)', run: (_arg) => { armAgent(); toastr.info('SmartTavern will run the selected agent before the next reply.', 'SmartTavern'); } },
+        { name: 'smarttavern-think', help: 'Arm the selected agent engine for the next reply (one-shot; requires Armed mode). With the GM engine in Armed tick mode it arms the next GM tick', run: (_arg) => armFromCommand() },
+        { name: 'smarttavern-gm', help: 'Show the GM\'s prepared brief, clocks, NPC agendas and queued question', run: (_arg) => showGmState() },
         { name: 'smarttavern-ruling', help: 'Ask the character oracle a behavioral question and save the ruling (<question>)', run: (arg) => runManualRuling(arg) },
         { name: 'smarttavern-roll', help: 'Roll dice now (informational — NOT binding, unlike the agent\'s roll_dice)', run: (arg) => runManualRoll(arg) },
         { name: 'smarttavern-memory', help: 'List the agent-owned lorebook entries of this chat', run: (_arg) => listAgentMemory() },
+        { name: 'smarttavern-scene', help: 'Show the resolved scene state (established facts) of this chat', run: (_arg) => showSceneState() },
+        { name: 'smarttavern-track', help: 'Run the scene tracker on the latest character reply now', run: (_arg) => runTrackCommand() },
         { name: 'smarttavern-hud', help: 'Toggle the SmartTavern floating panel', run: (_arg) => togglePanel() },
     ];
 

@@ -21,6 +21,9 @@ import { generateWithRetry, withInternalGeneration, isAbortError, throwIfAborted
 import { serializeProfile, extractJson } from './profiles.js';
 import { parseDice, rollDice, agentRollExtreme, validateToolArgs, looksRefusal, wordTrim, truncate } from './agent-core.js';
 import { consultOracle } from './rulings.js';
+import { createClock, advanceClock, removeClock, setAgenda, SUBMIT_BRIEF_DEFINITION } from './gm-core.js';
+import { getSceneObject, writeSceneFacts } from './scene.js';
+import { activityEntry } from './progress.js';
 
 // --------------------------------------------------------------------------------------------
 // Chat lorebook helpers (the chat binds exactly ONE book; SmartTavern shares it)
@@ -30,18 +33,11 @@ export const OWNERSHIP_PREFIX = '[ST] ';
 const MEMORY_CONTENT_MAX_WORDS = 80;
 
 /** Scene facts are grounded in saved messages; edited/deleted/swiped sources stop applying.
- * Keep earlier versions so rewinding a conversation restores its earlier facts. */
+ * Keep earlier versions so rewinding a conversation restores its earlier facts.
+ * Since the shared scene store (scene.js) the agent reads the SAME facts as the scene
+ * tracker and the panel — the resolution logic lives in scene-core.js's resolveScene. */
 export function getSceneState(chat = getContext().chat) {
-    const state = Object.create(null);
-    const saved = getContext().chat ?? [];
-    const history = getChatStore().agentScene;
-    for (const fact of (Array.isArray(history) ? [...history].sort((a, b) => a?.sourceIndex - b?.sourceIndex) : [])) {
-        if (!fact || saved[fact.sourceIndex]?.mes !== fact.sourceText
-            || !chat?.some(message => !message.is_system && message.mes === fact.sourceText)) continue;
-        if (fact.value) state[fact.key] = fact.value;
-        else delete state[fact.key];
-    }
-    return state;
+    return getSceneObject(chat);
 }
 
 const EXPERT_SCHEMA = {
@@ -585,16 +581,15 @@ export const TOOL_REGISTRY = [
             // conversation revision so paraphrases and omitted evidence support rewinds.
             if (sourceIndex < 0) sourceIndex = latestIndex;
             if (sourceIndex < 0) return { ok: false, result: '{"error":"no conversation message available to attach the scene update to"}' };
-            const store = getChatStore();
-            if (!Array.isArray(store.agentScene)) store.agentScene = [];
             const key = args.key.trim();
             const value = args.remove === true ? '' : args.value.trim();
-            // Replace only the same key/source revision; retain older messages for rewinds.
-            const fact = { key, value, evidence, sourceIndex, sourceText: saved[sourceIndex].mes };
-            const existing = store.agentScene.findIndex(entry => entry.key === key && entry.sourceIndex === sourceIndex && entry.sourceText === fact.sourceText);
-            if (existing < 0) store.agentScene.push(fact);
-            else store.agentScene[existing] = fact;
-            saveChatStore();
+            // Shared store: replaces only the same key/source revision and retains older
+            // messages' facts for rewinds. Keys the user locked cannot be changed.
+            const { locked } = writeSceneFacts([{ key, value, evidence }], { by: 'agent', sourceIndex });
+            if (locked.length) {
+                activityEntry({ title: `Scene: agent change to locked key "${key}" ignored`, tone: 'info' });
+                return { ok: true, result: `Scene key "${key}" is locked by the user and was left unchanged.` };
+            }
             return { ok: true, result: `Scene fact ${value ? 'recorded' : 'removed'}: ${key}${value ? ` = ${value}` : ''}. Established facts only; planned outcomes remain in the brief.` };
         },
     },
@@ -686,6 +681,15 @@ export const TOOL_REGISTRY = [
             const options = (Array.isArray(args.options) ? args.options : []).map(o => String(o ?? '').trim()).filter(Boolean).slice(0, 4);
             const freeText = args.free_text !== false || !options.length;
 
+            // GM engine: a between-turns tick has nobody to answer. The question is queued
+            // (one per chat) and asked at send time, right before the reply is written.
+            if (ctx.gm) {
+                if (ctx.gm.pendingQuestion) return { ok: false, result: '{"error":"a question is already queued for the next turn — do not ask another"}' };
+                const asked = options.length ? `${question} (${options.join(' / ')})` : question;
+                ctx.gm.pendingQuestion = { question: asked, at: Date.now() };
+                return { ok: true, result: `Question queued: the player will be asked "${asked}" right before the next reply is written, and their answer will join your brief. Do not wait for it — prepare a brief that works with or without it.` };
+            }
+
             // Swipes/regenerates reuse the answer cached for the same user message.
             const cacheKey = ctx.answerKey();
             if (cacheKey && ctx.cachedAnswer(cacheKey)) {
@@ -750,6 +754,74 @@ export const TOOL_REGISTRY = [
                 ok: true,
                 result: `NEW NPC: ${name} — wants: ${want || '?'}. Tell: ${tell || '?'}${persisted ? ' (saved to the chat lorebook; they can recur)' : ' (not persisted)'}.`,
             };
+        },
+    },
+    {
+        name: 'clock',
+        description: 'GM only. Progress clocks track a looming threat, deadline or plan that advances off-screen. create = new clock (name, segments 2-12, consequence = the concrete observable event that happens when it fills); advance = tick it forward by 1-3 when the fiction justified progress; resolve / delete = remove it. When a clock FILLS during this turn its consequence becomes a REQUIRED event of the next reply, so advance only what the story earned. Clocks and their consequences are never shown to the reply model beyond that one event.',
+        usage: '<tool name="clock">{"action":"create","name":"Guards close in","segments":4,"consequence":"Guards pound on the door and demand it be opened."}</tool>',
+        inputSchema: {
+            type: 'object',
+            required: ['action', 'name'],
+            properties: {
+                action: { enum: ['create', 'advance', 'resolve', 'delete'] },
+                name: { type: 'string', minLength: 1, maxLength: 60 },
+                segments: { type: 'number', description: 'create only, 2-12 (default 6)' },
+                by: { type: 'number', description: 'advance only, 1-3 (default 1)' },
+                consequence: { type: 'string', maxLength: 300, description: 'create only: what visibly happens when the clock fills' },
+            },
+        },
+        mode: 'write', maxPerTurn: 6,
+        enabled: settings => settings.agentEngine === 'gm' && settings.agentToolsEnabled?.clock !== false,
+        run(args, ctx) {
+            assertToolCurrent(ctx);
+            const gm = ctx.gm;
+            if (!gm) return { ok: false, result: '{"error":"clocks are only available to the GM engine"}' };
+            const name = String(args.name ?? '').trim();
+            if (args.action === 'create') {
+                if (!String(args.consequence ?? '').trim()) return { ok: false, result: '{"error":"a clock needs a consequence — the event that happens when it fills"}' };
+                const made = createClock(gm.clocks, { name, segments: args.segments, consequence: args.consequence });
+                if (!made.ok) return { ok: false, result: `{"error":"${made.error.replace(/"/g, "'")}"}` };
+                return { ok: true, result: `Clock created: "${made.clock.name}" 0/${made.clock.segments} — when full: ${made.clock.consequence}` };
+            }
+            if (args.action === 'advance') {
+                const moved = advanceClock(gm.clocks, name, args.by);
+                if (!moved.ok) return { ok: false, result: `{"error":"${moved.error.replace(/"/g, "'")}"}` };
+                if (moved.justFilled) {
+                    gm.filledNow.push(moved.clock.id);
+                    return { ok: true, result: `Clock "${moved.clock.name}" is now FULL (${moved.clock.segments}/${moved.clock.segments}). Its consequence becomes a required event of the next reply: ${moved.clock.consequence}` };
+                }
+                return { ok: true, result: `Clock "${moved.clock.name}" advanced to ${moved.clock.filled}/${moved.clock.segments}.` };
+            }
+            if (args.action === 'resolve' || args.action === 'delete') {
+                const gone = removeClock(gm.clocks, name);
+                if (!gone.ok) return { ok: false, result: `{"error":"${gone.error.replace(/"/g, "'")}"}` };
+                gm.filledNow = gm.filledNow.filter(id => id !== gone.clock.id);
+                return { ok: true, result: `Clock "${gone.clock.name}" ${args.action === 'resolve' ? 'resolved' : 'deleted'}.` };
+            }
+            return { ok: false, result: '{"error":"action must be create, advance, resolve or delete"}' };
+        },
+    },
+    {
+        name: 'npc_intent',
+        description: 'GM only. Set or update an NPC\'s PRIVATE agenda: what they want and will do next, off-screen (at most 40 words). Saved per chat and shown to you next turn. The reply model never sees it unless you put the visible part in your brief.',
+        usage: '<tool name="npc_intent">{"name":"Captain Voss","intent":"Quietly orders the harbor sealed and sends two scouts to the inn."}</tool>',
+        inputSchema: {
+            type: 'object',
+            required: ['name', 'intent'],
+            properties: {
+                name: { type: 'string', minLength: 1, maxLength: 60 },
+                intent: { type: 'string', minLength: 3, maxLength: 400 },
+            },
+        },
+        mode: 'write', maxPerTurn: 4,
+        enabled: settings => settings.agentEngine === 'gm' && settings.agentToolsEnabled?.npc_intent !== false,
+        run(args, ctx) {
+            assertToolCurrent(ctx);
+            if (!ctx.gm) return { ok: false, result: '{"error":"NPC agendas are only available to the GM engine"}' };
+            const set = setAgenda(ctx.gm.agendas, args.name, args.intent);
+            if (!set.ok) return { ok: false, result: `{"error":"${set.error.replace(/"/g, "'")}"}` };
+            return { ok: true, result: `Agenda saved for ${set.name}: ${set.intent}` };
         },
     },
     {
@@ -894,8 +966,31 @@ export const TOOL_REGISTRY = [
 // Registry helpers used by the loop, the panel and the catalog
 // --------------------------------------------------------------------------------------------
 
+// Tools registered at runtime by other modules (the MCP bridge, mcp.js). They are plain
+// registry entries — name, description, inputSchema, mode, maxPerTurn, enabled(settings),
+// run(args, ctx) — plus an optional `group`: tools of one group share ONE per-turn budget
+// (maxPerTurn is then the budget of the whole group). Nothing here depends on who registers.
+const extraTools = new Map();
+
+/** Replaces the runtime tool set. Names that collide with a built-in tool are ignored. */
+export function setExtraTools(tools = []) {
+    extraTools.clear();
+    for (const tool of Array.isArray(tools) ? tools : []) {
+        if (tool && typeof tool.name === 'string' && tool.name && typeof tool.run === 'function'
+            && !TOOL_REGISTRY.some(builtin => builtin.name === tool.name)) extraTools.set(tool.name, tool);
+    }
+}
+
+const allTools = () => (extraTools.size ? [...TOOL_REGISTRY, ...extraTools.values()] : TOOL_REGISTRY);
+
 export function getTool(name) {
-    return TOOL_REGISTRY.find(tool => tool.name === name) ?? null;
+    return allTools().find(tool => tool.name === name) ?? null;
+}
+
+/** Calls used so far against `tool`'s budget: its own, or the whole group's. */
+function usesOf(tool, toolState) {
+    if (!tool.group) return toolState[tool.name] ?? 0;
+    return allTools().filter(other => other.group === tool.group).reduce((sum, other) => sum + (toolState[other.name] ?? 0), 0);
 }
 
 /** Tool toggle from settings (the memory_* family shares the `memory` switch). */
@@ -912,14 +1007,28 @@ export function toolEnabled(name, settings = getSettings()) {
 /** One-line catalog of the tools available this turn, for the agent prompt. */
 export function availableTools(settings = getSettings(), { dryRun = false, toolState = {}, turn = {}, toolsOn = true } = {}) {
     if (!toolsOn) return [];
-    return TOOL_REGISTRY.filter(tool => {
+    return allTools().filter(tool => {
         if (!toolEnabled(tool.name, settings) || (dryRun && tool.mode === 'write')) return false;
         const cap = typeof tool.maxPerTurn === 'function' ? tool.maxPerTurn(settings) : tool.maxPerTurn;
-        if ((toolState[tool.name] ?? 0) >= cap) return false;
+        if (usesOf(tool, toolState) >= cap) return false;
         if (/^memory_(?:create|update|delete)$/.test(tool.name)
             && (turn.memoryWrites ?? 0) >= clampInt(settings.agentMemoryWritesPerTurn, 0, 10, 3)) return false;
         return true;
     });
+}
+
+/**
+ * Tool definitions for NATIVE function calling: [{name, description, inputSchema}] for the
+ * tools available this tick (exactly the availableTools rules, MCP tools included), plus
+ * the GM's final `submit_brief` tool. `ctx.toolsOn: false` leaves only submit_brief (the
+ * forced last request); `ctx.submit: false` omits it.
+ */
+export function listToolDefinitions(settings = getSettings(), ctx = {}) {
+    const definitions = availableTools(settings, ctx).map(tool => ({
+        name: tool.name, description: tool.description, inputSchema: tool.inputSchema ?? { type: 'object', properties: {} },
+    }));
+    if (ctx.submit !== false && settings.agentEngine === 'gm') definitions.push({ ...SUBMIT_BRIEF_DEFINITION });
+    return definitions;
 }
 
 // Turn-local receipts; a later successful write invalidates that subsystem's receipt.
@@ -967,7 +1076,7 @@ export async function executeToolCall(call, ctx) {
     }
     const count = ctx.toolState[name] ?? 0;
     const cap = typeof tool.maxPerTurn === 'function' ? tool.maxPerTurn(ctx.settings) : tool.maxPerTurn;
-    if (Number.isFinite(cap) && count >= cap) {
+    if (Number.isFinite(cap) && usesOf(tool, ctx.toolState) >= cap) {
         return wrap({ ok: false, result: `{"error":"per-turn limit (${cap}) reached for ${name}"}` });
     }
     if (!availableTools(ctx.settings, ctx).some(candidate => candidate.name === name)) {

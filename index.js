@@ -8,8 +8,11 @@ import {
     runRefinementPipeline, hasFreshReply, cancelFreshReply,
 } from './src/pipeline.js';
 import { maybeAutoUpdate } from './src/profiles.js';
+import { maybeTrackScene } from './src/scene.js';
 import { onStoryCharacterReply, resetStoryGenerationState } from './src/story.js';
 import { clearAgentSession } from './src/agent.js';
+import { maybeRunGmTick, clearGmSession } from './src/gm.js';
+import { initMcp } from './src/mcp.js';
 import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
 import { initPromptTail } from './src/tail.js';
@@ -22,6 +25,8 @@ async function initSmartTavern() {
     // ST exposes eventTypes; older builds/extensions may use event_types.
     const events = context.event_types ?? context.eventTypes;
     initPromptTail();
+    // Optional MCP bridge: probes the server plugin in the background when switched on (fails open).
+    initMcp();
     // Living description: swap the card's description for the stored profile in the
     // assembled prompt (chat completion messages / combined prompt). Registered after
     // the tail so both makeLast hooks keep their relative order.
@@ -48,6 +53,8 @@ async function initSmartTavern() {
         // Thinking agent: drop the armed flag, the last turn state and the cached
         // ask-user answers — they belong to the previous chat.
         clearAgentSession();
+        // GM engine: a running tick belongs to the previous chat — cancel it.
+        clearGmSession();
         // An in-flight refinement may still be veiling a message from the previous chat;
         // its DOM is gone, so this only clears bookkeeping and any stray overlay.
         dismissAllVeils();
@@ -100,6 +107,10 @@ function onMessageReceived(messageId) {
         // (see onCharacterMessageRendered) so it reads the refined reply.
         if (settings.enabled && settings.refinementEnabled) return;
         maybeAutoUpdate(message);
+        // Scene tracker: same moment and order as the profile auto-update. Both are
+        // fire-and-forget background calls; neither waits for the other. The GM tick
+        // (opt-in engine) starts after the tracker so it reads the updated scene.
+        void maybeRunGmTick(message, { after: maybeTrackScene(message) });
     } catch (error) {
         warn('MESSAGE_RECEIVED handler failed', error);
     }
@@ -123,6 +134,8 @@ async function onCharacterMessageRendered(messageId, type) {
         // cancelled or skipped refinement) must not skip the character's profile
         // maintenance, and the updater reads whatever draft survived.
         maybeAutoUpdate(context.chat?.[messageId]);
+        const reply = context.chat?.[messageId];
+        void maybeRunGmTick(reply, { after: maybeTrackScene(reply) });
     } catch (error) {
         warn('refinement hook failed', error);
     }

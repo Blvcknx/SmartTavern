@@ -87,7 +87,7 @@ Everything is summoned as a compact panel over the chat window — no drawer dig
 
 - **Right-click any character avatar** in the chat (long-press on touch devices) → quick menu: *Edit living bio*, *Edit pipeline*, *Update bio now*, *Guided update…*, *Last result*.
 - Other entry points: **Extensions (wand) menu → SmartTavern**, the **Open SmartTavern panel** button in the extension settings drawer, and the `/st-hud` toggle.
-- Tabs: **Profile** (the character's living bio, editable in place — manual edits save automatically with source `manual`; each field header has a **wand** to regenerate that field alone and a **compass** for a guided regeneration with extra direction from you; the optional **Guidance** box feeds the next **Update** / **Rebuild** as one-shot extra direction that never overrides the schema or the card), **Steps** (two editors — expansion steps and refinement passes; cards collapse on header click), **Schema** (profile field editor), **Results** (the latest run of each pipeline — dry run or captured from the last generation), **Settings** (everything else).
+- Tabs: **Profile** (the character's living bio, editable in place — manual edits save automatically with source `manual`; each field header has a **wand** to regenerate that field alone and a **compass** for a guided regeneration with extra direction from you; the optional **Guidance** box feeds the next **Update** / **Rebuild** as one-shot extra direction that never overrides the schema or the card), **Scene** (the shared [scene state](#scene-state): editable facts with pin / lock / delete, Add fact, Track now, Clear scene, undo list), **Steps** (two editors — expansion steps and refinement passes; cards collapse on header click), **Schema** (profile field editor), **Results** (the latest run of each pipeline — dry run or captured from the last generation), **Settings** (everything else).
 - Drag the header to move the panel; double-click the header to reset to the default (left-center) position. Tab and position are remembered.
 - `Esc` closes the panel (native popups keep priority).
 - On screens ≤ 900 px the panel becomes a near-fullscreen sheet and dragging is disabled.
@@ -133,6 +133,17 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Field inject / keywords | Schema rows: **Always** (default for existing configs), **When relevant** or **Never**, plus optional keywords — what the *reply model* sees of the profile. |
 | Block role | Expansion steps only: role of each generated output when using a history anchor; prompt-end mode uses the global tail role. Refinement passes have no role selector. |
 | Profile updater connection profile | Saved Connection Manager profile used by bootstrap/update/rebuild |
+| Scene tracker | Background call after each character reply that records scene facts (on for new installs, off for existing installs until enabled; see [Scene state](#scene-state)) |
+| Scene tracker connection profile | Connection Manager profile for the tracker (empty = active connection) |
+| Track every N replies / lookback / max tokens | Tracker cadence (default 1, 1–20, per chat), messages it reads (default 4, 1–20) and output budget (default 1024) |
+| Max scene facts | Cap on the resolved scene (default 40, 10–200); the least recently set unpinned facts drop out first |
+| Scene state in the reply tail | Off (default) or On: a `[Scene state]` section in the prompt-end tail (priority 70 for the tail budget) |
+| Agent engine | Agent tab: **Planner** (default), **GM — thinks between turns (background)** or **Legacy**. The GM is opt-in because every tick is an extra background call; upgrading never changes your engine, and switching engines never deletes data (see [GM engine](#gm-engine)). |
+| GM tick mode | **Every reply** (default), **Every Nth reply** (N = 2–20, counted per chat) or **Armed** (only after **Think next turn** / `/smarttavern-think`; the arm is consumed when the tick starts) |
+| GM task | Editable prompt section for the GM tick (`gmTask`) |
+| GM / fit-check / agent connection profile | Connection Manager profiles for the GM tick (empty = agent profile), for the small send-time branch check (empty = GM profile) and the shared fallback (empty = active connection) |
+| Wait for the GM (ms) | Send time: how long to wait for a tick that is still running (default 10000, 0–60000); after that the planner runs and the late tick is cancelled |
+| GM tools | The Agent tab's tool switches also cover `clock` and `npc_intent`; they exist only while the engine is GM. Budgets (iterations, tool calls, timeout, lookback, brief word cap) are shared with the Legacy agent. |
 | Disable floating UI | Master switch for the floating panel, avatar context menu and wand-menu button |
 | Run expansion / Run refinement (Results tab) | Dry run each pipeline: expansion runs its steps without injecting; refinement previews what the passes would change about the last character reply, saving nothing |
 
@@ -163,6 +174,7 @@ Each refinement pass streams progress to the activity display and the reply veil
 | `{{previous}}` | Expansion steps: this step's previous output in this chat, or `(none yet)` (see [Lean context](#lean-context)) |
 | `{{steps}}` | Earlier completed outputs in a step prompt; all generated outputs in the reply-tail template, in configured order |
 | `{{draft}}` / `{{original_draft}}` | Refinement passes only: the current working draft / the original reply before any pass touched it. In surgical passes `{{draft}}` renders the numbered paragraphs; `{{draft_plain}}` gives the unnumbered working draft, `{{draft_paragraphs}}` forces the numbered rendering in any pass |
+| `{{scene}}` | The shared scene state as `key: value` lines (`location`, `time`, `weather` first), or `(no scene facts yet)` — see [Scene state](#scene-state) |
 | `{{story}}` | The compiled scene directive text (Story Director; never contains secrets or future chapters) |
 | `{{must}}` / `{{beat}}` / `{{chapter}}` / `{{ledger}}` | The required event / the current beat text / the current chapter line / the fact ledger |
 
@@ -231,6 +243,32 @@ Four opt-in features that shrink what is sent to the reply model and what the ex
 
 **Reply-tail token budget**. With a budget above 0 the prompt-end tail is measured (about 3.5 characters per token) per section: the story directive and required events are never dropped; the Turn Brief has priority 90, saved answers 80, the profile inside the tail 60 and each expansion block its *Priority* (default 50). While over budget, whole sections are dropped lowest priority first (ties: the later one first) by re-expanding the template without them; text is never cut. Results shows the estimated tokens per section and a "Tail budget: dropped X, Y (≈N tokens)" line, also written to the activity log. The budget does not apply to history-anchor injection positions, and the profile is not counted as droppable when the description override already carries it.
 
+## Scene state
+
+One **shared scene store** per chat holds the established, observable facts of the current scene: `location`, `time`, `weather`, and per character `<Name>.position`, `<Name>.clothing`, `<Name>.injuries`, `<Name>.inventory`, `<Name>.knows`, `<Name>.mood`. Keys match case-insensitively (the first-seen casing is kept). Three authors write to it, and each fact shows who set it last (tracker / agent / user badge in the **Scene** tab):
+
+- **Scene tracker** — a background call after each finalized character reply (after refinement when refinement runs, in the same place and order as the profile auto-update; never for narration, user or system messages). It reads the current scene, the participants, the key conventions and the last few messages and answers with tags only: `<set key="Alice.position">kneeling by the fire</set>`, `<remove key="Alice.inventory"/>` or `<none/>`. Quote-grounded facts only, never plans or speculation, values of at most 20 words, at most 12 operations per run. The parser tolerates think blocks, code fences, odd quoting and unclosed tags. Runs never overlap within a chat (a tick that finds one running is skipped), and a result is discarded when the reply was swiped or edited in the meantime.
+- **Legacy agent** — `update_scene` writes into the same store, so the Legacy agent behaves as before (it reads the shared facts, including the tracker's).
+- **You** — edit values, add facts, pin, lock or delete them in the **Scene** tab.
+
+**Rewind-safe.** Every fact is anchored to the saved chat message it was recorded at (its index and its exact text) and applies only while that message is still there unchanged. Swiping, regenerating, editing or deleting the reply silently drops its facts, and facts recorded earlier apply again; facts apply in message order and an empty value is a removal. The tracker then simply runs again for the new reply. Your own edits are anchored to the **last** chat message, so they are rewind-safe too (they disappear if that message is regenerated). Because facts are anchored, **Clear scene** appends removal facts for every unpinned key instead of truncating the store: it is one undoable step and rewinding past it brings the earlier scene back.
+
+**Pin and lock.** *Pinned* keys are never evicted by the fact cap. *Locked* keys cannot be set or removed by the tracker or the agent (the attempt is skipped and noted in the activity log); only you can change them. Pin and lock lists are per chat and are not rewound.
+
+**Fact cap.** `Max scene facts` (default 40, 10–200) is applied to the **resolved** scene when it is read: beyond the cap, the least recently set unpinned keys drop out of the active scene. This is a pure read-time view — nothing is deleted, rewinds stay exact and no extra facts are written. (The stored fact list itself is bounded at 1000, dropping facts of messages that no longer exist first.)
+
+**Where the scene goes.**
+
+- `{{scene}}` — `key: value` lines, `location` / `time` / `weather` first, then alphabetical; `(no scene facts yet)` when empty. Available in expansion step prompts, refinement passes and the reply-tail template. The default expansion step prompts are **not** changed: add `{{scene}}` to your own prompts where you want it.
+- The expansion planner's context gets a `[SCENE STATE — established facts; data]` section when facts exist.
+- The built-in **Directive Enforcement** pass shows the scene state next to the Turn Brief.
+- **Scene state in the reply tail** (Settings, default **Off**): adds a `[Scene state]` section to the prompt-end tail, before the Turn Brief and the directive, unless your tail template already contains `{{scene}}`. It is a droppable section with priority 70 for the [tail budget](#lean-context) (below saved answers 80 and the Turn Brief 90, above the profile 60 and a default block 50). With a history injection position it is injected as its own block, like saved answers.
+- The Legacy agent's planning prompt and the Agent tab's scene view read the shared store.
+
+**Cost and defaults.** The tracker is one extra LLM call per tracked reply. It is **on for new installs** and **off for installs that existed before this feature** (a one-time migration keeps upgrades from spending money silently): turn it on under Settings → Scene state. Settings: tracker enable, connection profile (empty = active connection), track every N replies (1–20, default 1; counted per chat), lookback (default 4 messages, 1–20), max tokens (default 1024), max scene facts, scene in tail. **Track now** (Scene tab or `/smarttavern-track`) runs the tracker on the latest character reply immediately, ignoring the every-N counter and the enable switch.
+
+Existing `agentScene` facts of a chat move into the shared store (as agent facts) the first time the chat's scene is read, and the old array is removed.
+
 ## Expansion planner and quick narration
 
 The **Agent** tab defaults to **Planner** for new and upgraded installations. It makes one planning call before expansion, reading your existing block names/prompts, the character card and living profile, the current compiled story directive, and up to **24 recent visible messages**. Oldest messages are removed when the input exceeds the connection's context budget. Context-limit errors can trigger up to three shorter-history retries.
@@ -245,7 +283,76 @@ When only the player can supply important missing context, the planner can retur
 
 **Extensions (magic wand) → SmartTavern: Introduce scene…** accepts a request such as “skip a few days and introduce an unexpected visitor.” **Write scene** makes a direct prose call using the agent connection and appends a narrator message. It bypasses expansion and refinement, leaves player choices open, and does not advance Story Director's chapter, beat, or ledger. Cancel while it runs, or retry in the same dialog after a failure. Pending scenes are discarded if the conversation changes. This action works in either agent engine, including when automatic planning is off.
 
-Select **Legacy** in the Agent tab to restore the original tool agent. Its settings, memories, scene state, and rulings remain available; switching engines does not erase them. The sections below describe Legacy behavior.
+Select **GM** in the Agent tab for background planning between turns (see [GM engine](#gm-engine)), or **Legacy** to restore the original tool agent. Its settings, memories, scene state, and rulings remain available; switching engines does not erase them. The sections below describe Legacy behavior.
+
+## GM engine
+
+The **GM** engine (Agent tab → Agent engine → *GM — thinks between turns (background)*) moves the thinking agent out of the send path. After each finalized character reply a **tick** runs in the background while you read and type; it prepares the *next* turn, and sending a message only has to **read** the result.
+
+**The tick** runs after the reply is final (after refinement, the profile update and — when it runs — the scene tracker for that reply, so it reads the updated scene). It is a tool-using loop built on the Legacy agent's machinery: the same tolerant tool-call parser, tool registry and budgets (max iterations, max tool calls, timeout), with a GM system prompt and tag output. The GM sees the character card and living profile, the **story bible including secrets, cast agendas and chapters** and the compiled directive, the scene state, its own clocks and NPC agendas, saved rulings, saved player answers, recent chat (agent lookback) and its previous prepared brief for continuity. Tools: everything the Legacy agent has (`roll_dice`, `consult_character`, `consult_expert`, `update_scene`, `introduce_npc`, memory, `character_ruling`) plus:
+
+- `clock` — progress clocks (`create` with a name, 2–12 segments and a concrete consequence; `advance` by 1–3; `resolve` / `delete`). A clock that fills during a tick is marked full and its consequence becomes a **required event** of the prepared brief.
+- `npc_intent` — an NPC's private agenda (at most 40 words), kept per chat and shown to the GM on later ticks.
+- `ask_user` does **not** open a popup in a tick: it queues one question that is asked at send time (below).
+
+The GM finishes with tags, never JSON: `<brief>` (about 100 words of guidance), up to three `<must>` events, up to four `<branch if="condition on the player's next message">outcome</branch>`, an optional `<fields>` list (which *When relevant* profile fields matter) and `<skip>` entries (planner-activated expansion blocks to skip). Dice rolled during the tick are recorded by code and attached to the brief — dice in model text are never trusted.
+
+**Send time.** The prepared brief is valid only if the reply it was made after is unchanged (same index and exact text) and is still the last character reply before your new message; swipes and regenerations of the *next* reply reuse it, while editing or swiping the anchor reply invalidates it. If a tick for that reply is still running, SmartTavern shows *Waiting for the GM…* for up to **Wait for the GM** milliseconds. Then:
+
+1. A queued question is asked once with the planner's Submit / Skip dialog (never on dry runs, swipes, regenerations or continuations, which reuse a stored answer).
+2. If the brief has branches, one small **fit check** (`gmFitProfileId`, 256 output tokens) sees your latest message and the branch conditions and answers `<use>1,3</use>` or `<use>none</use>`. Any failure includes no branches — the general brief still applies.
+3. The Turn Brief is compiled from the brief, the chosen branch outcomes, the musts, the code-recorded dice and the question/answer, capped by the brief word cap, and injected through the same path as the Legacy agent: its musts and dice feed **Directive Enforcement**, and `{{brief}}` / `{{rolls}}` work. The prepared `<fields>` / `<skip>` choices take the planner's place for [lean context](#lean-context); **no planner call is made**.
+
+If there is no valid brief (the tick is off-cycle, failed, timed out or the anchor changed), the **expansion planner runs exactly as in Planner mode**, so a turn never depends on the GM. The reason is shown in the Agent tab status line, the activity log and the Results tab.
+
+**Safety.** The reply model never sees the bible, the GM transcript, NPC agendas or clocks — only the compiled Turn Brief (and the story directive, as before). Every GM failure fails open, and background ticks never raise unhandled errors. A tick is cancelled when the chat changes or SmartTavern is disabled, and its result is discarded if the anchor reply changes while it thinks. One tick runs at a time per chat; a newer reply preempts the running one.
+
+**Agent tab (GM).** A status line (last tick, running, last planner fallback), **Think now** (a tick on the last character reply, any tick mode), **Think next turn** (arms Armed mode), **Discard prepared brief**, the prepared brief with its musts, branches and dice, the clock list (+1 / resolve / delete and an *Add clock* row), editable NPC agendas, the queued question and a collapsible transcript of the last tick. `/smarttavern-gm` shows the prepared brief, clocks, agendas and queued question in a popup.
+
+**Cost.** Every tick is a tool loop of up to *max iterations* calls plus the tools' own calls, and each send with branches adds one tiny fit-check call; use *Every Nth reply* or *Armed* mode to limit it. Dice, clocks and agendas are plain data in the chat metadata (see Storage).
+
+### Tool transport (native function calling)
+
+By default the GM calls tools by writing `<tool name="…">{json}</tool>` tags (**Tags**, setting `gmToolTransport: 'tags'`), which works with every connection. Two opt-in alternatives (Agent tab → GM → *Tool transport*):
+
+- **Native** — the tools are sent as real OpenAI-format `tools` (function definitions built from the same registry, with JSON-schema arguments) and the model answers with tool calls; their results go back as `role: "tool"` messages. A final tool, **`submit_brief`** (`brief`, `musts[]`, `branches[{if, then}]`, `fields[]`, `skips[]`), ends the tick and goes through the same normalization as the tag output (same word caps and refusal rule). When the iterations run out, the model is asked once more with *only* `submit_brief` offered and `tool_choice` forcing it (`required`, `any` for Claude); if it still does not submit, one tags-format final request finishes the tick.
+- **Auto** — native when the GM connection supports it, otherwise tags (silently).
+
+Native needs a **Chat Completion Connection Manager profile** (GM, else agent profile) whose source is on SillyTavern's own tool-calling list (OpenAI, Claude, Gemini via AI Studio/Vertex, OpenRouter, Mistral, Cohere, DeepSeek, Groq, xAI, custom OpenAI-compatible and others) and whose *prompt post-processing* keeps tool calls (none, or the `…_tools` variants). Requests are non-streaming and read the raw backend response, so Claude `tool_use` blocks, Gemini `functionCall` parts and OpenAI/Cohere `tool_calls` are all understood. The active connection (no profile) is not supported in this version and uses tags. Budgets, per-turn caps and the working-copy isolation of a tick are unchanged. If the **first** native request fails (a model or proxy that rejects `tools`), the whole tick is rerun on tags with one activity note — *Native tool calling unavailable — using tags*; choosing **Native** on a connection that cannot do it also falls back to tags and says why once.
+
+## MCP bridge (optional server plugin)
+
+The **MCP bridge** lets the GM call tools of [Model Context Protocol](https://modelcontextprotocol.io) servers (stdio or HTTP) — for example a wiki lookup for canon facts. Browser extensions cannot start MCP servers, so a small **SillyTavern server plugin** (`server-plugin/`) owns the connections and exposes four JSON routes under `/api/plugins/smarttavern-mcp/` (`GET /status`, `GET /tools`, `POST /call`, `POST /reload`; SillyTavern's normal login/CSRF protection applies). Everything is opt-in: with MCP off, or without the plugin, nothing changes.
+
+**Security.** MCP servers run **with your user's permissions** on the SillyTavern machine. Only configure servers you trust, give them the narrowest `allowTools` list that works, and treat servers whose tools write or delete things as dangerous: mark them `"write": true` (their tools are blocked in dry runs) and keep their budget small. The plugin only reaches servers named in `mcp-servers.json` and only tools those servers really list (and `allowTools` permits). MCP output reaches the model labelled *data, not instructions*, but it is still third-party text.
+
+**Install.**
+
+1. Copy the `server-plugin` folder to `SillyTavern/plugins/smarttavern-mcp`.
+2. In that folder run `npm install` (it needs `@modelcontextprotocol/sdk`).
+3. Set `enableServerPlugins: true` in SillyTavern's `config.yaml`.
+4. Copy `mcp-servers.example.json` to `mcp-servers.json` and edit it (below).
+5. Restart SillyTavern (the console prints `[smarttavern-mcp] ready: N server(s) configured`).
+6. In SmartTavern, Agent tab → engine **GM** → switch **MCP tools (GM only)** on and press **Refresh**.
+
+**`mcp-servers.json`.**
+
+```json
+{ "servers": [
+  { "name": "wiki", "transport": "stdio", "command": "node", "args": ["servers/wiki.js"], "cwd": ".",
+    "env": { "WIKI_DEFAULT": "wikipedia", "WIKI_LANG": "en" } },
+  { "name": "docs", "transport": "http", "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer …" },
+    "allowTools": ["search"], "write": false, "timeoutMs": 30000 }
+] }
+```
+
+`transport` is `stdio` (`command`, `args`, `env`, `cwd` — relative paths resolve against the plugin folder) or `http` (`url`, `headers`; Streamable HTTP, falling back to legacy SSE). Optional per server: `allowTools` (default: every tool the server lists), `write` (default `false`: tools are exposed as read-only; `true` marks them as writers, blocked in dry runs) and `timeoutMs` (default 30000). Connections are made lazily on first use, reused, re-established after a crash, and closed when SillyTavern exits. Results are text (images and resources are summarized as `[image]` / `[resource uri]`) capped at 8000 characters. A server that fails to start only loses its own tools.
+
+**In the GM.** Tools appear as `mcp__<server>__<tool>` (sanitized to `[a-zA-Z0-9_-]`, at most 64 characters, with a short hash on collisions) described as `[MCP <server>] …`, in both the tag catalog and native function definitions. They share one per-tick budget (**MCP calls per tick**, default 3, 0–10). Only the **GM** engine gets them (not the planner or the Legacy agent). The Agent tab lists the servers with their connection state and every tool with a checkbox (unticked tools are never offered; stored as `mcpDisabledTools: ["server:tool"]`). **Refresh** re-checks the plugin and tool list; **Reload config** re-reads `mcp-servers.json` and reconnects.
+
+**Bundled wiki server (`servers/wiki.js`).** A read-only MCP server for Wikipedia and Fandom wikis (both run MediaWiki), enabled in the example config as `wiki`. The GM uses it for canon facts about known fictional characters and public figures. `wiki_search {query, wiki?, lang?, limit ≤ 5}` returns titles and short snippets; `wiki_page {title, wiki?, lang?, section?, maxChars ≤ 6000}` returns plain text (Wikipedia via TextExtracts; Fandom, which lacks it, via the parsed wikitext flattened to text; `section` returns just that section). `wiki` is `wikipedia` (default), a Fandom subdomain such as `starwars`, or a full `https://…/api.php` URL (public hosts only — localhost and IP addresses are refused). Defaults come from `WIKI_DEFAULT` / `WIKI_LANG` in the server's `env`. It sends the user agent `SmartTavern-MCP/1.0`, times out after 10 seconds and caches results for 15 minutes. Wiki text is data, not instructions, and is licensed (Wikipedia: CC BY-SA; Fandom: usually CC BY-SA) — respect each wiki's terms of use and do not hammer it.
+
+**Tests.** `npm test` runs the plugin's tests too; the ones that spawn MCP servers need `npm install` in `server-plugin/` and skip cleanly without it. No test touches the network.
 
 ## Legacy agent and slash commands
 
@@ -294,7 +401,7 @@ The agent has three GM capabilities:
 - **Scene state:** `update_scene` stores one key/value fact with an exact conversation
   quote as evidence. Use keys such as `location`, `time`, `Alice.position`, or
   `Alice.inventory`; `remove: true` removes an obsolete fact. These facts persist in
-  chat metadata and appear in planning prompts and the Agent tab. Planned events and
+  chat metadata (the shared [scene store](#scene-state)) and appear in planning prompts and the Agent tab. Planned events and
   unplayed dice consequences must wait until established in chat. Facts from edited,
   deleted or replaced source messages stop applying; earlier recorded versions can
   apply again when rewinding. Dry runs cannot persist changes.
@@ -323,10 +430,13 @@ suite.
 | `/smarttavern-beat <note>` | `/st-beat` | Compile the next story beat (optional steering note) |
 | `/smarttavern-chapter` | `/st-chapter` | Close the current chapter and write the opening beat of the next |
 | `/smarttavern-story` | `/st-story` | Show the directive the reply model will receive |
-| `/smarttavern-think` | `/st-think` | Arm the agent for the next reply (one-shot; requires Armed mode) |
+| `/smarttavern-think` | `/st-think` | Arm the agent for the next reply (one-shot; requires Armed mode). With the GM engine in Armed tick mode it arms the next GM tick |
+| `/smarttavern-gm` | `/st-gm` | Show the GM's prepared brief, clocks, NPC agendas and queued question |
 | `/smarttavern-ruling <question>` | `/st-ruling` | Ask the character oracle a behavioral question and save the ruling |
 | `/smarttavern-roll <dice>` | `/st-roll` | Roll dice now (informational, not binding) |
 | `/smarttavern-memory` | `/st-memory` | List the agent-owned lorebook memory entries of this chat |
+| `/smarttavern-scene` | `/st-scene` | Show the resolved scene state in a popup |
+| `/smarttavern-track` | `/st-track` | Run the scene tracker on the latest character reply now |
 | `/smarttavern-hud` | `/st-hud` | Toggle the floating panel |
 
 **smarttavern_dump** is registered as a SillyTavern debug function: open it from SillyTavern's debug menu (User Settings → Debug menu). It prints the SmartTavern settings and the chat's store (including stored profiles) to the browser console.
@@ -338,9 +448,12 @@ suite.
 - Story: `chatMetadata.smarttavern.story = { v, bible, chapterIndex, beat, ledger, turnsSinceDelivery, seed, createdAt }` — one story per chat, saved with it.
 - Reusable assessments: `chatMetadata.smarttavern.stepMemory = { [step name]: { text, sourceIndex, sourceText } }`.
 - Kept planner answers: `chatMetadata.smarttavern.userAnswers` (only answers the player chose to keep).
-- Legacy agent: scene state in `chatMetadata.smarttavern.agentScene`, the rulings ledger in `rulings` / `agentRulingSeq` / `agentRulingLog`, the memory undo log in `agentMemoryLog` (all under `chatMetadata.smarttavern`), and agent-owned memory entries as flagged entries in the chat's bound lorebook (user-authored entries are never modified).
+- Scene state: `chatMetadata.smarttavern.scene = { facts: [{ key, value, evidence, sourceIndex, sourceText, by: 'tracker' | 'agent' | 'user', at }], pinned: [keys], locked: [keys], log: [undo entries, max 30], tick }` — shared by the tracker, the Legacy agent and the Scene tab. Formerly the Legacy agent's `agentScene` array, which migrates into `facts` (as `by: 'agent'`) when first read.
+- GM engine: `chatMetadata.smarttavern.gm = { prepared: { anchorIndex, anchorText, brief, musts, branches: [{ if, then }], rolls, fields, skips, createdAt, model, npc, voice, reaction, qa }, previous (the brief that was in force when the newest reply was generated, so swipes of that reply still find theirs), clocks: [{ id, name, segments, filled, consequence, status: 'active' | 'filled' }], agendas: { [npc name]: { intent, at } }, pendingQuestion: { question, at } | null, tick, transcript (last tick, capped), status }`. It holds secrets-adjacent GM data (agendas, clocks) that is only ever sent to the GM's own calls.
+- Legacy agent: the rulings ledger in `rulings` / `agentRulingSeq` / `agentRulingLog`, the memory undo log in `agentMemoryLog` (all under `chatMetadata.smarttavern`), and agent-owned memory entries as flagged entries in the chat's bound lorebook (user-authored entries are never modified).
 - No secrets are stored; connection profiles reference the Connection Manager's own records.
-- Every generation makes up to `1 (bootstrap) + expansion steps + refinement passes` extra LLM calls, plus the planner call (Planner engine), the legacy agent's planning iterations and consults (character, expert, oracle), the built-in Directive Enforcement pass when a story beat is pending, and any retries or connection fallbacks — mind your provider quota/billing. Prompt-tail assembly makes no model call.
+- MCP bridge settings (`mcpEnabled`, `mcpCallsPerTurn`, `mcpDisabledTools`) and `gmToolTransport` live in the global settings; the server list and its credentials live only in the plugin's `mcp-servers.json` on the server, never in chats or settings.
+- Every generation makes up to `1 (bootstrap) + expansion steps + refinement passes` extra LLM calls, plus the scene tracker call per tracked reply (when enabled), the planner call (Planner engine), the GM engine's background tick after each reply (a tool loop) plus one small fit-check call per send when the brief has branches, the legacy agent's planning iterations and consults (character, expert, oracle), the built-in Directive Enforcement pass when a story beat is pending, and any retries or connection fallbacks — mind your provider quota/billing. Prompt-tail assembly makes no model call.
 
 ## Caveats
 

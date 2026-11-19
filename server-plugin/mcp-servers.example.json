@@ -1,0 +1,33 @@
+{
+    "servers": [
+        {
+            "name": "wiki",
+            "transport": "stdio",
+            "command": "node",
+            "args": ["servers/wiki.js"],
+            "env": { "WIKI_DEFAULT": "wikipedia", "WIKI_LANG": "en" },
+            "cwd": ".",
+            "write": false,
+            "timeoutMs": 30000
+        },
+        {
+            "name": "filesystem",
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/a/folder/you/want/to/expose"],
+            "env": {},
+            "cwd": ".",
+            "allowTools": ["read_file", "list_directory", "search_files"],
+            "write": false,
+            "timeoutMs": 30000
+        },
+        {
+            "name": "web-docs",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "headers": { "Authorization": "Bearer YOUR_TOKEN" },
+            "write": false,
+            "timeoutMs": 30000
+        }
+    ]
+}

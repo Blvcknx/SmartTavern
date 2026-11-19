@@ -29,6 +29,7 @@ test('render listeners release ST to end generation before active refinement, th
     const sources = {
         index: await readFile(new URL('../index.js', import.meta.url), 'utf8'),
         gen: await readFile(new URL('../src/gen.js', import.meta.url), 'utf8'),
+        'native-core': await readFile(new URL('../src/native-core.js', import.meta.url), 'utf8'),
         extensions: 'export const getContext = () => context;',
         state: `export const loadSettings = () => {}; export const getSettings = () => ({ enabled: true, refinementEnabled: true });
             export const normalizeStepSampling = value => value;
@@ -41,6 +42,9 @@ test('render listeners release ST to end generation before active refinement, th
         profiles: 'export const maybeAutoUpdate = () => { order.push("updated"); finish(); };',
         story: 'export const onStoryCharacterReply = () => {}; export const resetStoryGenerationState = () => {};',
         agent: 'export const clearAgentSession = () => {};',
+        mcp: 'export const initMcp = () => {};',
+        gm: 'export const maybeRunGmTick = () => {}; export const clearGmSession = () => {};',
+        scene: 'export const maybeTrackScene = () => {};',
         ui: 'export const initUI = () => {};',
         hud: 'export const initHud = () => {};',
         tail: 'export const initPromptTail = () => {};',

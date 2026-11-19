@@ -17,6 +17,8 @@ import {
 } from './rulings.js';
 import { profileOptionsHtml } from './panel.js';
 import { openNarrationDialog } from './narration.js';
+import { gmTabHtml, wireGmTab, GM_TOOL_LABELS } from './gm-ui.js';
+import { cancelGmTick } from './gm.js';
 
 const htmlEscapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
@@ -169,15 +171,85 @@ function rulingSectionHtml(settings) {
 // Rendering
 // --------------------------------------------------------------------------------------------
 
+/** The Tools + Budgets block, shared by the legacy and the GM tab (`extraLabels` adds engine-only tools). */
+function toolsAndBudgetsHtml(settings, extraLabels = {}) {
+    return `
+        <div class="smarttavern_steps_section_title"><i class="fa-solid fa-toolbox"></i><span>Tools</span></div>
+        <label title="Connection profile for consult_expert; empty uses the agent profile">Expert connection profile
+            <select id="smarttavern_expertProfileId" class="smarttavern_profile_select">${profileOptionsHtml(settings.expertProfileId ?? '')}</select>
+        </label>
+        ${Object.entries({ ...TOOL_LABELS, ...extraLabels }).map(([key, label]) => `
+        <label class="checkbox" title="${escapeHtml(label)}">
+            <input class="smarttavern_agent_tool" data-tool="${escapeHtml(key)}" type="checkbox" ${settings.agentToolsEnabled?.[key] !== false ? 'checked' : ''}>
+            <span>${escapeHtml(label)}</span>
+        </label>`).join('')}
+        <label>Memory writes
+            <select id="smarttavern_agentMemoryMode" title="Auto writes directly; Confirm asks per write; Off disables all memory tools">
+                <option value="auto"${settings.agentMemoryMode !== 'confirm' && settings.agentMemoryMode !== 'off' ? ' selected' : ''}>Auto — the agent writes directly</option>
+                <option value="confirm"${settings.agentMemoryMode === 'confirm' ? ' selected' : ''}>Confirm each write</option>
+                <option value="off"${settings.agentMemoryMode === 'off' ? ' selected' : ''}>Off — memory tools disabled</option>
+            </select>
+        </label>
+
+        <div class="smarttavern_steps_section_title"><i class="fa-solid fa-gauge-high"></i><span>Budgets</span></div>
+        <div class="smarttavern_grid">
+            <label title="LLM iterations of the loop; the last one always disables tools">Max iterations
+                <input id="smarttavern_agentMaxIterations" class="text_margin_input" type="number" min="1" max="8" step="1" value="${settings.agentMaxIterations}">
+            </label>
+            <label title="Total tool calls allowed per turn">Max tool calls
+                <input id="smarttavern_agentMaxToolCalls" class="text_margin_input" type="number" min="1" max="24" step="1" value="${settings.agentMaxToolCalls}">
+            </label>
+            <label title="0 disables the deadline. A positive budget pauses while an ask-user popup is open.">Timeout (ms; 0 = unlimited)
+                <input id="smarttavern_agentTimeoutMs" class="text_margin_input" type="number" min="0" max="600000" step="5000" value="${settings.agentTimeoutMs}">
+            </label>
+            <label title="Chat messages the agent sees as context">Chat lookback
+                <input id="smarttavern_agentLookback" class="text_margin_input" type="number" min="0" max="100" step="1" value="${settings.agentLookback}">
+            </label>
+            <label title="Hard word cap of the compiled brief (guidance trims first)">Brief word cap
+                <input id="smarttavern_agentBriefMaxWords" class="text_margin_input" type="number" min="40" max="400" step="10" value="${settings.agentBriefMaxWords}">
+            </label>
+            <label title="Output token budget for consult_character and NPC generation">Auxiliary max tokens
+                <input id="smarttavern_agentAuxMaxTokens" class="text_margin_input" type="number" min="1" max="100000" step="100" value="${settings.agentAuxMaxTokens}">
+            </label>
+            <label title="ask_user calls per turn (0 disables)">Asks per turn
+                <input id="smarttavern_agentAskPerTurn" class="text_margin_input" type="number" min="0" max="3" step="1" value="${settings.agentAskPerTurn}">
+            </label>
+            <label title="Shared by memory create/update/delete and NPC persistence">Memory writes per turn
+                <input id="smarttavern_agentMemoryWritesPerTurn" class="text_margin_input" type="number" min="0" max="10" step="1" value="${settings.agentMemoryWritesPerTurn}">
+            </label>
+            <label title="character_ruling calls per turn (0 disables)">Rulings per turn
+                <input id="smarttavern_agentConsultPerTurn" class="text_margin_input" type="number" min="0" max="4" step="1" value="${settings.agentConsultPerTurn}">
+            </label>
+            <label title="Maximum saved rulings per chat; superseded and tentative ones are pruned first">Ledger cap
+                <input id="smarttavern_agentRulingsMax" class="text_margin_input" type="number" min="5" max="300" step="5" value="${settings.agentRulingsMax}">
+            </label>
+            <label title="Rulings auto-surfaced into one Turn Brief">Surfaced per brief
+                <input id="smarttavern_agentRulingsSurfaceMax" class="text_margin_input" type="number" min="0" max="4" step="1" value="${settings.agentRulingsSurfaceMax}">
+            </label>
+            <label title="Reuse an existing ruling when the question matches at/above this similarity">Reuse threshold
+                <input id="smarttavern_agentRulingReuseThreshold" class="text_margin_input" type="number" min="0.3" max="0.95" step="0.05" value="${settings.agentRulingReuseThreshold}">
+            </label>
+            <label title="Surface a ruling into the brief when its keys match the chat at/above this score">Surface threshold
+                <input id="smarttavern_agentRulingSurfaceThreshold" class="text_margin_input" type="number" min="0.3" max="0.95" step="0.05" value="${settings.agentRulingSurfaceThreshold}">
+            </label>
+        </div>
+    `;
+}
+
 export function renderAgentTab() {
     const $root = $agentRoot();
     if (!$root.length) return;
     const settings = getSettings();
     const engineHtml = `<label>Agent engine
         <select id="smarttavern_agentEngine">
-            <option value="planner"${settings.agentEngine !== 'legacy' ? ' selected' : ''}>Planner — add useful expansion context</option>
+            <option value="planner"${settings.agentEngine !== 'legacy' && settings.agentEngine !== 'gm' ? ' selected' : ''}>Planner — add useful expansion context</option>
+            <option value="gm"${settings.agentEngine === 'gm' ? ' selected' : ''}>GM — thinks between turns (background)</option>
             <option value="legacy"${settings.agentEngine === 'legacy' ? ' selected' : ''}>Legacy — tools and Turn Brief</option>
         </select></label>`;
+    if (settings.agentEngine === 'gm') {
+        $root.html(`${engineHtml}${gmTabHtml(settings)}${toolsAndBudgetsHtml(settings, GM_TOOL_LABELS)}${rulingSectionHtml(settings)}`);
+        return;
+    }
     if (settings.agentEngine !== 'legacy') {
         $root.html(`${engineHtml}
             <div class="smarttavern_hint">Before expansion, the planner reads existing prompts, saved user answers, and up to 24 recent messages. It can add context prompts or ask you a question with Submit / Skip. Answers apply only to the current reply by default. Check &quot;Keep for future replies in this chat&quot; to reuse an answer on later turns. At most five blocks run in total; your saved prompts stay unchanged. Independent blocks can run in parallel. Dry runs and swipes never open questions. See Results for accepted prompts and notices.</div>
@@ -257,65 +329,7 @@ export function renderAgentTab() {
             <span class="smarttavern_missing_profile" id="smarttavern_voice_missing_profile" title="The pinned connection profile no longer exists — requests fall back to the active connection"><i class="fa-solid fa-triangle-exclamation"></i><span>missing</span></span>
         </label>
 
-        <div class="smarttavern_steps_section_title"><i class="fa-solid fa-toolbox"></i><span>Tools</span></div>
-        <label title="Connection profile for consult_expert; empty uses the agent profile">Expert connection profile
-            <select id="smarttavern_expertProfileId" class="smarttavern_profile_select">${profileOptionsHtml(settings.expertProfileId ?? '')}</select>
-        </label>
-        ${Object.entries(TOOL_LABELS).map(([key, label]) => `
-        <label class="checkbox" title="${escapeHtml(label)}">
-            <input class="smarttavern_agent_tool" data-tool="${escapeHtml(key)}" type="checkbox" ${settings.agentToolsEnabled?.[key] !== false ? 'checked' : ''}>
-            <span>${escapeHtml(label)}</span>
-        </label>`).join('')}
-        <label>Memory writes
-            <select id="smarttavern_agentMemoryMode" title="Auto writes directly; Confirm asks per write; Off disables all memory tools">
-                <option value="auto"${settings.agentMemoryMode !== 'confirm' && settings.agentMemoryMode !== 'off' ? ' selected' : ''}>Auto — the agent writes directly</option>
-                <option value="confirm"${settings.agentMemoryMode === 'confirm' ? ' selected' : ''}>Confirm each write</option>
-                <option value="off"${settings.agentMemoryMode === 'off' ? ' selected' : ''}>Off — memory tools disabled</option>
-            </select>
-        </label>
-
-        <div class="smarttavern_steps_section_title"><i class="fa-solid fa-gauge-high"></i><span>Budgets</span></div>
-        <div class="smarttavern_grid">
-            <label title="LLM iterations of the loop; the last one always disables tools">Max iterations
-                <input id="smarttavern_agentMaxIterations" class="text_margin_input" type="number" min="1" max="8" step="1" value="${settings.agentMaxIterations}">
-            </label>
-            <label title="Total tool calls allowed per turn">Max tool calls
-                <input id="smarttavern_agentMaxToolCalls" class="text_margin_input" type="number" min="1" max="24" step="1" value="${settings.agentMaxToolCalls}">
-            </label>
-            <label title="0 disables the deadline. A positive budget pauses while an ask-user popup is open.">Timeout (ms; 0 = unlimited)
-                <input id="smarttavern_agentTimeoutMs" class="text_margin_input" type="number" min="0" max="600000" step="5000" value="${settings.agentTimeoutMs}">
-            </label>
-            <label title="Chat messages the agent sees as context">Chat lookback
-                <input id="smarttavern_agentLookback" class="text_margin_input" type="number" min="0" max="100" step="1" value="${settings.agentLookback}">
-            </label>
-            <label title="Hard word cap of the compiled brief (guidance trims first)">Brief word cap
-                <input id="smarttavern_agentBriefMaxWords" class="text_margin_input" type="number" min="40" max="400" step="10" value="${settings.agentBriefMaxWords}">
-            </label>
-            <label title="Output token budget for consult_character and NPC generation">Auxiliary max tokens
-                <input id="smarttavern_agentAuxMaxTokens" class="text_margin_input" type="number" min="1" max="100000" step="100" value="${settings.agentAuxMaxTokens}">
-            </label>
-            <label title="ask_user calls per turn (0 disables)">Asks per turn
-                <input id="smarttavern_agentAskPerTurn" class="text_margin_input" type="number" min="0" max="3" step="1" value="${settings.agentAskPerTurn}">
-            </label>
-            <label title="Shared by memory create/update/delete and NPC persistence">Memory writes per turn
-                <input id="smarttavern_agentMemoryWritesPerTurn" class="text_margin_input" type="number" min="0" max="10" step="1" value="${settings.agentMemoryWritesPerTurn}">
-            </label>
-            <label title="character_ruling calls per turn (0 disables)">Rulings per turn
-                <input id="smarttavern_agentConsultPerTurn" class="text_margin_input" type="number" min="0" max="4" step="1" value="${settings.agentConsultPerTurn}">
-            </label>
-            <label title="Maximum saved rulings per chat; superseded and tentative ones are pruned first">Ledger cap
-                <input id="smarttavern_agentRulingsMax" class="text_margin_input" type="number" min="5" max="300" step="5" value="${settings.agentRulingsMax}">
-            </label>
-            <label title="Rulings auto-surfaced into one Turn Brief">Surfaced per brief
-                <input id="smarttavern_agentRulingsSurfaceMax" class="text_margin_input" type="number" min="0" max="4" step="1" value="${settings.agentRulingsSurfaceMax}">
-            </label>
-            <label title="Reuse an existing ruling when the question matches at/above this similarity">Reuse threshold
-                <input id="smarttavern_agentRulingReuseThreshold" class="text_margin_input" type="number" min="0.3" max="0.95" step="0.05" value="${settings.agentRulingReuseThreshold}">
-            </label>
-            <label title="Surface a ruling into the brief when its keys match the chat at/above this score">Surface threshold
-                <input id="smarttavern_agentRulingSurfaceThreshold" class="text_margin_input" type="number" min="0.3" max="0.95" step="0.05" value="${settings.agentRulingSurfaceThreshold}">
-            </label>
-        </div>
+        ${toolsAndBudgetsHtml(settings)}
 
         <div class="smarttavern_steps_section_title"><i class="fa-solid fa-file-lines"></i><span>Last Turn Brief</span></div>
         <pre id="smarttavern_agent_brief" class="smarttavern_story_directive">${escapeHtml(brief || '(no brief compiled yet — send a message)')}</pre>
@@ -356,10 +370,14 @@ export function wireAgentTab($rootPanel) {
         return;
     }
     wired = true;
+    wireGmTab($panel, renderAgentTabSafe);
 
     $panel.on('change', '#smarttavern_agentEngine', function () {
-        getSettings().agentEngine = this.value === 'legacy' ? 'legacy' : 'planner';
+        const previous = getSettings().agentEngine;
+        getSettings().agentEngine = ['gm', 'legacy'].includes(this.value) ? this.value : 'planner';
         saveSettings();
+        // Switching engines never deletes data; a running GM tick just stops.
+        if (previous === 'gm' && getSettings().agentEngine !== 'gm') cancelGmTick();
         renderAgentTab();
     });
     $panel.on('input', '#smarttavern_plannerTask', function () {

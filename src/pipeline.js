@@ -29,7 +29,7 @@ import { setReplyFields, clearReplyFields, livingProfileTexts } from './descript
 import {
     scanText, partitionByActivation, stepActivation, selectReplyFields, isUnchangedOutput, anchorIndex,
     previousFromMemory, NO_PREVIOUS, estimateTokens, planTailBudget,
-    PRIORITY_BRIEF, PRIORITY_USER_ANSWERS, PRIORITY_PROFILE, DEFAULT_PRIORITY,
+    PRIORITY_BRIEF, PRIORITY_USER_ANSWERS, PRIORITY_SCENE, PRIORITY_PROFILE, DEFAULT_PRIORITY,
 } from './lean-core.js';
 import { configuredBlocks } from './planner-core.js';
 import {
@@ -42,7 +42,10 @@ import {
 } from './agent.js';
 import { rollsMacroText } from './agent-core.js';
 import { planExpansion } from './planner.js';
+import { prepareGmTurn, gmHasWork } from './gm.js';
 import { askPlannerUser, savedUserAnswers, userAnswersContext } from './user-context.js';
+import { getSceneText, getSceneEntries } from './scene.js';
+import { renderScene } from './scene-core.js';
 
 export const EPHEMERAL_FLAG = 'smarttavern_ephemeral';
 
@@ -74,6 +77,9 @@ const DIRECTIVE_ENFORCEMENT_PROMPT = [
     '',
     'TURN BRIEF (what the reply model was told; judge dice outcomes by its declared difficulty and interpretation):',
     '{{brief}}',
+    '',
+    'Scene state (established facts):',
+    '{{scene}}',
     '',
     'Recent chat:',
     '{{chat}}',
@@ -206,6 +212,7 @@ function recordLastRun(result, pipeline, source) {
         brief: result.brief ?? '',
         agentTranscript: result.agentTranscript ?? null,
         planner: result.planner ?? null,
+        gm: result.gm ?? null,
         activation: result.activation ?? { skipped: [], inactive: [] },
         tail: result.tail ?? null,
         effectiveSteps: result.effectiveSteps ?? [],
@@ -382,6 +389,8 @@ export function makeMacroResolver({ char, profile, chat, stepOutputs, settings, 
         if (m === 'brief') return agent?.brief ?? '';
         if (m === 'rolls') return agent?.rollsText ?? '';
         if (m === 'rulings') return agent?.rulingsText ?? '';
+        // Shared scene state: compact "key: value" lines (see scene.js / scene-core.js).
+        if (m === 'scene') return getSceneText(chat ?? undefined);
         return null;
     };
 }
@@ -609,7 +618,10 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
     // when expansion is disabled and no story exists.
     const plannerMode = settings.agentEngine !== 'legacy';
     const agentWanted = !plannerMode && agentActiveForTurn(settings);
-    if (!settings.expansionEnabled && !directive && !agentWanted) return null;
+    // GM engine: a prepared brief (or a tick still running) is a reason to run even when
+    // expansion is off and no story exists — the brief is injected like the legacy agent's.
+    const gmEngine = settings.agentEngine === 'gm';
+    if (!settings.expansionEnabled && !directive && !agentWanted && !(gmEngine && gmHasWork())) return null;
 
     if (inject) {
         clearPromptTail();
@@ -664,8 +676,20 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
                 activityEntry({ title: `${gated.inactive.length} block(s) not triggered`, text: activation.inactive.map(name => `Not triggered: ${name}`).join('\n'), tone: 'info' });
             }
         }
+        // GM engine: the brief prepared between turns replaces the planner call (its field and
+        // skip choices stand in for the planner's record). A missing, stale or unusable brief
+        // falls back to the planner path below, exactly as for the planner engine.
+        let gmTurn = null;
+        if (gmEngine) {
+            gmTurn = await prepareGmTurn({ settings, type, dryRun: isDryRun, signal: control.signal, char });
+            if (!isCurrentChat()) return null;
+        }
         let planner = null;
-        if (expand && plannerMode) {
+        if (gmTurn?.ok) {
+            planner = gmTurn.planner;
+            activation.skipped = planner.skips ?? [];
+            if (expand) settings = { ...settings, steps: gmTurn.steps };
+        } else if (expand && plannerMode) {
             const active = agentActiveForTurn(settings);
             if (active && inject && settings.agentMode === 'armed') consumeAgentArm();
             const planned = await planExpansion({ char, profile, chat: arr, settings, directive, signal: control.signal, active });
@@ -694,6 +718,10 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             agentResult = await runAgentLoop({
                 chat: arr, char, profile, stepOutputs, directive, settings, type, dryRun: isDryRun,
             });
+        } else if (gmTurn?.ok) {
+            // The GM's compiled brief (already published through agent.js setPreparedTurn, so
+            // its musts and dice reach the enforcement pass) takes the legacy result's place.
+            agentResult = { ran: true, turn: gmTurn.turn, brief: gmTurn.brief, transcript: gmTurn.transcript };
         }
         throwIfAborted(control.signal);
         if (!isCurrentChat()) return null;
@@ -730,7 +758,12 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         const tailTemplate = String(settings.tailPrompt ?? '');
         const usesStoryMacro = /\{\{\s*story\s*\}\}/i.test(tailTemplate);
         const usesBriefMacro = /\{\{\s*(brief|rolls)\s*\}\}/i.test(tailTemplate);
+        const usesSceneMacro = /\{\{\s*scene\s*\}\}/i.test(tailTemplate) && getSceneEntries(arr).length > 0;
         const savedUserContext = expand && plannerMode ? userAnswersContext(userAnswers) : '';
+        // Scene state in the tail (sceneInTail 'on'): its own droppable section before the
+        // Turn Brief — unless the template places {{scene}} itself. Empty scene = no section.
+        const sceneEntries = settings.sceneInTail === 'on' && !/\{\{\s*scene\s*\}\}/i.test(tailTemplate) ? getSceneEntries(arr) : [];
+        const sceneSection = sceneEntries.length ? `[Scene state]\n${renderScene(sceneEntries)}` : '';
         // Prompt-end tail. Templates may reference the turn macros anywhere; their complete
         // sections are relocated so the directive is still last and the brief directly
         // precedes it. `drop` (tail budget) removes whole sections by re-expanding the
@@ -740,16 +773,17 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             for (const id of drop) if (id.startsWith('step:')) delete outputs[id.slice(5)];
             const brief = drop.has('brief') ? '' : briefText;
             const answers = drop.has('answers') ? '' : savedUserContext;
+            const scene = drop.has('scene') ? '' : sceneSection;
             const agentView = agentMacro ? { ...agentMacro, brief } : null;
             const resolve = makeMacroResolver({ char, profile, chat: arr, stepOutputs: outputs, settings, stepsList: settings.steps,
                 story: storyContext, agent: agentView, definitionsFields: replyFieldList, definitionsText: drop.has('profile') ? '' : null });
             let text = '';
-            if ((expand && stepBlocks(settings.steps, outputs).length > 0) || (directive && usesStoryMacro) || (brief && usesBriefMacro)) {
+            if ((expand && stepBlocks(settings.steps, outputs).length > 0) || (directive && usesStoryMacro) || (brief && usesBriefMacro) || usesSceneMacro) {
                 text = substituteParamsSafe(expandMacros(tailTemplate, resolve)).trim();
             }
             if (brief && !text.includes(brief)) text = text ? `${text}\n\n${brief}` : brief;
             if (directive?.text && !text.includes(directive.text)) text = text ? `${text}\n\n${directive.text}` : directive.text;
-            const turn = [answers, brief, directive?.text ?? ''].filter(Boolean);
+            const turn = [answers, scene, brief, directive?.text ?? ''].filter(Boolean);
             for (const section of turn) text = text.split(section).join('').trim();
             return [text, ...turn].filter(Boolean).join('\n\n');
         };
@@ -771,6 +805,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
                 candidates.push({ id: 'profile', label: 'Living profile', priority: PRIORITY_PROFILE });
             }
             if (savedUserContext) candidates.push({ id: 'answers', label: 'Saved answers', priority: PRIORITY_USER_ANSWERS });
+            if (sceneSection) candidates.push({ id: 'scene', label: 'Scene state', priority: PRIORITY_SCENE });
             if (briefText) candidates.push({ id: 'brief', label: 'Turn Brief', priority: PRIORITY_BRIEF });
             const sections = candidates.map(item => ({ ...item, tokens: Math.max(0, total - tokensOf(buildTail(new Set([item.id])))) }));
             const required = [];
@@ -804,7 +839,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
         } else if (briefText || directive?.text) {
             injectionText = [briefText, directive?.text ?? ''].filter(Boolean).join('\n\n');
         }
-        const turnSections = [savedUserContext, briefText, directive?.text ?? ''].filter(Boolean);
+        const turnSections = [savedUserContext, sceneSection, briefText, directive?.text ?? ''].filter(Boolean);
         if (settings.injectAnchor !== 'prompt-end') {
             for (const section of turnSections) injectionText = injectionText.split(section).join('').trim();
             injectionText = [injectionText, ...turnSections].filter(Boolean).join('\n\n');
@@ -824,6 +859,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             brief: briefText,
             agentTranscript: agentResult?.transcript ?? null,
             surfacedRulings,
+            gm: gmTurn?.record ?? null,
         };
         if (!inject) return recordLastRun({ char, profile, stepOutputs, stepStats, injectionText, storyDirective: directive?.text ?? '', ...agentRecord }, 'expansion', 'dry run');
 
@@ -845,6 +881,7 @@ export async function runPipeline({ chat = null, inject = true, bootstrap = true
             .filter(block => block.text);
         const blockRole = STEP_ROLES.includes(settings.tailRole) ? settings.tailRole : 'assistant';
         if (savedUserContext) blocks.push({ text: savedUserContext, role: blockRole });
+        if (sceneSection) blocks.push({ text: sceneSection, role: blockRole });
         // Turn Brief first, then the directive — history anchors keep the same relative
         // order as the prompt-end tail (expansion outputs → brief → directive last).
         if (briefText && !blocks.some(block => block.text.includes(briefText))) {
@@ -1401,7 +1438,8 @@ export async function smarttavernInterceptor(chat, _contextSize, _abort, type) {
         // The story directive and the thinking agent are their own gates: with an active
         // story or an active agent the pipeline runs (and injects) even when expansion
         // is disabled.
-        if (settings.expansionEnabled || (settings.storyEnabled !== false && hasStory()) || agentActiveForTurn(settings)) {
+        if (settings.expansionEnabled || (settings.storyEnabled !== false && hasStory()) || agentActiveForTurn(settings)
+            || (settings.agentEngine === 'gm' && gmHasWork())) {
             // The foreground generation is parked on this interceptor while the pipeline
             // runs, so its internal calls are exempt from gen.js's foreground-idle wait.
             await withInterceptorScope(() => runPipeline({ chat, inject: true, type }));

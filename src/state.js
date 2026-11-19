@@ -332,7 +332,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
     profileUpdateProfileId: '',
     // Planner adds temporary context tasks before expansion. Legacy retains the
     // original tool loop and Turn Brief; its settings and per-chat data are preserved.
-    agentEngine: 'planner',                  // 'planner' | 'legacy'; legacy data is retained
+    // GM thinks between turns: a background tool loop after each finalized character reply
+    // prepares the NEXT turn (brief, musts, branches, clocks, NPC agendas); send time only
+    // reads it. It is opt-in — it adds background calls — and never replaces stored data.
+    agentEngine: 'planner',                  // 'planner' | 'gm' | 'legacy'; other engines' data is retained
     plannerTask: 'Add expansion prompts only for important context missing from the existing blocks. Prefer no additions when they already cover this turn.',
     agentMode: 'always',                     // 'off' | 'always' | 'armed' (one-shot)
     agentTask: 'Plan concrete events for the next reply. Check continuity, consult relevant lore, and use tools when they can change the scene.',
@@ -357,6 +360,16 @@ export const DEFAULT_SETTINGS = Object.freeze({
     agentMemoryMode: 'auto',                 // 'auto' | 'confirm' | 'off'
     agentMemoryWritesPerTurn: 3,             // shared by create/update/delete/npc-persist
     agentExposeNativeTools: false,          // reserved for an optional native-tool bridge
+    gmProfileId: '',                         // GM tick connection profile ('' = agent profile)
+    gmFitProfileId: '',                      // send-time branch fit check ('' = GM, then agent profile)
+    gmTask: 'Look ahead from the last reply: decide what the world and the NPCs do next, advance clocks the story has earned, roll for risky off-screen events, and prepare a short brief with conditional branches for the player\'s likely next moves.',
+    gmTickMode: 'every',                     // 'every' | 'everyN' | 'armed' (after "Think next turn")
+    gmEveryN: 3,                             // everyN: tick on every Nth character reply (2..20, per chat)
+    gmWaitMs: 10000,                         // send time: wait this long for a running tick (0..60000)
+    gmToolTransport: 'tags',                 // 'tags' | 'native' | 'auto' (native function calling for the GM tick)
+    mcpEnabled: false,                       // GM may call MCP tools through the smarttavern-mcp server plugin
+    mcpCallsPerTurn: 3,                      // shared budget of MCP calls per GM tick (0..10)
+    mcpDisabledTools: [],                    // "server:tool" entries the user unticked
     agentToolsEnabled: {
         roll_dice: true,
         consult_character: true,
@@ -366,6 +379,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
         introduce_npc: true,
         memory: true,
         ruling: true,
+        clock: true,                         // GM engine only
+        npc_intent: true,                    // GM engine only
     },
     // Output budgets for internal calls. Each call is additionally capped to the
     // connection's context window and to any output limit a provider reports.
@@ -374,6 +389,17 @@ export const DEFAULT_SETTINGS = Object.freeze({
     // When a pinned Connection Manager profile fails, retry the call on the active
     // connection. Every fallback is reported in the activity log and a toast.
     fallbackToActive: true,
+    // Shared scene state: facts anchored to saved chat messages (rewind-safe), written
+    // by the scene tracker (background call after each finalized character reply), the
+    // legacy agent and the user. Existing installs start with the tracker OFF (see the
+    // sceneVersion migration in normalizeSettings); new installs start with it on.
+    sceneTrackerEnabled: true,
+    sceneTrackerProfileId: '',               // Connection Manager profile ('' = active connection)
+    sceneTrackerEvery: 1,                    // run every N character replies (per chat)
+    sceneTrackerLookback: 4,                 // recent messages the tracker reads
+    sceneTrackerMaxTokens: 1024,
+    sceneMaxFacts: 40,                       // cap on the RESOLVED scene (least recently set unpinned keys evicted)
+    sceneInTail: 'off',                      // 'off' | 'on': add a [Scene state] section to the reply tail
     stepExecution: 'dependencies',
     // Lean context. Expansion steps may be gated (`activation`: always | keywords |
     // planner) by keywords found in the last `activationScanDepth` non-system messages;
@@ -431,7 +457,7 @@ export function deepMerge(target, source) {
  * local prompt-tail assembly, and migrates the single pipelineMode + shared step list
  * into the two independent pipelines (expansion steps + refinement passes).
  */
-function normalizeSettings(settings) {
+function normalizeSettings(settings, isNewInstall = false) {
     let changed = false;
 
     // v2: the mutually exclusive pipelineMode split into two independent pipelines.
@@ -597,7 +623,7 @@ function normalizeSettings(settings) {
     // ------------------------------------------------------------------
     // Thinking Agent
     // ------------------------------------------------------------------
-    if (!['planner', 'legacy'].includes(settings.agentEngine)) {
+    if (!['planner', 'gm', 'legacy'].includes(settings.agentEngine)) {
         settings.agentEngine = 'planner';
         changed = true;
     }
@@ -664,11 +690,61 @@ function normalizeSettings(settings) {
         changed = true;
     }
     if (!isPlainObject(settings.agentToolsEnabled)) settings.agentToolsEnabled = {};
-    for (const tool of ['roll_dice', 'consult_character', 'consult_expert', 'scene', 'ask_user', 'introduce_npc', 'memory', 'ruling']) {
+    for (const tool of ['roll_dice', 'consult_character', 'consult_expert', 'scene', 'ask_user', 'introduce_npc', 'memory', 'ruling', 'clock', 'npc_intent']) {
         if (typeof settings.agentToolsEnabled[tool] !== 'boolean') {
             settings.agentToolsEnabled[tool] = true;
             changed = true;
         }
+    }
+    // GM engine. deepMerge has just filled the new keys; an existing install keeps its
+    // engine (planner or legacy) — the GM is opt-in because every tick is an extra
+    // background call. Later releases can gate their GM defaults on gmVersion.
+    if (settings.gmVersion !== 1) {
+        settings.gmVersion = 1;
+        changed = true;
+    }
+    for (const key of ['gmProfileId', 'gmFitProfileId']) {
+        if (typeof settings[key] !== 'string') {
+            settings[key] = '';
+            changed = true;
+        }
+    }
+    if (typeof settings.gmTask !== 'string') {
+        settings.gmTask = DEFAULT_SETTINGS.gmTask;
+        changed = true;
+    }
+    if (!['every', 'everyN', 'armed'].includes(settings.gmTickMode)) {
+        settings.gmTickMode = 'every';
+        changed = true;
+    }
+    for (const [key, min, max, fallback] of [['gmEveryN', 2, 20, 3], ['gmWaitMs', 0, 60000, 10000]]) {
+        const normalized = clampInt(settings[key], min, max, fallback);
+        if (settings[key] !== normalized) {
+            settings[key] = normalized;
+            changed = true;
+        }
+    }
+    // Native tool calling + MCP bridge (both opt-in; defaults keep the tag transport, MCP off).
+    if (settings.toolTransportVersion !== 1) {
+        settings.toolTransportVersion = 1;
+        changed = true;
+    }
+    if (!['tags', 'native', 'auto'].includes(settings.gmToolTransport)) {
+        settings.gmToolTransport = 'tags';
+        changed = true;
+    }
+    if (typeof settings.mcpEnabled !== 'boolean') {
+        settings.mcpEnabled = false;
+        changed = true;
+    }
+    const mcpCalls = clampInt(settings.mcpCallsPerTurn, 0, 10, 3);
+    if (settings.mcpCallsPerTurn !== mcpCalls) {
+        settings.mcpCallsPerTurn = mcpCalls;
+        changed = true;
+    }
+    if (!Array.isArray(settings.mcpDisabledTools) || settings.mcpDisabledTools.some(item => typeof item !== 'string')) {
+        settings.mcpDisabledTools = Array.isArray(settings.mcpDisabledTools) ? settings.mcpDisabledTools.filter(item => typeof item === 'string') : [];
+        changed = true;
     }
     // Replace the old default deadline once; preserve custom deadlines and future edits.
     if (settings.agentTimeoutVersion !== 1) {
@@ -766,15 +842,47 @@ function normalizeSettings(settings) {
         settings.leanContextVersion = 1;
         changed = true;
     }
+    // Shared scene state. deepMerge has just filled the new keys with their defaults, so
+    // an EXISTING install (settings were already saved before this version) is switched
+    // back to tracker-off once: the tracker is an extra background LLM call after every
+    // reply, and an upgrade must never start costing money silently. New installs keep
+    // the default (on); users of existing setups opt in from Settings → Scene state.
+    if (settings.sceneVersion !== 1) {
+        if (!isNewInstall) settings.sceneTrackerEnabled = false;
+        settings.sceneVersion = 1;
+        changed = true;
+    }
+    if (typeof settings.sceneTrackerEnabled !== 'boolean') {
+        settings.sceneTrackerEnabled = DEFAULT_SETTINGS.sceneTrackerEnabled;
+        changed = true;
+    }
+    if (typeof settings.sceneTrackerProfileId !== 'string') {
+        settings.sceneTrackerProfileId = '';
+        changed = true;
+    }
+    for (const [key, min, max] of [['sceneTrackerEvery', 1, 20], ['sceneTrackerLookback', 1, 20], ['sceneTrackerMaxTokens', 128, 32000], ['sceneMaxFacts', 10, 200]]) {
+        const value = clampInt(settings[key], min, max, DEFAULT_SETTINGS[key]);
+        if (settings[key] !== value) {
+            settings[key] = value;
+            changed = true;
+        }
+    }
+    if (settings.sceneInTail !== 'on' && settings.sceneInTail !== 'off') {
+        settings.sceneInTail = 'off';
+        changed = true;
+    }
     if (changed) saveSettings();
 }
 
 export function loadSettings() {
     const context = getContext();
+    // No saved settings object yet = a fresh install (drives the sceneVersion migration).
+    const isNewInstall = !isPlainObject(context.extensionSettings[SETTINGS_KEY])
+        || Object.keys(context.extensionSettings[SETTINGS_KEY]).length === 0;
     const settings = isPlainObject(context.extensionSettings[SETTINGS_KEY]) ? context.extensionSettings[SETTINGS_KEY] : {};
     context.extensionSettings[SETTINGS_KEY] = settings;
     deepMerge(settings, DEFAULT_SETTINGS);
-    normalizeSettings(settings);
+    normalizeSettings(settings, isNewInstall);
     return settings;
 }
 

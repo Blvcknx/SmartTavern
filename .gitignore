@@ -12,3 +12,5 @@ Desktop.ini
 
 # Node (not expected, but harmless)
 node_modules/
+server-plugin/node_modules/
+server-plugin/mcp-servers.json

@@ -113,6 +113,19 @@ export function clearAgentSession() {
     answerCache.clear();
 }
 
+/**
+ * GM engine: publishes a brief that was compiled elsewhere (gm.js, from the brief the GM
+ * prepared between turns) through the SAME state the legacy loop fills, so injection,
+ * the {{brief}} / {{rolls}} macros and agentTurnRequirements (the musts and binding
+ * dice that feed Directive Enforcement) behave identically for every engine.
+ * `turn` needs at least { must: string[], rolls: object[] }.
+ */
+export function setPreparedTurn({ turn = null, brief = '', transcript = [] } = {}) {
+    lastTurn = turn;
+    lastBrief = String(brief ?? '');
+    lastTranscript = Array.isArray(transcript) ? transcript : [];
+}
+
 export function getLastBrief() {
     return lastBrief;
 }
