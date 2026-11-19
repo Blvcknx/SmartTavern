@@ -457,6 +457,10 @@ function buildPanelHtml() {
                     <input id="smarttavern_replaceDescription" type="checkbox" ${settings.replaceDescription ? 'checked' : ''}>
                     <span>Replace the card description with the living profile</span>
                 </label>
+                <label class="checkbox" title="When a step's or pass's connection profile fails, retry once on the active connection instead of failing. Each fallback is reported in the activity log (and as a toast).">
+                    <input id="smarttavern_fallbackToActive" type="checkbox" ${settings.fallbackToActive !== false ? 'checked' : ''}>
+                    <span>Fall back to the active connection when a connection profile fails</span>
+                </label>
                 <label class="checkbox" title="Hides the avatar menu, the wand-menu button and this panel; the settings drawer stays available">
                     <input id="smarttavern_disableFloatingUI" type="checkbox" ${settings.disableFloatingUI ? 'checked' : ''}>
                     <span>Disable floating UI</span>
@@ -478,10 +482,10 @@ function buildPanelHtml() {
                     <label>Updater chat lookback (messages)
                         <input id="smarttavern_profileUpdateLookback" class="text_margin_input" type="number" min="1" max="200" step="1" value="${settings.profileUpdateLookback}">
                     </label>
-                    <label>Step max tokens
+                    <label title="Upper bound; each call is also capped to the connection's context window and to the provider's reported output limit.">Step max tokens
                         <input id="smarttavern_stepMaxTokens" class="text_margin_input" type="number" min="16" max="100000" step="16" value="${settings.stepMaxTokens}">
                     </label>
-                    <label>Updater max tokens
+                    <label title="Upper bound; each call is also capped to the connection's context window and to the provider's reported output limit.">Updater max tokens
                         <input id="smarttavern_updaterMaxTokens" class="text_margin_input" type="number" min="16" max="100000" step="16" value="${settings.updaterMaxTokens}">
                     </label>
                     <label title="Extra attempts when an internal LLM call fails, comes back empty, or collapses into a repetition loop (reasoning corruption). Applies to pipeline steps and profile updates alike.">LLM retries per call
@@ -595,6 +599,7 @@ const PANEL_CONTROLS = [
     ['smarttavern_autoUpdate', 'autoUpdate', 'checkbox'],
     ['smarttavern_bootstrapOnFirstMessage', 'bootstrapOnFirstMessage', 'checkbox'],
     ['smarttavern_replaceDescription', 'replaceDescription', 'checkbox'],
+    ['smarttavern_fallbackToActive', 'fallbackToActive', 'checkbox'],
     ['smarttavern_savePassesAsSwipes', 'savePassesAsSwipes', 'checkbox'],
     ['smarttavern_veilAllowPeek', 'veilAllowPeek', 'checkbox'],
     ['smarttavern_storyEnabled', 'storyEnabled', 'checkbox'],
@@ -918,6 +923,10 @@ function renderFieldEditor() {
             <div class="smarttavern_field_row">
                 <input class="text_margin_input smarttavern_field_name" type="text" value="${escapeHtml(field.name)}" title="Field name (JSON key, {{field:Name}} target)">
                 <input class="text_margin_input smarttavern_field_desc" type="text" value="${escapeHtml(field.description ?? '')}" title="Field description (fed to the LLM)">
+                <label class="checkbox smarttavern_field_stable" title="The background updater keeps this field essentially unchanged (little to no drift)">
+                    <input class="smarttavern_field_stable_input" type="checkbox" ${field.stable ? 'checked' : ''}>
+                    <span>Stable</span>
+                </label>
                 <div class="smarttavern_row_actions">
                     <a class="menu_button menu_button_icon smarttavern_field_up" title="Move up"><i class="fa-solid fa-arrow-up"></i></a>
                     <a class="menu_button menu_button_icon smarttavern_field_down" title="Move down"><i class="fa-solid fa-arrow-down"></i></a>
@@ -930,6 +939,10 @@ function renderFieldEditor() {
         });
         row.find('.smarttavern_field_desc').on('input', function () {
             settings.fields[index].description = String(/** @type {HTMLInputElement} */ (this).value);
+            saveSettings();
+        });
+        row.find('.smarttavern_field_stable_input').on('change', function () {
+            settings.fields[index].stable = /** @type {HTMLInputElement} */ (this).checked;
             saveSettings();
         });
         row.find('.smarttavern_field_up').on('click', () => moveArrayItem(settings.fields, index, -1, () => { saveSettings(); renderFieldEditor(); }));
@@ -1183,7 +1196,7 @@ export function refreshProfileSelects() {
 
 function addField() {
     const settings = getSettings();
-    settings.fields.push({ name: `Field ${settings.fields.length + 1}`, description: '' });
+    settings.fields.push({ name: `Field ${settings.fields.length + 1}`, description: '', stable: false });
     saveSettings();
     renderFieldEditor();
 }
@@ -1194,7 +1207,7 @@ async function restoreDefaultFields() {
         'This replaces your field list with the SmartTavern defaults.',
     );
     if (!confirmed) return;
-    getSettings().fields = structuredClone(DEFAULT_FIELDS).map(f => ({ name: f.name, description: f.description }));
+    getSettings().fields = structuredClone(DEFAULT_FIELDS).map(f => ({ name: f.name, description: f.description, stable: Boolean(f.stable) }));
     saveSettings();
     renderFieldEditor();
 }

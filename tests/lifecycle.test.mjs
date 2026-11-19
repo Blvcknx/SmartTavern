@@ -45,7 +45,7 @@ test('render listeners release ST to end generation before active refinement, th
         hud: 'export const initHud = () => {};',
         tail: 'export const initPromptTail = () => {};',
         description: 'export const initDescriptionOverride = () => {};',
-        veil: 'export const dismissAllVeils = () => {};',
+        veil: 'export const dismissAllVeils = () => {}; export const dismissVeil = () => {}; export const disarmPreVeil = () => {};',
     };
     const modules = new Map(Object.entries(sources).map(([name, source]) => [name, new SourceTextModule(source, { context: sandbox })]));
     await modules.get('index').link(specifier => modules.get(specifier.split('/').at(-1).replace('.js', '')));

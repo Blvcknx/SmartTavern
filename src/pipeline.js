@@ -85,8 +85,11 @@ const failedBootstraps = new Set();
 let lastExpansionRun = null;
 let lastRefinementRun = null;
 
-// Re-entrancy guard: renders (swipe views, scrollback) can re-fire the refinement event.
-let refinementBusy = false;
+// Refinement runs detached from the render event, so in group chats the next member's
+// reply can render while the previous member is still being refined. Runs are chained
+// instead of dropped; `refinementPending` counts active + queued runs.
+let refinementChain = Promise.resolve();
+let refinementPending = 0;
 let activeRefinement = null;
 
 /** Accept the last completed pass and discard the currently running pass. */
@@ -153,6 +156,11 @@ let refinedEpoch = 0;
 
 export function markFreshGeneration() {
     generationEpoch++;
+    // 1:1 chats: a new generation makes the running refinement stale (its epoch check
+    // would stop it after the in-flight pass anyway). Cancel it now so the queued
+    // refinement of the new reply does not wait for that pass. Group chats keep it:
+    // the next member's reply is a different message.
+    if (activeRefinement && !getContext().groupId) activeRefinement.cancel();
 }
 
 export function hasFreshReply() {
@@ -172,7 +180,7 @@ function consumeFreshReply() {
 }
 
 export function isRefinementBusy() {
-    return refinementBusy;
+    return refinementPending > 0;
 }
 
 export function getLastRunResults() {
@@ -889,35 +897,74 @@ function appendRefinementSwipe(message, draft, originalDraft) {
  * @param {{dryRun?: boolean, bootstrap?: boolean}} [options]
  * @returns {Promise<{char, profile, stepOutputs, stepStats, workingDraft, changed}|null>}
  */
-export async function runRefinementPipeline(messageId, { dryRun = false, bootstrap = true } = {}) {
+export function runRefinementPipeline(messageId, { dryRun = false, bootstrap = true } = {}) {
+    const settings = getSettings();
+    // Every non-dry-run early exit must take down a pre-veil (see armPreVeil) so the
+    // message can never stay blurred; dismissVeil is a no-op when no veil is active.
+    const bail = () => {
+        if (!dryRun) dismissVeil(messageId);
+        return Promise.resolve(null);
+    };
+    if (!settings.enabled || !settings.refinementEnabled || isInternalGeneration()) return bail();
+    // Fresh generations only: an existing message re-rendered (new chat load, scrollback)
+    // must never be refined or veiled. The mark is consumed now, synchronously, so a
+    // re-fired render event cannot enqueue the same reply twice.
+    // Invalid targets (user/system/hidden/narration messages, already refined, no
+    // character) must not burn the mark either; checked again at run time below.
+    if (!refinementTarget(messageId, dryRun)) return bail();
+    if (!dryRun && !consumeFreshReply()) return bail();
+    refinementPending++;
+    const run = refinementChain.then(async () => {
+        try {
+            return await runRefinementNow(messageId, { dryRun, bootstrap });
+        } finally {
+            // Early exits skip the inner finally; revealVeil already removed the entry of
+            // a completed run, so this never cuts a reveal animation short.
+            if (!dryRun) dismissVeil(messageId);
+            refinementPending--;
+        }
+    });
+    refinementChain = run.catch(() => null);
+    return run;
+}
+
+/** The draft message and its character when a refinement may run on `messageId`, else null. */
+function refinementTarget(messageId, dryRun) {
+    const context = getContext();
+    const arr = context.chat ?? [];
+    const message = Number.isInteger(messageId) ? arr[messageId] : null;
+    if (!message || message.is_user || message.is_system || message[EPHEMERAL_FLAG] || message.is_hidden || message.extra?.smarttavernNarration) return null;
+    if (!String(message.mes ?? '').trim()) return null;
+    // Refined once already: swipe views and re-renders must not refine again.
+    if (!dryRun && isPlainObject(message.extra) && message.extra.smarttavernRefined) return null;
+    const char = context.groupId
+        ? (resolveMemberByMessageName(message.name) ?? resolveTargetChar(arr))
+        : (getMainCharacter() ?? resolveTargetChar(arr));
+    return char ? { arr, message, char } : null;
+}
+
+async function runRefinementNow(messageId, { dryRun, bootstrap }) {
     const context = getContext();
     const isCurrentChat = captureChatScope();
     const epoch = generationEpoch;
     const settings = getSettings();
     if (!settings.enabled || !settings.refinementEnabled) return null;
-    if (isInternalGeneration() || refinementBusy) return null;
-    // Fresh generations only: an existing message re-rendered (new chat load, scrollback)
-    // must never be refined or veiled.
+    if (isInternalGeneration()) return null;
 
-    const arr = context.chat ?? [];
-    const message = Number.isInteger(messageId) ? arr[messageId] : null;
-    if (!message || message.is_user || message.is_system || message[EPHEMERAL_FLAG] || message.is_hidden || message.extra?.smarttavernNarration) return null;
+    // Validity is judged at run time: a queued run sees the chat as it is now.
+    const target = refinementTarget(messageId, dryRun);
+    if (!target) return null;
+    const { arr, message, char } = target;
     const originalDraft = String(message.mes ?? '').trim();
-    if (!originalDraft) return null;
-    // Refined once already: swipe views and re-renders must not refine again.
-    if (!dryRun && isPlainObject(message.extra) && message.extra.smarttavernRefined) return null;
-
-    const char = context.groupId
-        ? (resolveMemberByMessageName(message.name) ?? resolveTargetChar(arr))
-        : (getMainCharacter() ?? resolveTargetChar(arr));
-    if (!char) return null;
-    if (!dryRun && !consumeFreshReply()) return null;
     let expectedDraft = message.mes;
     let expectedSwipe = message.swipe_id;
     const isCurrentDraft = () => isCurrentChat() && arr[messageId] === message
         && message.mes === expectedDraft && message.swipe_id === expectedSwipe
         && settings.enabled && settings.refinementEnabled
-        && (dryRun || generationEpoch === epoch);
+        // Group chats: the next member's generation bumps the epoch while this member is
+        // still being refined; message identity, text and swipe checks already guard
+        // against swipes and regenerates there.
+        && (dryRun || !!context.groupId || generationEpoch === epoch);
 
     const steps = effectiveRefinementSteps(settings);
     const control = createGenerationControl();
@@ -939,7 +986,6 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
     const key = charKey(char);
     const store = getChatStore();
     let profile = null;
-    refinementBusy = true;
     let failed = false;
     let summary = 'No pass changed the reply';
     const stepOutputs = Object.create(null);
@@ -1193,7 +1239,6 @@ export async function runRefinementPipeline(messageId, { dryRun = false, bootstr
         // message blurred. No-op when no veil is active for the id.
         else if (!dryRun) dismissVeil(messageId);
         activityEnd({ ok: !failed, summary, dismiss: true });
-        refinementBusy = false;
     }
 }
 

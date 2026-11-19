@@ -5,6 +5,7 @@ import { getContext } from '../../../../extensions.js';
 import { formatInstructModeChat, formatInstructModePrompt } from '../../../../instruct-mode.js';
 import { getSettings, warn } from './state.js';
 import { isInternalGeneration } from './gen.js';
+import { applyDescriptionOverride, livingProfileTexts } from './description.js';
 
 let pending = null;
 let sequence = 0;
@@ -51,6 +52,31 @@ function extract(text, tail) {
         content: text.slice(start + tail.start.length, end).trim(),
         remaining: text.slice(0, start) + text.slice(end + tail.end.length),
     };
+}
+
+const PROFILE_POINTER = '(the living profile is given in the character description above)';
+
+/**
+ * With the living description override on, the profile already sits in the card
+ * description slot; the default tail template's {{definitions}} would send it a second
+ * time. Swaps each profile text found in BOTH the rest of the prompt and the tail for a
+ * short pointer. Pure: returns the (possibly unchanged) tail content.
+ * @param {string} content tail text
+ * @param {string} rest the prompt without the tail
+ * @param {string[]} texts serialized profile texts
+ */
+export function dedupeProfileInTail(content, rest, texts) {
+    let out = content;
+    for (const text of texts) {
+        if (text && rest.includes(text) && out.includes(text)) out = out.split(text).join(PROFILE_POINTER);
+    }
+    return out;
+}
+
+function chatText(chat) {
+    return chat.map(message => typeof message.content === 'string'
+        ? message.content
+        : (Array.isArray(message.content) ? message.content.map(part => part?.text ?? '').join('\n') : '')).join('\n');
 }
 
 function removeStaleReservation(text) {
@@ -104,7 +130,12 @@ export function appendChatTail(event) {
     }
     if (content === null) return; // Not this generation, or ST trimmed the reservation.
     clearPromptTail();
-    if (tail.enabled && content) event.chat.push({ role: tail.role, content });
+    if (tail.enabled && content) {
+        // Swap the description first so the order of the two makeLast hooks never matters.
+        applyDescriptionOverride(event);
+        content = dedupeProfileInTail(content, chatText(event.chat), livingProfileTexts());
+        event.chat.push({ role: tail.role, content });
+    }
 }
 
 export function appendTextTail(event) {
@@ -140,7 +171,13 @@ export function appendTextTail(event) {
             : `${tail.name2}:`;
         // Move the existing assistant cue after the new tail when it is recognizable.
         if (cue && prompt.endsWith(cue)) prompt = prompt.slice(0, -cue.length);
-        event.prompt = `${prompt}\n${format(result.content)}${cue}`;
+        // Swap the description first (on the prompt without the tail) so the order of the
+        // two makeLast hooks never matters, then drop the duplicate profile from the tail.
+        const view = { prompt };
+        applyDescriptionOverride(view);
+        prompt = view.prompt;
+        const content = dedupeProfileInTail(result.content, prompt, livingProfileTexts());
+        event.prompt = `${prompt}\n${format(content)}${cue}`;
     } else event.prompt = prompt;
 }
 

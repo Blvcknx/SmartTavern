@@ -103,15 +103,32 @@ function applyTargets(text, targets) {
     return out;
 }
 
-// Chat Completion: the final assembled messages. The description is the content of the
-// "Char Description" system message (and of any custom prompt that used {{description}}).
-function onChatCompletionPrompt(event) {
+/**
+ * The unique serialized profile texts the override inserts into the prompt. The reply
+ * tail uses this to avoid sending the same profile a second time.
+ * @returns {string[]}
+ */
+export function livingProfileTexts() {
+    if (!overrideActive(null)) return [];
+    return [...new Set(replacementTargets().map(target => target.text))];
+}
+
+/**
+ * Performs the description swap on a prompt event: a chat completion event (`event.chat`)
+ * and/or a combined text prompt (`event.prompt`). Idempotent — once swapped the needle
+ * is gone from the prompt, so a second call changes nothing.
+ * @returns {number} how many prompt parts were swapped
+ */
+export function applyDescriptionOverride(event) {
     try {
-        if (!overrideActive(event) || !Array.isArray(event.chat)) return;
+        if (!overrideActive(event)) return 0;
+        const chat = Array.isArray(event?.chat) ? event.chat : null;
+        const combined = typeof event?.prompt === 'string';
+        if (!chat && !combined) return 0;
         const targets = replacementTargets();
-        if (!targets.length) return;
+        if (!targets.length) return 0;
         let swapped = 0;
-        for (const message of event.chat) {
+        for (const message of chat ?? []) {
             if (typeof message.content === 'string') {
                 const next = applyTargets(message.content, targets);
                 if (next !== message.content) {
@@ -130,25 +147,29 @@ function onChatCompletionPrompt(event) {
                 }
             }
         }
-        if (swapped) log(`living description swapped into ${swapped} chat completion message(s)`);
+        if (combined) {
+            const next = applyTargets(event.prompt, targets);
+            if (next !== event.prompt) {
+                event.prompt = next;
+                swapped++;
+            }
+        }
+        if (swapped) log(`living description swapped into ${swapped} prompt part(s)`);
+        return swapped;
     } catch (error) {
         // Fail open: the generation proceeds with the card description.
         warn('description override failed; using the card description as-is', error);
+        return 0;
     }
+}
+
+// Chat Completion: the final assembled messages. The description is the content of the
+// "Char Description" system message (and of any custom prompt that used {{description}}).
+function onChatCompletionPrompt(event) {
+    if (Array.isArray(event?.chat)) applyDescriptionOverride(event);
 }
 
 // Text Completion: the combined prompt after the story string was rendered.
 function onCombinedPrompt(event) {
-    try {
-        if (!overrideActive(event) || typeof event.prompt !== 'string') return;
-        const targets = replacementTargets();
-        if (!targets.length) return;
-        const next = applyTargets(event.prompt, targets);
-        if (next !== event.prompt) {
-            event.prompt = next;
-            log('living description swapped into the combined prompt');
-        }
-    } catch (error) {
-        warn('description override failed; using the card description as-is', error);
-    }
+    if (typeof event?.prompt === 'string') applyDescriptionOverride(event);
 }

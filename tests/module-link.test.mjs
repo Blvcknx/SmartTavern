@@ -1,4 +1,4 @@
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile, readdir, access } from 'node:fs/promises';
 import { test } from 'node:test';
 import { SourceTextModule, createContext, runInContext } from 'node:vm';
 import assert from 'node:assert/strict';
@@ -38,8 +38,14 @@ test('extension entry point and every local UI import link successfully', async 
     await entry.evaluate(); // Register startup without invoking jQuery's ready callback.
 });
 
-test('installed ST save/load functions preserve the ownership flag through JSON persistence', async () => {
-    const source = await readFile(new URL('../../../../world-info.js', import.meta.url), 'utf8');
+test('installed ST save/load functions preserve the ownership flag through JSON persistence', async (t) => {
+    // Needs SillyTavern's own world-info.js; outside a full ST checkout there is nothing to verify.
+    const worldInfoUrl = new URL('../../../../world-info.js', import.meta.url);
+    if (!await access(worldInfoUrl).then(() => true, () => false)) {
+        t.skip('SillyTavern world-info.js not found (extension is not inside an ST checkout)');
+        return;
+    }
+    const source = await readFile(worldInfoUrl, 'utf8');
     const definitions = ['saveWorldInfo', 'loadWorldInfo'].map(name => {
         const definition = source.match(new RegExp(`export async function ${name}\\([\\s\\S]*?\\n\\}`, 'm'))?.[0];
         assert.ok(definition, `ST still exports ${name}`);

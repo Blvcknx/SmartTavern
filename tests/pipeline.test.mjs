@@ -51,7 +51,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         'system-messages': "export const system_message_types = { NARRATOR: 'narrator' };",
         'instruct-mode': `export const formatInstructModeChat = (name, text, user, system) => '<' + (system ? 'system' : user ? 'user' : 'assistant') + '>' + text + '</turn>\\n'; export const formatInstructModePrompt = () => '<assistant>';`,
         progress: 'export const activityStart = () => {}; export const activityStatus = status => { context.activityStatuses.push(status); }; export const activityEntry = entry => { context.activityEntries.push(entry); }; export const activityFail = () => {}; export const activityEnd = options => { context.activityEnds.push(options); }; export const activitySteps = () => {}; export const activityStepState = () => {}; export const activityRefinementControls = () => {};',
-        veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = (_id, status) => { context.veilStatuses.push(status); }; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const armPreVeil = () => {};`,
+        veil: `export const applyVeil = () => ${veiled}; export const setVeilStep = () => {}; export const setVeilStatus = (_id, status) => { context.veilStatuses.push(status); }; export const revealVeil = () => {}; export const dismissVeil = () => {}; export const dismissAllVeils = () => {}; export const disarmPreVeil = () => {}; export const armPreVeil = () => {};`,
         // Story Director stub: no chat in these tests carries a story, so the whole
         // feature must stay inert. The no-ops mirror story.js's no-story behavior.
         story: `export const previewStoryDirective = () => (${JSON.stringify(directive)}); export const prepareStoryDirective = () => (${JSON.stringify(directive)}); export const storyMacroContext = value => value; export const recordedDirective = () => null; export const compileStoryDirective = () => null; export const hasStory = () => false; export const markStoryBeatDelivered = () => false; export const recordDirectiveInjection = () => {}; export const resetStoryGenerationState = () => {};`,
@@ -78,7 +78,7 @@ async function harness(settings = {}, respond = async () => ({ content: 'GENERAT
         `;
         for (const name of ['agent', 'agent-tools', 'rulings', 'ruling-core']) sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
-    for (const name of ['pipeline', 'state', 'gen', 'tail', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'user-context', 'narration', ...(realStory ? ['story', 'story-core'] : [])]) {
+    for (const name of ['pipeline', 'state', 'gen', 'tail', 'description', 'profiles', 'refinement-checks', 'refinement-edits', 'agent-core', 'planner', 'planner-core', 'user-context', 'narration', ...(realStory ? ['story', 'story-core'] : [])]) {
         sources[name] = await readFile(new URL(`../src/${name}.js`, import.meta.url), 'utf8');
     }
     for (const [name, source] of Object.entries(sources)) {
@@ -2461,4 +2461,51 @@ test('refinement macros use current agent brief and rolls and clear on turn rese
     const last = h.requests.at(-1).messages.map(message => message.content).join('\n');
     assert.ok(last.includes('BRIEF=\nROLLS='));
     assert.ok(!last.includes(lockDifficulty));
+});
+
+test('group chat refinements queue instead of dropping and survive the next member\'s generation', async () => {
+    const first = deferred();
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async (_messages, index) => {
+        if (index === 1) { await first.promise; return { content: tagged('Alice revised') }; }
+        return { content: tagged('Bob revised') };
+    });
+    h.context.groupId = 'g1';
+    h.context.groups = [{ id: 'g1', members: ['alice.png', 'bob.png'] }];
+    h.context.characters.push({ name: 'Bob', avatar: 'bob.png' });
+    const alice = { name: 'Alice', mes: 'Alice draft' };
+    const bob = { name: 'Bob', mes: 'Bob draft' };
+    h.savedChat.push(alice);
+    h.pipeline.markFreshGeneration();
+    const run1 = h.pipeline.runRefinementPipeline(1);
+    // The next member generates and renders while Alice is still being refined.
+    h.savedChat.push(bob);
+    h.pipeline.markFreshGeneration();
+    const run2 = h.pipeline.runRefinementPipeline(2);
+    assert.equal(h.pipeline.isRefinementBusy(), true);
+    first.resolve();
+    assert.ok(await run1);
+    assert.ok(await run2);
+    assert.equal(alice.mes, 'Alice revised');
+    assert.equal(bob.mes, 'Bob revised');
+    assert.equal(h.requests.length, 2);
+    assert.equal(h.pipeline.isRefinementBusy(), false);
+});
+
+test('a refinement requested without a fresh reply is dropped without consuming a later mark', async () => {
+    const h = await harness({ refinementSteps: [step('Edit', '{{draft}}')] }, async () => ({ content: tagged('Revised') }));
+    h.savedChat.push({ name: 'Alice', mes: 'Draft' });
+    assert.equal(await h.pipeline.runRefinementPipeline(1), null);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.pipeline.isRefinementBusy(), false);
+});
+
+test('tail dedupe swaps a profile already present elsewhere in the prompt for a pointer', async () => {
+    const h = await harness();
+    const profile = 'Personality: warm and stubborn.\nFears: the sea.';
+    const tail = `Living profile:\n${profile}\nAssess the scene.`;
+    const deduped = h.tail.dedupeProfileInTail(tail, `Description: ${profile}\nHello`, [profile]);
+    assert.match(deduped, /^Living profile:\n\(the living profile is given in the character description above\)\nAssess the scene\.$/);
+    // Profile absent from the rest of the prompt (override off): the tail keeps it.
+    assert.equal(h.tail.dedupeProfileInTail(tail, 'Hello', [profile]), tail);
+    assert.equal(h.tail.dedupeProfileInTail(tail, profile, []), tail);
 });

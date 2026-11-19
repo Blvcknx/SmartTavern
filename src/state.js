@@ -15,10 +15,10 @@ export const DEFAULT_FIELDS = Object.freeze([
     { name: 'Brief Summary', description: 'One short paragraph distilling who the character is right now.' },
     { name: 'Appearance', description: 'The character\'s current appearance, clothing and notable physical details.' },
     { name: 'Background', description: 'A long, winding account of the character\'s life and history up to the present. May accumulate detail over time.' },
-    { name: 'Personality', description: 'Personality, temperament, mannerisms and speech patterns, including sexual preferences. Should remain essentially stable over time.' },
-    { name: 'Aspirations', description: 'What the character wants, strives for and dreams of.' },
-    { name: 'Fears', description: 'What the character fears, avoids and dreads.' },
-    { name: 'Values', description: 'Political, ethical, moral and religious values and convictions.' },
+    { name: 'Personality', description: 'Personality, temperament, mannerisms and speech patterns, including sexual preferences. Should remain essentially stable over time.', stable: true },
+    { name: 'Aspirations', description: 'What the character wants, strives for and dreams of.', stable: true },
+    { name: 'Fears', description: 'What the character fears, avoids and dreads.', stable: true },
+    { name: 'Values', description: 'Political, ethical, moral and religious values and convictions.', stable: true },
 ]);
 
 export const DEFAULT_STEPS = Object.freeze([
@@ -206,6 +206,11 @@ export const LEGACY_REFINEMENT_STEPS = Object.freeze([
 export const STEP_ROLES = Object.freeze(['user', 'system', 'assistant']);
 export const INJECT_ANCHORS = Object.freeze(['prompt-end', 'before-last-user', 'after-last-user', 'top-of-history', 'depth']);
 
+export const DEFAULT_STEP_MAX_TOKENS = 8192;
+export const DEFAULT_UPDATER_MAX_TOKENS = 8192;
+// Field names that were implicitly held stable by the old hard-coded updater prompt.
+const LEGACY_STABLE_FIELDS = ['personality', 'aspirations', 'fears', 'values'];
+
 export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     autoUpdate: true,
@@ -304,8 +309,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
         memory: true,
         ruling: true,
     },
-    updaterMaxTokens: 100000,
-    stepMaxTokens: 100000,
+    // Output budgets for internal calls. Each call is additionally capped to the
+    // connection's context window and to any output limit a provider reports.
+    updaterMaxTokens: DEFAULT_UPDATER_MAX_TOKENS,
+    stepMaxTokens: DEFAULT_STEP_MAX_TOKENS,
+    // When a pinned Connection Manager profile fails, retry the call on the active
+    // connection. Every fallback is reported in the activity log and a toast.
+    fallbackToActive: true,
     stepExecution: 'dependencies',
     // Internal LLM calls (pipeline steps, profile bootstrap/update) are retried when
     // they fail, come back empty, or collapse into a repetition loop. `genRetries`
@@ -605,9 +615,36 @@ function normalizeSettings(settings) {
     // Raise persisted token caps (formerly 5000) so long outputs — revised replies,
     // expansion step payloads — are no longer cropped mid-generation.
     if (settings.tokenCapsVersion !== 1) {
-        settings.updaterMaxTokens = 100000;
-        settings.stepMaxTokens = 100000;
         settings.tokenCapsVersion = 1;
+        changed = true;
+    }
+    // v2: the forced 100000-token budget exceeded most providers' output limits and
+    // made requests fail. Reset only that exact value; custom budgets are kept.
+    if (settings.tokenCapsVersion !== 2) {
+        if (Number(settings.updaterMaxTokens) === 100000) settings.updaterMaxTokens = DEFAULT_UPDATER_MAX_TOKENS;
+        if (Number(settings.stepMaxTokens) === 100000) settings.stepMaxTokens = DEFAULT_STEP_MAX_TOKENS;
+        settings.tokenCapsVersion = 2;
+        changed = true;
+    }
+    for (const [key, fallback] of [['stepMaxTokens', DEFAULT_STEP_MAX_TOKENS], ['updaterMaxTokens', DEFAULT_UPDATER_MAX_TOKENS]]) {
+        const normalized = clampInt(settings[key], 16, 100000, fallback);
+        if (settings[key] !== normalized) {
+            settings[key] = normalized;
+            changed = true;
+        }
+    }
+    if (typeof settings.fallbackToActive !== 'boolean') {
+        settings.fallbackToActive = true;
+        changed = true;
+    }
+    // Schema fields carry a `stable` flag: the updater keeps stable fields essentially
+    // unchanged. Formerly hard-coded by name; migrate those names once.
+    if (settings.stableFieldsVersion !== 1) {
+        for (const field of (Array.isArray(settings.fields) ? settings.fields : [])) {
+            if (!isPlainObject(field) || typeof field.stable === 'boolean') continue;
+            field.stable = LEGACY_STABLE_FIELDS.includes(String(field.name ?? '').trim().toLowerCase());
+        }
+        settings.stableFieldsVersion = 1;
         changed = true;
     }
     if (changed) saveSettings();

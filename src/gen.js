@@ -199,43 +199,145 @@ export async function generateVia({ profileId = '', systemPrompt = '', prompt = 
     throwIfAborted(signal);
     const context = getContext();
     const profile = profileId ? getConnectionProfile(profileId) : null;
+    const promptChars = String(systemPrompt ?? '').length + (Array.isArray(prompt) ? flattenMessages(prompt) : String(prompt ?? '')).length;
 
     if (profileId && !profile) {
-        warn(`Connection profile "${profileId}" not found; falling back to the active connection.`);
+        if (getSettings().fallbackToActive === false) throw new Error(`Connection profile "${profileId}" no longer exists`);
+        reportFallback(profileId, profileId, 'the saved profile no longer exists');
     }
 
     if (profile) {
         const service = getServiceFromContext() ?? await loadServiceFallback();
         if (service && typeof service.sendRequest === 'function') {
             try {
-                const result = await abortable(generateViaService(service, profile, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning, onProgress }), signal);
+                const result = await abortable(withOutputLimit(`profile:${profile.id}`, effectiveMaxTokens(maxTokens, promptChars, profile.id), signal,
+                    tokens => generateViaService(service, profile, { systemPrompt, prompt, maxTokens: tokens, jsonSchema, signal, sampling, reasoning, onProgress })), signal);
                 // A technically successful request can still return garbage (sampling
                 // collapse, reasoning corruption). Treat that like a failure so the
                 // active connection gets a chance before any retry logic kicks in.
                 const degenerate = checkOutput ? resultDegenerateReason(result) : null;
                 if (!degenerate) return result;
-                warn(`Profiled request returned ${degenerate}; falling back to the active connection.`);
+                if (getSettings().fallbackToActive === false) throw new Error(`Connection profile "${profile.name ?? profile.id}" returned ${degenerate}`);
+                reportFallback(profile.id, profile.name, `it returned ${degenerate}`);
             } catch (error) {
                 if (signal?.aborted || isAbortError(error)) throw error;
                 if (error?.reasoningControl) throw error;
                 if (recoverContext && isContextLimitError(error)) throw error;
+                if (getSettings().fallbackToActive === false) throw error;
                 warn('Profiled request via Connection Manager failed; falling back to the active connection.', error);
+                reportFallback(profile.id, profile.name, String(error?.message ?? error));
             }
         } else {
             warnNoConnectionManager();
         }
     }
 
+    const activeTokens = effectiveMaxTokens(maxTokens, promptChars, '');
     if (sampling !== null) {
-        return abortable(generateIsolatedActive(context, { systemPrompt, prompt, maxTokens, jsonSchema, signal, sampling, reasoning, onProgress }), signal);
+        return abortable(withOutputLimit('active', activeTokens, signal,
+            tokens => generateIsolatedActive(context, { systemPrompt, prompt, maxTokens: tokens, jsonSchema, signal, sampling, reasoning, onProgress })), signal);
     }
     const request = activeQueue.then(async () => {
         throwIfAborted(signal);
         await waitForegroundIdle(signal);
-        return generateViaActive(context, { systemPrompt, prompt, maxTokens, jsonSchema });
+        return withOutputLimit('active', activeTokens, signal,
+            tokens => generateViaActive(context, { systemPrompt, prompt, maxTokens: tokens, jsonSchema }));
     });
     activeQueue = request.catch(() => {});
     return abortable(request, signal);
+}
+
+// --------------------------------------------------------------------------------------------
+// Output budgets: context-window cap and provider output limits
+// --------------------------------------------------------------------------------------------
+
+/**
+ * Context window of a saved profile (or the active connection for ''), or null when
+ * it cannot be determined. Reads the profile's own size, then its completion preset.
+ */
+export function knownContextWindow(profileId = '') {
+    const context = getContext();
+    const profile = profileId ? getConnectionProfile(profileId) : null;
+    let preset;
+    try {
+        if (profile?.preset) preset = context.getPresetManager?.((profile.mode ?? 'cc') === 'cc' ? 'openai' : 'textgenerationwebui')?.getCompletionPresetByName?.(profile.preset);
+    } catch { /* Older ST versions may not expose the preset manager. */ }
+    const candidates = [profile?.contextSize, profile?.max_context, preset?.openai_max_context, preset?.max_context,
+        !profile && context.mainApi === 'openai' ? context.chatCompletionSettings?.openai_max_context : null,
+        !profile ? context.maxContext : null];
+    const value = Number(candidates.find(item => Number(item) > 0));
+    return value > 0 ? value : null;
+}
+
+// Output limits learned from provider rejections, per connection, until reload.
+const learnedOutputLimits = new Map();
+const MIN_OUTPUT_TOKENS = 256;
+
+/** The requested budget, capped to what fits beside the prompt and to learned limits. */
+function effectiveMaxTokens(maxTokens, promptChars, profileId) {
+    let tokens = Number(maxTokens) > 0 ? Math.round(Number(maxTokens)) : 0;
+    if (!tokens) return maxTokens;
+    const window = knownContextWindow(profileId);
+    if (window) {
+        // ~3.5 characters per token, plus a margin for chat formatting.
+        const room = window - Math.ceil(promptChars / 3.5) - 256;
+        if (room >= MIN_OUTPUT_TOKENS) tokens = Math.min(tokens, room);
+    }
+    const learned = learnedOutputLimits.get(profileId ? `profile:${profileId}` : 'active');
+    if (learned) tokens = Math.min(tokens, learned);
+    return tokens;
+}
+
+/** True when a provider rejected the request because the output budget is too large. */
+export function outputLimitFromError(error) {
+    const seen = new Set();
+    while (error && !seen.has(error)) {
+        seen.add(error);
+        const message = String(error.message ?? error);
+        if (/max[_ ]?(?:completion[_ ]?|new[_ ]?|output[_ ]?)?tokens|max_length|maximum (?:output|completion)|output tokens/i.test(message)
+            && /too large|too high|exceed|must be|less than|at most|maximum|<=|limit|supports|not support|range/i.test(message)) {
+            // Only trust a number the message ties to the limit; model names carry digits too.
+            const stated = message.match(/(?:at most|maximum(?: allowed| of| is)?|<=|limit(?: is| of)?|up to|supports)\s*:?\s*(\d{3,7})\b/i)
+                ?? message.match(/\b(\d{3,7}),? which is the maximum/i);
+            const limit = stated ? Number(stated[1]) : null;
+            return { limit: limit >= MIN_OUTPUT_TOKENS ? limit : null };
+        }
+        error = error.cause;
+    }
+    return null;
+}
+
+/**
+ * Sends with `tokens`; when the provider rejects the output budget, retries once on
+ * the same connection with the limit it reported (or half the budget) and remembers it.
+ */
+async function withOutputLimit(key, tokens, signal, send) {
+    try {
+        return await send(tokens);
+    } catch (error) {
+        if (signal?.aborted || isAbortError(error) || error?.reasoningControl) throw error;
+        const rejected = outputLimitFromError(error);
+        if (!rejected || !(Number(tokens) > MIN_OUTPUT_TOKENS)) throw error;
+        const lower = Math.max(MIN_OUTPUT_TOKENS, Math.min(rejected.limit ?? Math.floor(tokens / 2), tokens - 1));
+        learnedOutputLimits.set(key, lower);
+        activityEntry({ title: `Output budget too large for this connection — retrying with ${lower} tokens`, text: String(error?.message ?? error), tone: 'info' });
+        throwIfAborted(signal);
+        return send(lower);
+    }
+}
+
+// One toast per profile per minute; every fallback still gets an activity entry.
+const fallbackToasts = new Map();
+
+function reportFallback(id, name, reason) {
+    const label = name || id;
+    warn(`Connection profile "${label}" unusable (${reason}); falling back to the active connection.`);
+    if (getSettings().fallbackToActive === false) return;
+    activityEntry({ title: `Profile "${label}" failed — using the active connection`, text: reason, tone: 'error' });
+    const now = Date.now();
+    if (now - (fallbackToasts.get(id) ?? 0) < 60000) return;
+    fallbackToasts.set(id, now);
+    toastr.warning(`Connection profile "${label}" failed (${reason.slice(0, 160)}). SmartTavern used the active connection instead.`, 'SmartTavern');
 }
 
 function samplingPayload(sampling, isChatCompletion, source) {

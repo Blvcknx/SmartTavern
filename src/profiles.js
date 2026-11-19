@@ -28,8 +28,8 @@ const UPDATE_SYSTEM = [
     'You are the keeper of a living character profile that evolves with an ongoing roleplay conversation.',
     'You receive the CURRENT profile and a RECENT EXCERPT of the conversation.',
     'Apply only changes that are clearly supported by the excerpt:',
-    '- Brief Summary, Appearance and Background may be updated freely (expand rather than shrink; never remove existing detail gratuitously).',
-    '- Personality, Values, Aspirations and Fears must stay essentially unchanged (little to no personality drift) unless the excerpt makes a change unavoidable.',
+    '- Fields marked [STABLE] must stay essentially unchanged (little to no drift) unless the excerpt makes a change unavoidable.',
+    '- All other fields may be updated freely (expand rather than shrink; never remove existing detail gratuitously).',
     'Return the COMPLETE updated profile as a single JSON object with EXACTLY the requested fields.',
     'Output ONLY the JSON object.',
 ].join(' ');
@@ -144,10 +144,11 @@ export function normalizeProfileJson(obj, fields, existing = null) {
 // Prompts
 // --------------------------------------------------------------------------------------------
 
-function fieldSpecList(fields) {
+// `markStable` tags schema fields flagged Stable so the updater can hold them still.
+function fieldSpecList(fields, { markStable = false } = {}) {
     return fields
         .filter(f => String(f?.name ?? '').trim())
-        .map(f => `- "${f.name}": ${f?.description ?? ''}`)
+        .map(f => `- "${f.name}"${markStable && f?.stable ? ' [STABLE]' : ''}: ${f?.description ?? ''}`)
         .join('\n');
 }
 
@@ -188,7 +189,7 @@ export function buildUpdatePrompt(char, profile, fields, excerpt, guide = '') {
         '',
         ...(guideText ? [guideText, ''] : []),
         'Return the complete updated profile as a single JSON object with exactly these fields:',
-        fieldSpecList(fields),
+        fieldSpecList(fields, { markStable: true }),
     ].join('\n'));
 }
 

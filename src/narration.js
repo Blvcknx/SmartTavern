@@ -3,6 +3,7 @@ import { getSettings, resolveTargetChar, getStoredProfile, charKey, captureChatS
 import { previewStoryDirective } from './story.js';
 import { createGenerationControl, isAbortError, throwIfAborted } from './gen.js';
 import { generateAgentText, sharedAgentContext } from './planner.js';
+import { disarmPreVeil } from './veil.js';
 import { activityStart, activityEntry, activityEnd } from './progress.js';
 
 const NARRATION_SYSTEM = `Write an immediate playable scene for an interactive-fiction chat following the user's scene request. Output only finished narration, no planning, tags, tools, or commentary. Honor continuity and the established narrative voice. For a time skip, establish when and where the new scene opens. Introduce an actionable situation or conflict when appropriate, leaving room for the player to respond. Never decide the player's actions, dialogue, feelings, or choices. Do not reveal hidden secrets. The current story directive is background context; the user's scene request controls the requested transition.`;
@@ -55,6 +56,8 @@ export async function writeQuickNarration(request, { signal } = {}) {
         }
         if (isCurrent()) {
             try {
+                // A leftover pre-veil observer must never blur the narrator message.
+                disarmPreVeil();
                 context.addOneMessage(message);
                 if (events.MESSAGE_RECEIVED) await context.eventSource.emit(events.MESSAGE_RECEIVED, messageId, 'smarttavern_narration');
                 if (isCurrent() && events.CHARACTER_MESSAGE_RENDERED) await context.eventSource.emit(events.CHARACTER_MESSAGE_RENDERED, messageId, 'smarttavern_narration');

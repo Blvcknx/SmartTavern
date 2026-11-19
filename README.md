@@ -71,7 +71,7 @@ Key implementation facts (verified against ST 1.13–1.19 source):
 - Generation instructions always go to the block model as a user request. Only generated output is injected into the main reply prompt. Assistant context supplies prior assessments; it does not force a provider to import them into a private reasoning channel or accept fabricated thought signatures.
 - Existing configurations migrate once to prompt-end injection with assistant role. Step prompts and connection profiles are preserved. The redundant final consolidation pass, its editor, and its saved settings have been removed: assembling the template makes no extra LLM call. After migration, manually chosen history anchors and role settings persist normally.
 - The former single *Pipeline mode* migrated into the two independent pipelines: refinement users' step lists moved to **Refinement passes** (expansion gets its default preset back), while expansion users keep their steps and gain the default refinement preset. Both pipelines default to on and can be toggled separately.
-- Profile updates fire on `MESSAGE_RECEIVED` once `chat.length - updatedAt >= updateInterval` messages have accumulated for the character who just replied. They run in the background and merge with **little-to-no personality drift** (Personality / Values / Aspirations / Fears are held stable by the updater prompt). When refinement is enabled the update is deferred until the passes finish, so the updater reads the refined reply.
+- Profile updates fire on `MESSAGE_RECEIVED` once `chat.length - updatedAt >= updateInterval` messages have accumulated for the character who just replied. They run in the background and merge with **little-to-no drift** on fields marked **Stable** in the schema (defaults: Personality, Aspirations, Fears, Values), which the updater prompt holds essentially unchanged; all other fields may grow freely. When refinement is enabled the update is deferred until the passes finish, so the updater reads the refined reply.
 - All internal LLM calls go through one adapter:
   - with a **Connection Manager profile id** → `ConnectionManagerRequestService.sendRequest()` against that saved API/preset/instruct (no global state mutation); Chat Completion structured output uses the `response_format: json_schema` override payload;
   - without one (or on any error) → `generateRaw()` on the active connection (`responseLength` = token budget, `jsonSchema` passed through, lenient JSON parsing as fallback).
@@ -79,7 +79,7 @@ Key implementation facts (verified against ST 1.13–1.19 source):
 - **Active-connection step calls and fallbacks use the same isolated sampling.** They use ST's Chat/Text Completion request services with connection routing only, without changing global ST settings. Older builds or other active API types need a saved Connection Manager profile for these calls. Planner, profile maintenance, Story Director and other non-step calls retain their existing preset behavior.
 - Refinement starts from the render event without blocking that event's completion. Active-connection requests can then wait safely for `GENERATION_ENDED`, rather than hitting the foreground wait's 60-second safety timeout. Passes remain sequential, and profile maintenance follows refinement.
 - Group chats: profiles are keyed by member avatar filename; the drafting member is resolved from the global `name2` (which ST sets to the currently-generating member), falling back to the last non-user message author.
-- **Living description override** (Settings → *Replace the card description with the living profile*): the character card's description text is swapped for the stored living profile inside the assembled prompt. This covers every channel the description travels — the Prompt Manager's **Char Description** entry (chat completion marker prompt), the instruct Context Template story string (text completion) and the `{{description}}` macro in custom prompts — because all of them end up containing the same description text ST computed in `Generate()`. The swap happens on the per-generation prompt copy at `CHAT_COMPLETION_PROMPT_READY` / `GENERATE_AFTER_COMBINE_PROMPTS`; **the stored card is never modified**, and without a profile the original description is used. In group chats every member with a stored profile gets their slice swapped (including merged group-card descriptions).
+- **Living description override** (Settings → *Replace the card description with the living profile*): the character card's description text is swapped for the stored living profile inside the assembled prompt. This covers every channel the description travels — the Prompt Manager's **Char Description** entry (chat completion marker prompt), the instruct Context Template story string (text completion) and the `{{description}}` macro in custom prompts — because all of them end up containing the same description text ST computed in `Generate()`. The swap happens on the per-generation prompt copy at `CHAT_COMPLETION_PROMPT_READY` / `GENERATE_AFTER_COMBINE_PROMPTS`; **the stored card is never modified**, and without a profile the original description is used. In group chats every member with a stored profile gets their slice swapped (including merged group-card descriptions). When the override is active, the reply-tail's `{{definitions}}` is replaced with a short pointer to the character description, so the profile is not sent twice.
 
 ## Using the floating panel
 
@@ -112,13 +112,14 @@ Full settings live in the floating panel (Settings tab); the **Extensions → Sm
 | Replace the card description with the living profile | Swaps the card's description text for the stored profile inside the assembled prompt (Char Description entry, story string, `{{description}}` macro). The card itself is never modified; needs a stored profile, which the pipelines (or a manual **Rebuild**) create. |
 | Update every N messages | Cadence per character (default 12) |
 | Pipeline / updater chat lookback | How many recent messages the step prompts / updater see (default 24) |
-| Step / updater max tokens | Token budgets for internal calls (default 512 / 1024) |
+| Step / updater max tokens | Upper bound for each internal call's output (default 8192 / 8192). Every call is also capped to the connection's context window and to the provider's reported output limit, and retried with a lower limit when the provider rejects the requested one. |
+| Fall back to the active connection | When a step's or updater's saved connection profile fails, retry on the active connection (on by default). Each fallback shows an entry in the activity log and a toast. |
 | Injection position | End of assembled reply prompt (default), or a history anchor for comparisons |
 | Prompt-tail role | Assistant (default), User, or System for the complete tail |
 | Reply prompt-tail template | Editable template assembled locally; defaults to profile + `{{steps}}` + instructions to use the assessments for the upcoming reply without repeating the notes |
 | Injection depth | Used only with custom history depth: 0 = after the newest message, 1 = before it |
 | Injection name / header / footer | Settings for history positions; `{{char}}` and other macros resolve |
-| Profile schema fields | Rows: name + description — the JSON schema is built from this list (defaults: Brief Summary, Appearance, Background, Personality incl. sexual preferences, Aspirations, Fears, Values) |
+| Profile schema fields | Rows: name + description + a **Stable** checkbox — the JSON schema is built from this list (defaults: Brief Summary, Appearance, Background, Personality incl. sexual preferences, Aspirations, Fears, Values). Fields marked Stable are held essentially unchanged by the background updater; Personality, Aspirations, Fears and Values are stable by default. |
 | Expansion steps | Cards: enabled, name, role, per-step lookback, connection profile, prompt; reorder / duplicate / delete; defaults: **Physical Condition** → **Mental Condition** |
 | Refinement passes | Same cards minus the role selector (passes are strictly sequential and work on the draft), plus an **Edit mode** select: **Surgical edits** (default) or **Full rewrite**. Defaults: **Body & Spatial Awareness** → **Character & Psychological Authenticity** → **Prose & Wording Polish** |
 | Step execution | Expansion only: parallel where independent (default), or sequential. `{{step:Name}}` waits for that earlier step; `{{steps}}` waits for all earlier steps. Refinement passes are always strictly sequential. Isolated step requests can overlap without changing ST's global generation settings. |
@@ -159,14 +160,6 @@ Each refinement pass streams progress to the activity display and the reply veil
 | `{{must}}` / `{{beat}}` / `{{chapter}}` / `{{ledger}}` | The required event / the current beat text / the current chapter line / the fact ledger |
 
 These macros also work in the reply-tail template. Include `{{steps}}` or selected `{{step:Name}}` references to supply the generated assessments. `{{step:Name}}` and `{{steps}}` resolve against the list of the pipeline the prompt belongs to — a refinement pass never sees expansion outputs, and vice versa. Unknown macros are left intact for SillyTavern's own substitution pass. The Results tab shows the assembled reply context (expansion) and the final refined reply (refinement) so you can inspect exactly what each pipeline produced.
-
-### Refinement guardrails
-
-Every completed refinement pass is checked only for an empty reply payload. An explicit `<audit>PASS</audit>` without a reply wrapper keeps the current draft. There are no length, similarity, placeholder, repetition, or tag-format filters for refinement. Other internal calls retain their generation sanity checks.
-
-An empty result or exhausted generation error pauses refinement with **Retry pass**, **Skip Pass**, and **Review** buttons. Review opens the returned output in a scrollable window with **Accept**, **Retry**, and **Skip Pass**. Accept uses the reviewed result and continues; when it contains no reply, Accept keeps the current draft. Retry repeats the same prompt using the last accepted draft. Skip discards the failed output and continues to the next pass. Only accepted outputs become swipes or `{{step:Name}}` values. The same workflow applies to dry runs without changing chat.
-
-**Skip pass** is also available while a request is running, in the veil and the expanded activity log. **That's enough** ends the whole refinement run. Global Stop and chat changes cancel pending rejection and review windows.
 
 ### Surgical refinement (edit modes)
 
@@ -227,7 +220,7 @@ The planner adds temporary prompts only for important missing context. **Zero ad
 
 Generated prompts use the agent connection and normal expansion token budget. They receive shared character, story, and recent-chat context automatically. Independent blocks can run in parallel; `{{step:Earlier Block}}` and `{{steps}}` retain their dependency semantics. Results shows the accepted prompts and any planner failures or truncation notices. Malformed plans fall back to saved blocks, without a format-repair loop. The writing model receives expansion outputs, not planner reasoning or a Turn Brief.
 
-When only the player can supply important missing context, the planner can return `## User: Short name` followed by a direct question. This uses the same plain-text heading format as `## Expansion:`, with no JSON or tool schema. A compact, mobile-friendly dialog shows the question, a text field, and **Submit / Skip**. Submitted question-and-answer pairs are saved in this chat's SmartTavern metadata and supplied to the planner, expansion blocks, and reply model on later turns, including after reload. Skip continues without inventing an answer. Questions count toward the five-block limit; later blocks wait for earlier questions and can reference them with `{{step:Short name}}`. Dry runs, swipes, regenerations, and continuations reuse saved answers but never open questions or save new answers. Stopping generation or changing chats closes an open question.
+When only the player can supply important missing context, the planner can return `## User: Short name` followed by a direct question. This uses the same plain-text heading format as `## Expansion:`, with no JSON or tool schema. A compact, mobile-friendly dialog shows the question, a text field, and **Submit / Skip**. A submitted answer applies to the current reply only, unless the player ticks **Keep for future replies in this chat** in the dialog; kept question-and-answer pairs are saved in this chat's SmartTavern metadata and supplied to the planner, expansion blocks, and reply model on later turns, including after reload. Skip continues without inventing an answer. Questions count toward the five-block limit; later blocks wait for earlier questions and can reference them with `{{step:Short name}}`. Dry runs, swipes, regenerations, and continuations reuse kept answers but never open questions or save new answers. Stopping generation or changing chats closes an open question.
 
 **Always**, **Armed**, and **Off** control planning. Armed mode is triggered with **Plan next reply** or `/smarttavern-think`; dry runs do not consume the armed flag. Planning requires expansion to be enabled. Use **Planner task** to guide which information gaps deserve attention.
 
@@ -262,6 +255,15 @@ larger reading window. Closing the activity panel keeps the log and expanded ent
 intact. The chip hides when refinement finishes or is skipped; other completed activity
 hides after a short idle delay. **Clear log** removes retained entries explicitly. Activity is kept in memory until cleared or the page is reloaded.
 
+### Rulings ledger (Legacy agent)
+
+The **character oracle** answers behavioral questions about a character ("how does she react when flattered?") from the card, the living profile, existing rulings and a chat excerpt only; it never sees the Story Director's bible, scene state or the agent's scratchpad. Each answer is validated and saved as a **ruling** in this chat's ledger (per character in group chats). Rulings can be pinned, edited, deleted and undone from the Agent tab, which keeps an undo log of ledger changes.
+
+- **Reuse:** before a new oracle call, the question is matched against existing active or tentative rulings; a match at or above the **reuse threshold** (default 0.6) is reused without a new call.
+- **Surfacing:** relevant rulings are added to the Turn Brief as "Established behavior" when they score at or above the **surface threshold** (default 0.34), at most **Surfaced per brief** rulings (default 2).
+- **Cap and pruning:** the ledger holds up to the **Ledger cap** per chat (default 60); when it is full, superseded rulings go first, then tentative ones, then the least-used unpinned. Tentative rulings expire after 30 new messages, and pinned rulings are never evicted.
+- **Manual use:** **Consult now** in the Agent tab and `/smarttavern-ruling <question>` ask the oracle directly and save the result. The tool switch and the **Rulings per turn** limit are in the Agent tab; the oracle has its own optional connection profile.
+
 The agent has three GM capabilities:
 
 - **Agent dice:** agent rolls use an unmodified d20. Only **1 -- complete failure**
@@ -289,8 +291,7 @@ limited to three per turn and share the existing total tool-call budget.
 
 Thinking adds up to the configured number of planning calls, plus character/NPC
 consults and retries. Use Armed mode to control latency. `npm test` runs the complete
-suite. See [the thinking-agent audit](THINKING_AGENT_AUDIT.md) for verification details
-and the in-app smoke test.
+suite.
 
 | Command | Alias | Effect |
 | --- | --- | --- |
@@ -303,18 +304,23 @@ and the in-app smoke test.
 | `/smarttavern-beat <note>` | `/st-beat` | Compile the next story beat (optional steering note) |
 | `/smarttavern-chapter` | `/st-chapter` | Close the current chapter and write the opening beat of the next |
 | `/smarttavern-story` | `/st-story` | Show the directive the reply model will receive |
+| `/smarttavern-think` | `/st-think` | Arm the agent for the next reply (one-shot; requires Armed mode) |
+| `/smarttavern-ruling <question>` | `/st-ruling` | Ask the character oracle a behavioral question and save the ruling |
+| `/smarttavern-roll <dice>` | `/st-roll` | Roll dice now (informational, not binding) |
+| `/smarttavern-memory` | `/st-memory` | List the agent-owned lorebook memory entries of this chat |
 | `/smarttavern-hud` | `/st-hud` | Toggle the floating panel |
 
-**smarttavern_dump**: open the browser console and run
-`SillyTavern.getContext().registerDebugFunction`-registered **smarttavern_dump** from the debug menu — it prints settings + the chat profile store.
+**smarttavern_dump** is registered as a SillyTavern debug function: open it from SillyTavern's debug menu (User Settings → Debug menu). It prints the SmartTavern settings and the chat's store (including stored profiles) to the browser console.
 
 ## Storage & privacy
 
 - Global config: `extensionSettings.smarttavern` (in `settings.json`).
 - Profiles: `chatMetadata.smarttavern = { version, profiles: { [avatar]: { fields, createdAt, updatedAt, source, lastDiff? } } }` — saved with the chat, invisible to the character card. `lastDiff` records the field-level before/after of the most recent background update (cleared by manual edits).
 - Story: `chatMetadata.smarttavern.story = { v, bible, chapterIndex, beat, ledger, turnsSinceDelivery, seed, createdAt }` — one story per chat, saved with it.
+- Kept planner answers: `chatMetadata.smarttavern.userAnswers` (only answers the player chose to keep).
+- Legacy agent: scene state in `chatMetadata.smarttavern.agentScene`, the rulings ledger in `rulings` / `agentRulingSeq` / `agentRulingLog`, the memory undo log in `agentMemoryLog` (all under `chatMetadata.smarttavern`), and agent-owned memory entries as flagged entries in the chat's bound lorebook (user-authored entries are never modified).
 - No secrets are stored; connection profiles reference the Connection Manager's own records.
-- Every generation makes up to `1 (bootstrap) + expansion steps + refinement passes` extra LLM calls — mind your provider quota/billing. Prompt-tail assembly makes no model call.
+- Every generation makes up to `1 (bootstrap) + expansion steps + refinement passes` extra LLM calls, plus the planner call (Planner engine), the legacy agent's planning iterations and consults (character, expert, oracle), the built-in Directive Enforcement pass when a story beat is pending, and any retries or connection fallbacks — mind your provider quota/billing. Prompt-tail assembly makes no model call.
 
 ## Caveats
 
@@ -323,11 +329,11 @@ and the in-app smoke test.
 - The reservation increases the prompt size by roughly the expanded template (profile + step outputs by default). It participates in ST's normal context budgeting. If ST removes the reservation, the tail is omitted rather than silently re-added beyond that budget. Hooks installed by other extensions after SmartTavern's hook may append further content.
 - Stopping a run cancels retries and queued steps. Connection Manager requests receive an abort signal. The active-connection API cannot always abort an individual request; in that case its late result is discarded and the UI resumes immediately, while further active-connection calls wait for that request to settle.
 - `extensions/shared.js` is internal to ST; the adapter prefers the context-exposed `ConnectionManagerRequestService` and degrades gracefully if it moves.
-- The description override runs after ST's context budgeting, which counted the original description. A living profile larger than the card's description can therefore push the final prompt slightly over the budgeted size — keep an eye on the context meter if your profiles are much longer than the original descriptions. Descriptions shorter than 12 characters are left untouched (too risky to match textually). Prompt dry runs/inspectors (`dryRun`) and SmartTavern's own internal calls always see the original card description.
+- The description override runs after ST's context budgeting, which counted the original description. A living profile larger than the card's description can therefore push the final prompt slightly over the budgeted size — keep an eye on the context meter if your profiles are much longer than the original descriptions. Descriptions shorter than 12 characters are left untouched (too risky to match textually). Prompt dry runs/inspectors (`dryRun`) and SmartTavern's own internal calls always see the original card description. With the override active, a profile that the reply tail would repeat (the default tail template's `{{definitions}}`) is replaced inside the tail by a short pointer to the character description; custom tails that paraphrase the profile are not deduplicated.
 
 ## Roadmap (out of v1)
 
-Per-field immutability locks; update-diff preview before applying (SkyrimNet-style); drag-to-reorder for steps; `{{smarttavern:Field}}` macros usable in character cards/presets; per-step reasoning/thinking presets.
+Hard per-field locks (Stable is a soft lock); update-diff preview before applying (SkyrimNet-style); drag-to-reorder for steps; `{{smarttavern:Field}}` macros usable in character cards/presets.
 
 ## License
 

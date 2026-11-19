@@ -14,7 +14,7 @@ import { initUI } from './src/ui.js';
 import { initHud } from './src/hud.js';
 import { initPromptTail } from './src/tail.js';
 import { initDescriptionOverride } from './src/description.js';
-import { dismissAllVeils } from './src/veil.js';
+import { dismissAllVeils, dismissVeil, disarmPreVeil } from './src/veil.js';
 
 async function initSmartTavern() {
     const context = getContext();
@@ -33,7 +33,12 @@ async function initSmartTavern() {
 
     // Defensive sweeps — the pipeline injects into the per-generation core chat copy,
     // so the real chat history should never contain ephemeral messages.
-    context.eventSource.on(events.GENERATION_ENDED, () => sweepEphemeral());
+    context.eventSource.on(events.GENERATION_ENDED, () => {
+        sweepEphemeral();
+        // An armed pre-veil observer must never outlive its generation (ST awaits render
+        // listeners before this event, so the reply node already exists by now).
+        disarmPreVeil();
+    });
     context.eventSource.on(events.MESSAGE_DELETED, () => sweepEphemeral());
     context.eventSource.on(events.CHAT_CHANGED, () => {
         cancelFreshReply();
@@ -104,13 +109,15 @@ async function onCharacterMessageRendered(messageId, type) {
     try {
         const context = getContext();
         const settings = getSettings();
-        if (!settings.enabled || !settings.refinementEnabled) return;
-        if (context.chat?.[messageId]?.extra?.smarttavernNarration) return;
+        // Every early exit also drops a pre-veil (armPreVeil) so a blurred
+        // "Drafting reply…" message can never stay stuck.
+        if (!settings.enabled || !settings.refinementEnabled) { dismissVeil(messageId); return; }
+        if (context.chat?.[messageId]?.extra?.smarttavernNarration) { dismissVeil(messageId); return; }
         // Only freshly GENERATED replies are refined — never a character greeting
         // ('first_message' fires when a new chat starts or a card is re-created) and
         // never messages that are merely re-rendered (chat loads, scrollback).
         // `hasFreshReply` is true only after the interceptor marked a real generation.
-        if (type === 'first_message' || !hasFreshReply()) return;
+        if (type === 'first_message' || !hasFreshReply()) { dismissVeil(messageId); return; }
         await runRefinementPipeline(messageId);
         // Auto-update always follows the refinement attempt: a null result (busy,
         // cancelled or skipped refinement) must not skip the character's profile

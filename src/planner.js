@@ -1,7 +1,7 @@
 import { getContext } from '../../../../extensions.js';
 import { cardText, warn } from './state.js';
 import { serializeProfile } from './profiles.js';
-import { generateVia, getConnectionProfile, isContextLimitError, isAbortError, throwIfAborted } from './gen.js';
+import { generateVia, knownContextWindow, isContextLimitError, isAbortError, throwIfAborted } from './gen.js';
 import { activityEntry, activityStatus } from './progress.js';
 import { EXPANSION_LIMIT, configuredBlocks, parseExpansionPlan, recentMessages, reduceHistory, fitHistory, cleanAgentText } from './planner-core.js';
 import { userAnswersContext } from './user-context.js';
@@ -24,16 +24,7 @@ export function sharedAgentContext({ char, profile, settings, directive }) {
 }
 
 function contextWindow(profileId) {
-    const context = getContext();
-    const profile = getConnectionProfile(profileId);
-    let preset;
-    try {
-        if (profile?.preset) preset = context.getPresetManager?.((profile.mode ?? 'cc') === 'cc' ? 'openai' : 'textgenerationwebui')?.getCompletionPresetByName?.(profile.preset);
-    } catch { /* Older ST versions may not expose the preset manager. */ }
-    const candidates = [profile?.contextSize, profile?.max_context, preset?.openai_max_context, preset?.max_context, preset?.max_length,
-        !profile && context.mainApi === 'openai' ? context.chatCompletionSettings?.openai_max_context : null,
-        !profile ? context.maxContext : null];
-    return Number(candidates.find(value => Number(value) > 0)) || 8192;
+    return knownContextWindow(profileId) ?? 8192;
 }
 
 /** One text call, with bounded retries only for context overflow. No format repair. */
